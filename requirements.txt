@@ -1,0 +1,5 @@
+numpy>=2.1
+opencv-python>=4.10
+mss>=10.0
+pillow>=12.0
+pyinstaller>=6.11

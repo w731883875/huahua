@@ -1,0 +1,33 @@
+# 初始颜料固定关键词清单
+#
+# 后续把真实游戏截图裁剪成关键词模板放到本目录：
+# - direction_纵向.png
+# - direction_相邻.png
+# - direction_对角斜向.png
+# - object_所有.png
+# - object_怪物.png
+# - object_玩法.png
+# - tile_阻挡地块.png
+# - tile_空白地块.png
+# - effect_提升1级.png
+# - effect_提升2级.png
+# - subtype_宝箱.png
+# - count_0_3.png
+# - count_0_4.png
+
+相邻
+横向
+纵向
+对角斜向
+全图
+所有
+怪物
+玩法
+阻挡地块
+空白地块
+虚空地块
+提升1级
+提升2级
+宝箱
+(0/3)
+(0/4)

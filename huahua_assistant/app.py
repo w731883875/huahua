@@ -37,6 +37,7 @@ from .game_model import (
     recommend_special_actions,
     state_from_observation,
 )
+from .learning import load_learning_stats, record_observation
 from .models import BoardObservation, BrushOptionsObservation, RegionKind, SceneObservation, TileState
 from .vision import VisionTracker, analyze_and_save_debug
 
@@ -90,6 +91,8 @@ class HuahuaApp(tk.Tk):
         self.force_used_var = tk.IntVar(value=0)
         self.refresh_used_var = tk.IntVar(value=0)
         self.tracker = VisionTracker()
+        self.detected_backpack_cache: dict[str, Paint] = {}
+        self.backpack_session_key: str | None = None
 
         self._build_ui()
 
@@ -228,7 +231,9 @@ class HuahuaApp(tk.Tk):
             return
 
         board = scene.board
-        self.current_state = state_from_observation(scene.board, scene.current_paint)
+        backpack = self._merge_detected_backpack(scene)
+        self.current_state = state_from_observation(scene.board, scene.current_paint, backpack)
+        self._record_scene_observation(scene, backpack)
         if scene.brush_options is not None and self.current_state.current_rule is not None:
             self.current_state = replace(
                 self.current_state,
@@ -259,6 +264,8 @@ class HuahuaApp(tk.Tk):
 
     def simulate_random(self) -> None:
         self.current_scene = None
+        self.detected_backpack_cache = {}
+        self.backpack_session_key = None
         self.current_state = random_state()
         self.selected_backpack_index = None
         self.recommendations = recommend_placements(self.current_state)
@@ -269,6 +276,114 @@ class HuahuaApp(tk.Tk):
         self.canvas.delete("all")
         self._draw_grid(None, self.current_state)
         self._write_simulation()
+
+    def _merge_detected_backpack(self, scene: SceneObservation) -> tuple[Paint, ...]:
+        session_key = _scene_backpack_session_key(scene)
+        if session_key != self.backpack_session_key:
+            self.detected_backpack_cache = {}
+            self.backpack_session_key = session_key
+        if scene.backpack is None:
+            return tuple(self.detected_backpack_cache.values())
+        for observed in scene.backpack.paints:
+            key = observed.fingerprint or _observed_paint_key(observed)
+            self.detected_backpack_cache[key] = Paint(
+                category=observed.category,
+                level=observed.level,
+                subtype=observed.subtype,
+                is_treasure=observed.is_treasure,
+            )
+        return tuple(self.detected_backpack_cache.values())
+
+    def _record_scene_observation(self, scene: SceneObservation, backpack: tuple[Paint, ...]) -> None:
+        if scene.current_paint is not None:
+            paint = scene.current_paint
+            record_observation(
+                "current_paint",
+                {
+                    "category": paint.category.value,
+                    "level": paint.level,
+                    "direction": paint.direction.value,
+                    "target": paint.target_object.value,
+                    "match_current": paint.match_current,
+                    "match_required": paint.match_required,
+                    "upgrade_amount": paint.upgrade_amount,
+                    "raw_text_hint": paint.raw_text_hint,
+                },
+                source="real_capture",
+            )
+            self._record_current_paint_rule_warnings(paint)
+        if scene.brush_options is not None:
+            brush = scene.brush_options
+            record_observation(
+                "brush_options",
+                {
+                    "stage1_options": brush.stage1_options,
+                    "chosen_stage1": brush.chosen_stage1,
+                    "stage2_options": brush.stage2_options,
+                    "confidence": brush.confidence,
+                    "stage1_scores": brush.stage1_scores,
+                    "stage2_scores": brush.stage2_scores,
+                },
+                source="real_capture",
+            )
+            for name in brush.stage2_options:
+                if "进度要求减少1" in name or "所需数量-2" in name:
+                    record_observation(
+                        "rule_conflict",
+                        {
+                            "kind": "match_required_delta",
+                            "affix_name": name,
+                            "note": "转锋减进度存在 -1/-2 版本，需继续用实战截图确认",
+                        },
+                        source="real_capture",
+                    )
+        if scene.backpack is not None:
+            record_observation(
+                "backpack_capture",
+                {
+                    "visible": len(scene.backpack.paints),
+                    "cumulative": len(backpack),
+                    "paints": [
+                        {
+                            "category": paint.category.value,
+                            "level": paint.level,
+                            "subtype": paint.subtype,
+                            "is_treasure": paint.is_treasure,
+                        }
+                        for paint in backpack
+                    ],
+                },
+                source="real_capture",
+            )
+
+    def _record_current_paint_rule_warnings(self, paint) -> None:
+        if paint.level is None:
+            return
+        expected_match, expected_upgrade = _empirical_current_paint_defaults(paint.level)
+        if paint.match_required is not None and paint.match_required != expected_match:
+            record_observation(
+                "rule_mismatch",
+                {
+                    "kind": "current_match_required",
+                    "level": paint.level,
+                    "observed": paint.match_required,
+                    "expected": expected_match,
+                    "raw_text_hint": paint.raw_text_hint,
+                },
+                source="real_capture",
+            )
+        if paint.upgrade_amount is not None and paint.upgrade_amount != expected_upgrade:
+            record_observation(
+                "rule_mismatch",
+                {
+                    "kind": "current_upgrade_amount",
+                    "level": paint.level,
+                    "observed": paint.upgrade_amount,
+                    "expected": expected_upgrade,
+                    "raw_text_hint": paint.raw_text_hint,
+                },
+                source="real_capture",
+            )
 
     def force_complete_current(self) -> None:
         if self.current_state is None:
@@ -1067,6 +1182,15 @@ class HuahuaApp(tk.Tk):
                 f"stage2_scores={_format_keyword_scores(brush.stage2_scores)}\n"
                 "crop=runtime/brush_options_panel.png\n\n",
             )
+        if scene.backpack is not None:
+            self.region_text.insert(
+                tk.END,
+                f"Backpack Capture\n"
+                f"visible={len(scene.backpack.paints)} cumulative={len(self.detected_backpack_cache)}\n"
+                f"confidence={scene.backpack.confidence:.2f}\n"
+                "manual scroll supported: scroll in game, then Capture again\n\n",
+            )
+        self._write_learning_stats()
         self._write_backpack()
         self._write_install_plan()
         self._write_recommendations()
@@ -1128,6 +1252,24 @@ class HuahuaApp(tk.Tk):
         for index, paint in enumerate(self.current_state.backpack, start=1):
             self.region_text.insert(tk.END, f"{index}. {_paint_display_label(paint)}\n")
         self.region_text.insert(tk.END, "\n")
+
+    def _write_learning_stats(self) -> None:
+        stats = load_learning_stats()
+        if not stats:
+            return
+        conflicts = stats.get("event_counts", {}).get("rule_conflict", 0)
+        mismatches = sum((stats.get("rule_mismatches") or {}).values())
+        affix_seen = stats.get("affix_seen") or {}
+        top_affixes = sorted(affix_seen.items(), key=lambda item: item[1], reverse=True)[:3]
+        affix_text = ", ".join(f"{name}x{count}" for name, count in top_affixes) if top_affixes else "-"
+        self.region_text.insert(
+            tk.END,
+            "Learning Log\n"
+            f"events={stats.get('total_events', 0)} conflicts={conflicts} mismatches={mismatches}\n"
+            f"top affixes={affix_text}\n"
+            f"treasure_ratio={stats.get('treasure_ratio', 0.0):.3f}\n"
+            "files=runtime/observations.jsonl, runtime/stats.json\n\n",
+        )
 
     def _write_install_plan(self) -> None:
         self.region_text.insert(tk.END, "安装计划（逐步模拟，每步立即结算）\n")
@@ -1217,6 +1359,14 @@ def _format_keyword_scores(scores: dict[str, float]) -> str:
     return ", ".join(f"{key}:{value:.2f}" for key, value in top)
 
 
+def _empirical_current_paint_defaults(level: int) -> tuple[int, int]:
+    if level >= 5:
+        return 4, 2
+    if level == 4:
+        return 4, 1
+    return 3, 1
+
+
 def _tile_display_label(state: TileState, paint: Paint | None) -> str:
     if paint is None:
         return STATE_LABELS[state]
@@ -1267,6 +1417,19 @@ def _brush_type_from_value(value: str | None) -> BrushType | None:
 def _brush_types_from_values(values: tuple[str, ...]) -> tuple[BrushType, ...]:
     parsed = [_brush_type_from_value(value) for value in values]
     return normalize_brush_options([brush_type for brush_type in parsed if brush_type is not None])
+
+
+def _scene_backpack_session_key(scene: SceneObservation) -> str:
+    paint_hint = scene.current_paint.raw_text_hint if scene.current_paint else "no_paint"
+    tile_counts = Counter(tile.state for tile in scene.board.tiles)
+    board_key = ",".join(f"{state.value}:{tile_counts[state]}" for state in TileState)
+    anchor = next(((tile.row, tile.col) for tile in scene.board.tiles if tile.state == TileState.PAINT), None)
+    return f"{paint_hint}|{board_key}|anchor={anchor}"
+
+
+def _observed_paint_key(observed) -> str:
+    treasure = "treasure" if observed.is_treasure else "normal"
+    return f"{observed.category.value}:{observed.level}:{observed.subtype}:{treasure}:{observed.slot_rect.x}:{observed.slot_rect.y}"
 
 
 def _direction_display_label(direction) -> str:

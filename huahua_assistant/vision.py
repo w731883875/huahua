@@ -9,6 +9,8 @@ from .capture import write_image
 from .game_model import BRUSH_TYPE_ORDER, BrushType, build_affix_catalog
 from .keyword_match import match_keywords
 from .models import (
+    BackpackObservation,
+    BackpackPaintObservation,
     BoardObservation,
     BrushOptionsObservation,
     CurrentPaintObservation,
@@ -78,7 +80,14 @@ def _analyze_scene_from_board_rect(image: np.ndarray, rect: Rect, fast: bool) ->
     regions = tuple(_estimate_regions(image, board))
     current_paint = _analyze_current_paint(image, regions)
     brush_options = _analyze_brush_options(image, regions)
-    return SceneObservation(board=board, regions=regions, current_paint=current_paint, brush_options=brush_options)
+    backpack = _analyze_backpack(image, regions)
+    return SceneObservation(
+        board=board,
+        regions=regions,
+        current_paint=current_paint,
+        brush_options=brush_options,
+        backpack=backpack,
+    )
 
 
 def make_debug_image(image: np.ndarray, scene: SceneObservation | BoardObservation | None) -> np.ndarray:
@@ -725,6 +734,9 @@ def _analyze_brush_options(
     stage1_crop = _brush_stage1_crop(crop)
     stage2_crop = _brush_stage2_crop(crop)
     stage1_scores = _brush_stage1_scores(stage1_crop)
+    pattern_scores = _brush_card_pattern_scores(crop)
+    for brush_type, score in pattern_scores.items():
+        stage1_scores[brush_type] = max(stage1_scores.get(brush_type, 0.0), score)
     stage1_options = _detected_stage1_options(stage1_scores)
     keyword_scores = _brush_keyword_scores(stage2_crop, stage1_options)
     stage2_scores = _brush_stage2_scores(keyword_scores, stage1_scores, stage1_options)
@@ -745,6 +757,288 @@ def _analyze_brush_options(
         keyword_scores=keyword_scores,
         confidence=float(np.clip(confidence, 0.0, 1.0)),
     )
+
+
+def _analyze_backpack(
+    image: np.ndarray,
+    regions: tuple[RegionObservation, ...],
+) -> BackpackObservation | None:
+    region = next((item for item in regions if item.kind == RegionKind.BACKPACK), None)
+    if region is None:
+        return None
+
+    panel = region.rect
+    slots = _locate_backpack_slots(image, panel)
+    paints = tuple(
+        observation
+        for slot in slots
+        if (observation := _analyze_backpack_slot(image, slot)) is not None
+    )
+    if not paints:
+        return None
+    confidence = float(np.mean([paint.category_confidence * 0.55 + paint.level_confidence * 0.45 for paint in paints]))
+    return BackpackObservation(panel_rect=panel, paints=paints, confidence=float(np.clip(confidence, 0.0, 1.0)))
+
+
+def _locate_backpack_slots(image: np.ndarray, panel: Rect) -> tuple[Rect, ...]:
+    crop = image[panel.y : panel.bottom, panel.x : panel.right]
+    if crop.size == 0:
+        return ()
+
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 40, 120)
+    closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=2)
+    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    boxes: list[tuple[int, int, int, int]] = []
+    for contour in contours:
+        x, y, w, h = cv2.boundingRect(contour)
+        area = cv2.contourArea(contour)
+        aspect = w / max(1, h)
+        if 42 <= w <= 115 and 42 <= h <= 115 and 0.72 <= aspect <= 1.28 and area > 900:
+            boxes.append((x, y, w, h))
+
+    if boxes:
+        boxes = _dedupe_slot_boxes(boxes)
+        grid_boxes = _expand_backpack_slot_grid(boxes, crop.shape[1], crop.shape[0])
+    else:
+        grid_boxes = _fallback_backpack_slot_grid(crop)
+
+    slots: list[Rect] = []
+    for x, y, w, h in grid_boxes:
+        rect = _bounded_rect(panel.x + x, panel.y + y, w, h, image.shape[1], image.shape[0])
+        if _slot_has_icon(image, rect):
+            slots.append(rect)
+    return tuple(slots)
+
+
+def _dedupe_slot_boxes(boxes: list[tuple[int, int, int, int]]) -> list[tuple[int, int, int, int]]:
+    boxes = sorted(boxes, key=lambda item: item[2] * item[3], reverse=True)
+    kept: list[tuple[int, int, int, int]] = []
+    for box in boxes:
+        rect = Rect(box[0], box[1], box[2], box[3])
+        if all(_iou(rect, Rect(other[0], other[1], other[2], other[3])) < 0.55 for other in kept):
+            kept.append(box)
+    return sorted(kept, key=lambda item: (item[1], item[0]))
+
+
+def _expand_backpack_slot_grid(
+    boxes: list[tuple[int, int, int, int]],
+    width: int,
+    height: int,
+) -> list[tuple[int, int, int, int]]:
+    sizes = [max(w, h) for _, _, w, h in boxes]
+    slot = int(np.median(sizes)) if sizes else 80
+    centers_x = sorted(x + w / 2 for x, _, w, _ in boxes)
+    centers_y = sorted(y + h / 2 for _, y, _, h in boxes)
+    pitch_x = _median_positive_delta(centers_x, default=slot + 5)
+    pitch_y = _median_positive_delta(centers_y, default=slot + 7)
+    min_x = min(x for x, _, _, _ in boxes)
+    min_y = min(y for _, y, _, _ in boxes)
+
+    # The visible backpack page is a regular grid. Some colorful borders are
+    # hard to contour, so infer missing columns/rows from detected slots.
+    while min_x - pitch_x >= -slot * 0.55:
+        min_x -= pitch_x
+    while min_y - pitch_y >= -slot * 0.55:
+        min_y -= pitch_y
+
+    result: list[tuple[int, int, int, int]] = []
+    y = min_y
+    while y <= height - slot * 0.40:
+        x = min_x
+        while x <= width - slot * 0.40:
+            result.append((int(round(x)), int(round(y)), slot, slot))
+            x += pitch_x
+        y += pitch_y
+    return result
+
+
+def _fallback_backpack_slot_grid(crop: np.ndarray) -> list[tuple[int, int, int, int]]:
+    h, w = crop.shape[:2]
+    slot = max(54, min(88, int(h * 0.34)))
+    gap = max(4, int(slot * 0.08))
+    result: list[tuple[int, int, int, int]] = []
+    for y in range(0, max(1, h - slot + 1), slot + gap):
+        for x in range(0, max(1, w - slot + 1), slot + gap):
+            result.append((x, y, slot, slot))
+    return result
+
+
+def _median_positive_delta(values: list[float], default: float) -> float:
+    if len(values) < 2:
+        return default
+    deltas = [
+        b - a
+        for a, b in zip(values, values[1:])
+        if default * 0.55 <= b - a <= default * 1.60
+    ]
+    if not deltas:
+        return default
+    return float(np.median(deltas))
+
+
+def _slot_has_icon(image: np.ndarray, slot: Rect) -> bool:
+    crop = image[slot.y : slot.bottom, slot.x : slot.right]
+    if crop.size == 0:
+        return False
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    s = hsv[:, :, 1]
+    v = hsv[:, :, 2]
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 40, 120)
+    yy, xx = np.indices(gray.shape)
+    border = (
+        (yy < gray.shape[0] * 0.18)
+        | (yy > gray.shape[0] * 0.82)
+        | (xx < gray.shape[1] * 0.18)
+        | (xx > gray.shape[1] * 0.82)
+    )
+    icon_ratio = float(np.mean((s > 45) & (v > 55)))
+    bright_ratio = float(np.mean(v > 95))
+    edge_ratio = float(np.mean(edges > 0))
+    border_edge_ratio = float(np.mean((edges > 0) & border))
+    color_std = float(np.std(crop.reshape(-1, 3), axis=0).mean())
+    return (
+        icon_ratio > 0.10
+        and bright_ratio > 0.12
+        and edge_ratio > 0.055
+        and border_edge_ratio > 0.025
+        and color_std > 24.0
+    )
+
+
+def _analyze_backpack_slot(image: np.ndarray, slot: Rect) -> BackpackPaintObservation | None:
+    crop = image[slot.y : slot.bottom, slot.x : slot.right]
+    if crop.size == 0 or not _slot_has_icon(image, slot):
+        return None
+
+    category, category_confidence = _classify_backpack_category(crop)
+    level, level_confidence = _detect_backpack_level(crop)
+    is_treasure, treasure_confidence = _detect_treasure_icon(crop)
+    subtype = "宝箱" if is_treasure else None
+    if is_treasure:
+        category = PaintCategory.GAMEPLAY
+        category_confidence = max(category_confidence, treasure_confidence)
+    fingerprint = _backpack_slot_fingerprint(crop)
+    return BackpackPaintObservation(
+        slot_rect=slot,
+        category=category,
+        category_confidence=category_confidence,
+        level=level,
+        level_confidence=level_confidence,
+        subtype=subtype,
+        is_treasure=is_treasure,
+        fingerprint=fingerprint,
+    )
+
+
+def _classify_backpack_category(crop: np.ndarray) -> tuple[PaintCategory, float]:
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    circles = cv2.HoughCircles(
+        gray,
+        cv2.HOUGH_GRADIENT,
+        dp=1.2,
+        minDist=max(10, min(gray.shape[:2]) // 2),
+        param1=80,
+        param2=18,
+        minRadius=max(10, min(gray.shape[:2]) // 4),
+        maxRadius=max(14, min(gray.shape[:2]) // 2),
+    )
+    circle_score = 0.0 if circles is None else 0.72
+
+    edges = cv2.Canny(gray, 60, 160)
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    diamond_score = 0.0
+    area_total = crop.shape[0] * crop.shape[1]
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < area_total * 0.08:
+            continue
+        peri = cv2.arcLength(contour, True)
+        approx = cv2.approxPolyDP(contour, 0.055 * peri, True)
+        if len(approx) == 4:
+            x, y, w, h = cv2.boundingRect(approx)
+            aspect = w / max(1, h)
+            if 0.68 <= aspect <= 1.35:
+                diamond_score = max(diamond_score, min(0.88, area / max(1.0, area_total * 0.42)))
+
+    if diamond_score > circle_score + 0.04:
+        return PaintCategory.GAMEPLAY, max(0.50, diamond_score)
+    if circle_score > 0.0:
+        return PaintCategory.MONSTER, circle_score
+    return PaintCategory.UNKNOWN, 0.30
+
+
+def _detect_backpack_level(crop: np.ndarray) -> tuple[int, float]:
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    h = hsv[:, :, 0]
+    s = hsv[:, :, 1]
+    v = hsv[:, :, 2]
+    # Prefer the bottom-right label when visible.
+    label = crop[int(crop.shape[0] * 0.56) :, int(crop.shape[1] * 0.54) :]
+    digit = _detect_level_digit_from_label(label)
+    if digit is not None:
+        return digit, 0.72
+
+    border = (
+        (np.indices(h.shape)[0] < crop.shape[0] * 0.16)
+        | (np.indices(h.shape)[0] > crop.shape[0] * 0.84)
+        | (np.indices(h.shape)[1] < crop.shape[1] * 0.16)
+        | (np.indices(h.shape)[1] > crop.shape[1] * 0.84)
+    ) & (s > 60) & (v > 75)
+    scores = {
+        2: float(np.mean(border & (h >= 45) & (h <= 85))),
+        3: float(np.mean(border & (h >= 90) & (h <= 115))),
+        4: float(np.mean(border & (h >= 125) & (h <= 165))),
+        5: float(np.mean(border & (h >= 8) & (h <= 28))),
+        6: float(np.mean(border & (((h >= 0) & (h <= 8)) | (h >= 170)))),
+    }
+    best_level, best_score = max(scores.items(), key=lambda item: item[1])
+    if best_score > 0.02:
+        return best_level, float(np.clip(best_score / 0.12, 0.45, 0.82))
+    return 1, 0.55
+
+
+def _detect_level_digit_from_label(label_crop: np.ndarray) -> int | None:
+    if label_crop.size == 0:
+        return None
+    gray = cv2.cvtColor(label_crop, cv2.COLOR_BGR2GRAY)
+    gray = cv2.resize(gray, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
+    _, binary = cv2.threshold(gray, 145, 255, cv2.THRESH_BINARY)
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    boxes = []
+    for contour in contours:
+        x, y, w, h = cv2.boundingRect(contour)
+        if h < binary.shape[0] * 0.22 or w < 3:
+            continue
+        boxes.append((x, y, w, h))
+    for x, y, w, h in sorted(boxes, key=lambda item: item[0] + item[2], reverse=True)[:3]:
+        digit = _match_digit_template(binary[y : y + h, x : x + w])
+        if digit is not None:
+            return digit
+    return None
+
+
+def _detect_treasure_icon(crop: np.ndarray) -> tuple[bool, float]:
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    h = hsv[:, :, 0]
+    s = hsv[:, :, 1]
+    v = hsv[:, :, 2]
+    gold_ratio = float(np.mean((h >= 13) & (h <= 38) & (s > 70) & (v > 100)))
+    dark_center = crop[crop.shape[0] // 4 : crop.shape[0] * 3 // 4, crop.shape[1] // 4 : crop.shape[1] * 3 // 4]
+    if dark_center.size == 0:
+        return False, 0.0
+    center_hsv = cv2.cvtColor(dark_center, cv2.COLOR_BGR2HSV)
+    center_gold = float(np.mean((center_hsv[:, :, 0] >= 13) & (center_hsv[:, :, 0] <= 38) & (center_hsv[:, :, 1] > 70) & (center_hsv[:, :, 2] > 95)))
+    confidence = float(np.clip(max(gold_ratio, center_gold) / 0.20, 0.0, 0.85))
+    return (gold_ratio > 0.13 and center_gold > 0.10), confidence
+
+
+def _backpack_slot_fingerprint(crop: np.ndarray) -> str:
+    small = cv2.resize(crop, (8, 8), interpolation=cv2.INTER_AREA)
+    hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+    quantized = (hsv[:, :, 0] // 12).astype(np.uint8)
+    return "".join(f"{value:02x}" for value in quantized.flatten())
 
 
 def _brush_stage1_crop(crop: np.ndarray) -> np.ndarray:
@@ -773,6 +1067,95 @@ def _brush_stage1_scores(crop: np.ndarray) -> dict[str, float]:
         BrushType.STACK.value: scores.get("堆砌", 0.0),
         BrushType.SPREAD.value: scores.get("扩散", 0.0),
     }
+
+
+def _brush_card_pattern_scores(crop: np.ndarray) -> dict[str, float]:
+    if crop.size == 0:
+        return {}
+    cards = _split_brush_cards(crop)
+    scores = {
+        BrushType.TRANSFORM.value: 0.0,
+        BrushType.STACK.value: 0.0,
+        BrushType.SPREAD.value: 0.0,
+    }
+    for card in cards:
+        card_scores = _brush_pattern_score_single(card)
+        for brush_type, score in card_scores.items():
+            scores[brush_type] = max(scores[brush_type], score)
+    return scores
+
+
+def _split_brush_cards(crop: np.ndarray) -> list[np.ndarray]:
+    if crop.size == 0:
+        return []
+    h, w = crop.shape[:2]
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    active = (hsv[:, :, 1] > 35) & (hsv[:, :, 2] > 35)
+    row_activity = active.mean(axis=1)
+    rows = np.where(row_activity > 0.18)[0]
+    if len(rows) == 0:
+        return [crop]
+
+    segments: list[tuple[int, int]] = []
+    start = int(rows[0])
+    last = int(rows[0])
+    for row in rows[1:]:
+        row = int(row)
+        if row - last > max(5, h * 0.045):
+            if last - start > h * 0.06:
+                segments.append((start, last + 1))
+            start = row
+        last = row
+    if last - start > h * 0.06:
+        segments.append((start, last + 1))
+
+    cards = [crop[max(0, y0 - 2) : min(h, y1 + 2), :] for y0, y1 in segments]
+    return cards or [crop]
+
+
+def _brush_pattern_score_single(card: np.ndarray) -> dict[str, float]:
+    h, w = card.shape[:2]
+    if h < 12 or w < 32:
+        return {}
+    left = card[:, : max(1, int(w * 0.24))]
+    hsv = cv2.cvtColor(left, cv2.COLOR_BGR2HSV)
+    hue = hsv[:, :, 0]
+    sat = hsv[:, :, 1]
+    val = hsv[:, :, 2]
+    mask = (sat > 35) & (val > 35)
+    if not np.any(mask):
+        return {}
+
+    hs = hue[mask]
+    vs = val[mask]
+    cyan = float(np.mean((hs >= 88) & (hs <= 101)))
+    bright_blue = float(np.mean((hs >= 100) & (hs <= 108) & (vs > 130)))
+    deep_blue = float(np.mean((hs >= 108) & (hs <= 122)))
+    dim_blue = float(np.mean(vs < 115))
+    median_hue = float(np.median(hs))
+
+    # Workbook samples show stable families:
+    # 转锋: teal/cyan leaf motif, 堆砌: bright blue swirl, 扩散: deeper blue/purple target motif.
+    transform_score = _clamp01_vision((cyan - 0.28) / 0.55)
+    stack_score = _clamp01_vision((bright_blue - 0.22) / 0.52 + (1.0 - abs(median_hue - 103.0) / 18.0) * 0.22)
+    spread_score = _clamp01_vision((deep_blue - 0.32) / 0.60 + dim_blue * 0.18)
+
+    if transform_score < 0.22:
+        transform_score = 0.0
+    if stack_score < 0.22:
+        stack_score = 0.0
+    if spread_score < 0.22:
+        spread_score = 0.0
+
+    return {
+        BrushType.TRANSFORM.value: min(0.74, transform_score),
+        BrushType.STACK.value: min(0.72, stack_score),
+        BrushType.SPREAD.value: min(0.72, spread_score),
+    }
+
+
+def _clamp01_vision(value: float) -> float:
+    return max(0.0, min(1.0, value))
 
 
 def _detected_stage1_options(stage1_scores: dict[str, float]) -> tuple[str, ...]:
@@ -899,9 +1282,16 @@ def _brush_affix_token_keywords() -> tuple[str, ...]:
         "完成条件",
         "所需数量",
         "-2",
+        "-1",
+        "进度要求",
+        "减少1",
         "当前颜料",
         "等级随机",
+        "内容不变",
+        "作用方向",
+        "内容，等级不变",
         "重新获得",
+        "随机调色颜料",
         "初始颜料",
         "随机类型",
         "随机玩法",
@@ -910,6 +1300,12 @@ def _brush_affix_token_keywords() -> tuple[str, ...]:
         "随机1个",
         "随机2个",
         "随机1块",
+        "距离最近",
+        "最近1个",
+        "随机增加",
+        "调色进度",
+        "要求增加2",
+        "同等级",
         "所有颜料",
         "提升1级",
         "提升2级",
@@ -958,8 +1354,10 @@ def _estimate_regions(image: np.ndarray, board: BoardObservation) -> list[Region
     height, width = image.shape[:2]
     b = board.rect
     x0 = _clamp_int(b.right + b.w * 0.10, 0, width - 1)
+    content_x0 = _clamp_int(b.right - b.w * 0.06, 0, width - 1)
     right = _clamp_int(max(x0 + 1, width - b.w * 0.06), 1, width)
     panel_w = max(1, right - x0)
+    content_panel_w = max(1, right - content_x0)
     stage_mode = _detect_brush_options_mode(image, x0, b, panel_w)
 
     regions: list[RegionObservation] = [
@@ -1008,9 +1406,9 @@ def _estimate_regions(image: np.ndarray, board: BoardObservation) -> list[Region
                 RegionObservation(
                     kind=RegionKind.BACKPACK,
                     rect=_bounded_rect(
-                        x0,
+                        content_x0,
                         b.y + b.h * 0.29,
-                        panel_w,
+                        content_panel_w,
                         b.h * 0.50,
                         width,
                         height,
@@ -1098,6 +1496,9 @@ def _detect_brush_options_mode(image: np.ndarray, x0: int, board_rect: Rect, pan
         return False
 
     scores = _brush_stage1_scores(_brush_stage1_crop(roi))
+    pattern_scores = _brush_card_pattern_scores(roi)
+    for brush_type, score in pattern_scores.items():
+        scores[brush_type] = max(scores.get(brush_type, 0.0), score)
     ranked = sorted(scores.values(), reverse=True)
     strong_count = sum(1 for score in ranked if score >= 0.52)
     # The first initial paint has backpack icons here; their texture can match

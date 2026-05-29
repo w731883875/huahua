@@ -125,11 +125,31 @@ class BrushOptionsObservation:
 
 
 @dataclass(frozen=True)
+class BackpackPaintObservation:
+    slot_rect: Rect
+    category: PaintCategory
+    category_confidence: float
+    level: int
+    level_confidence: float
+    subtype: str | None = None
+    is_treasure: bool = False
+    fingerprint: str = ""
+
+
+@dataclass(frozen=True)
+class BackpackObservation:
+    panel_rect: Rect
+    paints: tuple[BackpackPaintObservation, ...]
+    confidence: float
+
+
+@dataclass(frozen=True)
 class SceneObservation:
     board: BoardObservation
     regions: tuple[RegionObservation, ...]
     current_paint: CurrentPaintObservation | None = None
     brush_options: BrushOptionsObservation | None = None
+    backpack: BackpackObservation | None = None
 
     def region(self, kind: RegionKind) -> RegionObservation | None:
         for region in self.regions:

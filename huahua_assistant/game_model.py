@@ -32,8 +32,12 @@ class AffixEffect(str, Enum):
     CHANGE_TARGET_OBJECT = "change_target_object"
     MATCH_REQUIRED_DELTA = "match_required_delta"
     RANDOMIZE_CURRENT_LEVEL = "randomize_current_level"
+    RANDOMIZE_CURRENT_DIRECTION = "randomize_current_direction"
+    RANDOMIZE_CURRENT_CONTENT = "randomize_current_content"
+    ADD_RANDOM_SCOPE = "add_random_scope"
     REROLL_CURRENT_RULE = "reroll_current_rule"
     UPGRADE_IN_SCOPE = "upgrade_in_scope"
+    UPGRADE_SCOPE_SAME_PAINT = "upgrade_scope_same_paint"
     UPGRADE_SELF = "upgrade_self"
     UPGRADE_GLOBAL_CATEGORY = "upgrade_global_category"
     UPGRADE_GLOBAL_SAME_PAINT = "upgrade_global_same_paint"
@@ -66,6 +70,7 @@ class Tile:
     state: TileState
     paint: Paint | None = None
     buff_applied_id: int | None = None
+    affix_applied_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -76,6 +81,7 @@ class CurrentPaintRule:
     match_required: int
     upgrade_amount: int
     match_current: int = 0
+    extra_directions: tuple[PaintDirection, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -89,6 +95,7 @@ class AffixRule:
     amount: int = 0
     count: int | None = None
     persistent_until_match: bool = False
+    nearest: bool = False
 
 
 @dataclass(frozen=True)
@@ -236,7 +243,7 @@ def current_scope_cells(state: PuzzleState, *, include_anchor: bool = True) -> t
     if state.current_rule is None or state.current_anchor is None:
         return ()
     row, col = state.current_anchor
-    cells = _scope_cells(row, col, state.current_rule.direction)
+    cells = _rule_scope_cells_for_anchor(row, col, state.current_rule)
     if include_anchor:
         return cells
     return tuple(cell for cell in cells if cell != state.current_anchor)
@@ -249,6 +256,7 @@ def current_rule_is_pending(state: PuzzleState) -> bool:
 def state_from_observation(
     board: BoardObservation,
     current_paint: CurrentPaintObservation | None = None,
+    backpack: tuple[Paint, ...] | list[Paint] = (),
 ) -> PuzzleState:
     rule = rule_from_observation(current_paint)
     anchor: tuple[int, int] | None = None
@@ -260,7 +268,12 @@ def state_from_observation(
     for tile in board.tiles:
         paint = rule.paint if anchor == (tile.row, tile.col) and rule is not None else None
         tiles.append(Tile(state=tile.state, paint=paint))
-    return PuzzleState(tiles=tuple(tiles), current_rule=rule, current_anchor=anchor)
+    return PuzzleState(
+        tiles=tuple(tiles),
+        current_rule=rule,
+        backpack=sort_backpack_for_rule(tuple(backpack), rule),
+        current_anchor=anchor,
+    )
 
 
 def rule_from_observation(current_paint: CurrentPaintObservation | None) -> CurrentPaintRule | None:
@@ -366,7 +379,7 @@ def _random_opening_rule_and_anchor(rng: random.Random, tiles: list[Tile]) -> tu
             )
         rng.shuffle(blank_cells)
         for row, col in blank_cells:
-            scope = tuple(cell for cell in _scope_cells(row, col, rule.direction) if cell != (row, col))
+            scope = tuple(cell for cell in _rule_scope_cells_for_anchor(row, col, rule) if cell != (row, col))
             placeable = sum(1 for r, c in scope if tiles[r * BOARD_SIZE + c].state == TileState.BLANK)
             if placeable >= rule.match_required:
                 return rule, (row, col)
@@ -611,7 +624,7 @@ def install_backpack_paint(state: PuzzleState, backpack_index: int, row: int, co
 
     paint = state.backpack[backpack_index]
     tiles = list(state.tiles)
-    tiles[row * BOARD_SIZE + col] = Tile(state=TileState.PAINT, paint=paint, buff_applied_id=None)
+    tiles[row * BOARD_SIZE + col] = Tile(state=TileState.PAINT, paint=paint, buff_applied_id=None, affix_applied_id=None)
     backpack = sort_backpack_for_rule(
         tuple(item for index, item in enumerate(state.backpack) if index != backpack_index),
         rule,
@@ -620,10 +633,13 @@ def install_backpack_paint(state: PuzzleState, backpack_index: int, row: int, co
     placed_state = replace(state, tiles=tuple(tiles), backpack=backpack)
     match_count = _current_match_count(placed_state, rule)
     upgraded_state, upgraded_count = _apply_current_rule_upgrade(placed_state, rule)
+    upgraded_state, persistent_affix_count = _apply_persistent_affix_after_install(upgraded_state)
     completed = match_count >= rule.match_required
     next_rule = replace(rule, match_current=min(match_count, rule.match_required))
     progress = f"{min(match_count, rule.match_required)}/{rule.match_required}"
     message = f"已安装{_paint_label(paint)}，安装即触发，范围内{upgraded_count}个目标颜料提升{rule.upgrade_amount}级，当前进度{progress}"
+    if persistent_affix_count:
+        message = f"{message}；持续词缀额外提升{persistent_affix_count}个颜料"
     if completed:
         upgraded_state, next_rule_message = _advance_to_next_current_rule(upgraded_state)
         message = f"完成匹配，{message}；{next_rule_message}"
@@ -657,7 +673,7 @@ def force_complete_current_rule(state: PuzzleState, force_used: int, seed: int |
     destroyed = tuple(sorted(rng.sample(paint_cells, min(damage_count, len(paint_cells))))) if paint_cells else ()
     tiles = list(upgraded_state.tiles)
     for row, col in destroyed:
-        tiles[row * BOARD_SIZE + col] = Tile(state=TileState.FADED, paint=None, buff_applied_id=None)
+        tiles[row * BOARD_SIZE + col] = Tile(state=TileState.FADED, paint=None, buff_applied_id=None, affix_applied_id=None)
     damaged_state = replace(upgraded_state, tiles=tuple(tiles))
     next_state, next_message = _advance_to_next_current_rule(damaged_state)
     message = (
@@ -778,13 +794,21 @@ def apply_affix_to_state(state: PuzzleState, affix: AffixRule, seed: int | None 
         AffixEffect.CHANGE_TARGET_OBJECT,
         AffixEffect.MATCH_REQUIRED_DELTA,
         AffixEffect.RANDOMIZE_CURRENT_LEVEL,
+        AffixEffect.RANDOMIZE_CURRENT_DIRECTION,
+        AffixEffect.RANDOMIZE_CURRENT_CONTENT,
+        AffixEffect.ADD_RANDOM_SCOPE,
         AffixEffect.REROLL_CURRENT_RULE,
     }:
         next_rule = _apply_rule_affix(rule, affix, state, rng)
         next_state = _replace_current_rule(
             state,
             next_rule,
-            update_anchor=affix.effect in {AffixEffect.RANDOMIZE_CURRENT_LEVEL, AffixEffect.REROLL_CURRENT_RULE},
+            update_anchor=affix.effect
+            in {
+                AffixEffect.RANDOMIZE_CURRENT_LEVEL,
+                AffixEffect.RANDOMIZE_CURRENT_CONTENT,
+                AffixEffect.REROLL_CURRENT_RULE,
+            },
         )
         return AffixApplyResult(state=next_state, success=True, message=f"已选择词缀：{affix.name}")
 
@@ -812,11 +836,19 @@ def apply_affix_to_state(state: PuzzleState, affix: AffixRule, seed: int | None 
 
     if affix.effect == AffixEffect.UPGRADE_GLOBAL_CATEGORY:
         next_state, count = _upgrade_global_category_paints(state, affix)
+        if affix.persistent_until_match:
+            next_state = replace(next_state, active_affix=affix)
         return AffixApplyResult(state=next_state, success=True, message=f"已选择词缀：{affix.name}，全图{count}个颜料已提升")
 
     if affix.effect == AffixEffect.UPGRADE_GLOBAL_SAME_PAINT:
         next_state, count = _upgrade_global_same_paints(state, affix)
+        if affix.persistent_until_match:
+            next_state = replace(next_state, active_affix=affix)
         return AffixApplyResult(state=next_state, success=True, message=f"已选择词缀：{affix.name}，全图{count}个同类颜料已提升")
+
+    if affix.effect == AffixEffect.UPGRADE_SCOPE_SAME_PAINT:
+        next_state, count = _upgrade_scope_same_paints(state, affix)
+        return AffixApplyResult(state=next_state, success=True, message=f"已选择词缀：{affix.name}，范围内{count}个同类颜料已提升")
 
     if affix.effect == AffixEffect.COPY_SELF_TO_SCOPE:
         next_state, count = _copy_self_to_scope(state)
@@ -1037,12 +1069,25 @@ def _score_affix(state: PuzzleState, affix: AffixRule) -> float:
         if current_fit < 0.65:
             return 130.0
         return 35.0
+    if affix.effect == AffixEffect.RANDOMIZE_CURRENT_DIRECTION:
+        return 80.0 if _current_rule_fit_score(state, rule) < 0.65 else 30.0
+    if affix.effect == AffixEffect.RANDOMIZE_CURRENT_CONTENT:
+        return 75.0 if not rule.paint.is_treasure else 20.0
+    if affix.effect == AffixEffect.ADD_RANDOM_SCOPE:
+        return 120.0 + _count_category_paints(state, rule.target_object) * 18.0 - max(0, affix.delta) * 35.0
     if affix.effect == AffixEffect.UPGRADE_SELF:
         return _level_gain_score(rule.paint, affix.amount, multiplier=1.15)
     if affix.effect == AffixEffect.UPGRADE_IN_SCOPE:
         affected = _best_scope_paint_count(state, rule.direction)
         count = affix.count if affix.count is not None else affected
         return min(affected, count) * _level_gain_score(rule.paint, affix.amount, multiplier=0.45)
+    if affix.effect == AffixEffect.UPGRADE_SCOPE_SAME_PAINT:
+        same_scope = sum(
+            1
+            for row, col in current_scope_cells(state, include_anchor=False)
+            if state.tile(row, col).paint is not None and _is_same_paint_kind(state.tile(row, col).paint, rule.paint)
+        )
+        return same_scope * _level_gain_score(rule.paint, affix.amount, multiplier=0.52)
     if affix.effect == AffixEffect.UPGRADE_GLOBAL_CATEGORY:
         target_count = _count_category_paints(state, affix.target_object)
         return target_count * affix.amount * 65.0 + (35.0 if affix.persistent_until_match else 0.0)
@@ -1101,7 +1146,7 @@ def _current_rule_fit_score(state: PuzzleState, rule: CurrentPaintRule) -> float
             tile = state.tile(row, col)
             if not _is_current_anchor_placeable(tile, state.active_affix):
                 continue
-            scope = tuple(cell for cell in _scope_cells(row, col, rule.direction) if cell != (row, col))
+            scope = tuple(cell for cell in _rule_scope_cells_for_anchor(row, col, rule) if cell != (row, col))
             existing_matches = sum(1 for r, c in scope if _tile_matches_target(state.tile(r, c), rule.target_object))
             placeable = sum(1 for r, c in scope if _is_placeable(state.tile(r, c), state.active_affix))
             possible = min(required, existing_matches + min(placeable, target_paints))
@@ -1124,8 +1169,16 @@ def _affix_reason(state: PuzzleState, affix: AffixRule) -> str:
         return "重新随机一张初始颜料，当前目标/地形不顺时救场"
     if affix.effect == AffixEffect.RANDOMIZE_CURRENT_LEVEL:
         return "随机改变当前初始颜料等级，赌高等级收益"
+    if affix.effect == AffixEffect.RANDOMIZE_CURRENT_DIRECTION:
+        return "随机改变当前初始颜料方向，适合当前范围卡住时救场"
+    if affix.effect == AffixEffect.RANDOMIZE_CURRENT_CONTENT:
+        return "随机改变当前初始颜料内容但保留等级，可赌更高价值类型"
+    if affix.effect == AffixEffect.ADD_RANDOM_SCOPE:
+        return "增加一种作用范围但提高进度要求，适合背包供给充足时扩大收益"
     if affix.effect == AffixEffect.UPGRADE_SELF:
         return f"自身提升{affix.amount}级，直接冲级"
+    if affix.effect == AffixEffect.UPGRADE_SCOPE_SAME_PAINT:
+        return "范围内同内容颜料额外提升，适合同类已铺开时冲级"
     if affix.effect == AffixEffect.COPY_SELF_TO_SCOPE:
         if rule and rule.paint.is_treasure:
             return "宝箱复制潜力最高"
@@ -1156,15 +1209,25 @@ def build_affix_catalog() -> tuple[AffixRule, ...]:
         AffixRule(BrushType.TRANSFORM, "作用方向改为全图", AffixEffect.CHANGE_DIRECTION, direction=PaintDirection.GLOBAL),
         AffixRule(BrushType.TRANSFORM, "作用对象改为另一类型", AffixEffect.CHANGE_TARGET_OBJECT),
         AffixRule(BrushType.TRANSFORM, "完成条件所需数量-2", AffixEffect.MATCH_REQUIRED_DELTA, delta=-2),
+        AffixRule(BrushType.TRANSFORM, "调色目标的进度要求减少1", AffixEffect.MATCH_REQUIRED_DELTA, delta=-1),
         AffixRule(BrushType.TRANSFORM, "当前颜料等级随机改变", AffixEffect.RANDOMIZE_CURRENT_LEVEL),
+        AffixRule(BrushType.TRANSFORM, "随机改变自身的等级，内容不变", AffixEffect.RANDOMIZE_CURRENT_LEVEL),
+        AffixRule(BrushType.TRANSFORM, "随机改变自身的作用方向", AffixEffect.RANDOMIZE_CURRENT_DIRECTION),
+        AffixRule(BrushType.TRANSFORM, "随机改变自身的内容，等级不变", AffixEffect.RANDOMIZE_CURRENT_CONTENT),
         AffixRule(BrushType.TRANSFORM, "重新获得一个随机初始颜料", AffixEffect.REROLL_CURRENT_RULE),
+        AffixRule(BrushType.TRANSFORM, "重新获得1个随机调色颜料", AffixEffect.REROLL_CURRENT_RULE),
         AffixRule(BrushType.TRANSFORM, "作用范围内颜料变成随机类型颜料", AffixEffect.RANDOMIZE_SCOPE_ANY),
         AffixRule(BrushType.TRANSFORM, "作用范围内颜料变成随机玩法类型颜料", AffixEffect.RANDOMIZE_SCOPE_CATEGORY, target_object=PaintObject.GAMEPLAY),
         AffixRule(BrushType.TRANSFORM, "作用范围内颜料变成随机怪物类型颜料", AffixEffect.RANDOMIZE_SCOPE_CATEGORY, target_object=PaintObject.MONSTER),
+        AffixRule(BrushType.STACK, "随机增加一种作用范围，调色进度要求增加2", AffixEffect.ADD_RANDOM_SCOPE, delta=2),
         AffixRule(BrushType.STACK, "范围内随机1个颜料提升1级", AffixEffect.UPGRADE_IN_SCOPE, amount=1, count=1),
         AffixRule(BrushType.STACK, "范围内随机2个颜料提升1级", AffixEffect.UPGRADE_IN_SCOPE, amount=1, count=2),
         AffixRule(BrushType.STACK, "范围内所有颜料提升1级", AffixEffect.UPGRADE_IN_SCOPE, amount=1),
         AffixRule(BrushType.STACK, "范围内所有颜料提升2级", AffixEffect.UPGRADE_IN_SCOPE, amount=2),
+        AffixRule(BrushType.STACK, "对调色范围内的随机1个颜料额外提升1级", AffixEffect.UPGRADE_IN_SCOPE, amount=1, count=1),
+        AffixRule(BrushType.STACK, "对调色范围内的随机2个颜料额外提升1级", AffixEffect.UPGRADE_IN_SCOPE, amount=1, count=2),
+        AffixRule(BrushType.STACK, "对调色范围内与自身内容相同的颜料额外提升1级", AffixEffect.UPGRADE_SCOPE_SAME_PAINT, amount=1),
+        AffixRule(BrushType.STACK, "对调色范围内与自身内容相同的颜料额外提升2级", AffixEffect.UPGRADE_SCOPE_SAME_PAINT, amount=2),
         AffixRule(BrushType.STACK, "自身提升1级", AffixEffect.UPGRADE_SELF, amount=1),
         AffixRule(BrushType.STACK, "自身提升2级", AffixEffect.UPGRADE_SELF, amount=2),
         AffixRule(BrushType.STACK, "自身提升3级", AffixEffect.UPGRADE_SELF, amount=3),
@@ -1178,10 +1241,13 @@ def build_affix_catalog() -> tuple[AffixRule, ...]:
         AffixRule(BrushType.STACK, "范围内颜料变成随机玩法类型颜料", AffixEffect.RANDOMIZE_SCOPE_CATEGORY, target_object=PaintObject.GAMEPLAY),
         AffixRule(BrushType.STACK, "范围内颜料变成随机怪物类型颜料", AffixEffect.RANDOMIZE_SCOPE_CATEGORY, target_object=PaintObject.MONSTER),
         AffixRule(BrushType.STACK, "范围内颜料变成随机类型颜料", AffixEffect.RANDOMIZE_SCOPE_ANY),
+        AffixRule(BrushType.STACK, "将作用范围内的颜料转变为同等级的随机颜料", AffixEffect.RANDOMIZE_SCOPE_ANY),
         AffixRule(BrushType.SPREAD, "横向随机阻挡地块变为空白地块", AffixEffect.CLEAR_TILE_IN_SCOPE, direction=PaintDirection.HORIZONTAL, target_object=PaintObject.BLOCKED_TILE, count=1),
         AffixRule(BrushType.SPREAD, "纵向随机阻挡地块变为空白地块", AffixEffect.CLEAR_TILE_IN_SCOPE, direction=PaintDirection.VERTICAL, target_object=PaintObject.BLOCKED_TILE, count=1),
         AffixRule(BrushType.SPREAD, "相邻随机阻挡地块变为空白地块", AffixEffect.CLEAR_TILE_IN_SCOPE, direction=PaintDirection.ADJACENT, target_object=PaintObject.BLOCKED_TILE, count=1),
         AffixRule(BrushType.SPREAD, "对角斜向随机阻挡地块变为空白地块", AffixEffect.CLEAR_TILE_IN_SCOPE, direction=PaintDirection.DIAGONAL, target_object=PaintObject.BLOCKED_TILE, count=1),
+        AffixRule(BrushType.SPREAD, "将距离最近的1个阻挡地块转变为空白地块", AffixEffect.CLEAR_TILE_IN_SCOPE, target_object=PaintObject.BLOCKED_TILE, count=1, nearest=True),
+        AffixRule(BrushType.SPREAD, "将作用范围中最近1个阻挡地块转变为空白地块", AffixEffect.CLEAR_TILE_IN_SCOPE, target_object=PaintObject.BLOCKED_TILE, count=1, nearest=True),
         AffixRule(BrushType.SPREAD, "范围内所有阻挡地块变为空白地块", AffixEffect.CLEAR_TILE_IN_SCOPE, target_object=PaintObject.BLOCKED_TILE),
         AffixRule(BrushType.SPREAD, "全图随机1块阻挡地块变为空白地块", AffixEffect.CLEAR_RANDOM_TILE_GLOBAL, target_object=PaintObject.BLOCKED_TILE, count=1),
         AffixRule(BrushType.SPREAD, "全图随机1块失色地块变为空白地块", AffixEffect.CLEAR_RANDOM_TILE_GLOBAL, count=1),
@@ -1241,14 +1307,14 @@ def _is_current_anchor_placeable(tile: Tile, affix: AffixRule | None) -> bool:
 
 def _tile_after_current_anchor_placement(tile: Tile, paint: Paint, affix: AffixRule | None) -> Tile:
     if affix is None:
-        return Tile(state=TileState.PAINT, paint=paint, buff_applied_id=None)
+        return Tile(state=TileState.PAINT, paint=paint, buff_applied_id=None, affix_applied_id=None)
     if tile.state == TileState.BLOCKED and affix.effect == AffixEffect.ALLOW_PLACE_ON_BLOCKED:
-        return Tile(state=TileState.PAINT, paint=paint, buff_applied_id=None)
+        return Tile(state=TileState.PAINT, paint=paint, buff_applied_id=None, affix_applied_id=None)
     if tile.state == TileState.VOID and affix.effect == AffixEffect.ALLOW_PLACE_ON_VOID_LOSE_SELF:
-        return Tile(state=TileState.FADED, paint=None, buff_applied_id=None)
+        return Tile(state=TileState.FADED, paint=None, buff_applied_id=None, affix_applied_id=None)
     if tile.state == TileState.PAINT and affix.effect == AffixEffect.ALLOW_PLACE_ON_PAINT_LOSE_SELF:
         return tile
-    return Tile(state=TileState.PAINT, paint=paint, buff_applied_id=None)
+    return Tile(state=TileState.PAINT, paint=paint, buff_applied_id=None, affix_applied_id=None)
 
 
 def _tile_matches_target(tile: Tile, target: PaintObject) -> bool:
@@ -1302,6 +1368,10 @@ def _tile_can_receive_current_buff(tile: Tile, state: PuzzleState) -> bool:
     return tile.buff_applied_id != state.current_buff_id
 
 
+def _tile_can_receive_persistent_affix(tile: Tile, state: PuzzleState) -> bool:
+    return tile.affix_applied_id != state.current_buff_id
+
+
 def _current_match_count(state: PuzzleState, rule: CurrentPaintRule) -> int:
     return sum(
         1
@@ -1325,6 +1395,7 @@ def _apply_current_rule_upgrade(state: PuzzleState, rule: CurrentPaintRule) -> t
             state=TileState.PAINT,
             paint=upgraded,
             buff_applied_id=state.current_buff_id,
+            affix_applied_id=tile.affix_applied_id,
         )
         upgraded_count += 1
     return replace(state, tiles=tuple(tiles)), upgraded_count
@@ -1410,7 +1481,10 @@ def _placement_scope_cells(state: PuzzleState, rule: CurrentPaintRule) -> tuple[
         return tuple((row, col) for row in range(BOARD_SIZE) for col in range(BOARD_SIZE))
     if state.current_anchor is None:
         return ()
-    return current_scope_cells(state, include_anchor=False)
+    if state.current_anchor is None:
+        return ()
+    row, col = state.current_anchor
+    return tuple(cell for cell in _rule_scope_cells_for_anchor(row, col, rule) if cell != state.current_anchor)
 
 
 def _recommend_current_anchor_positions(
@@ -1425,7 +1499,7 @@ def _recommend_current_anchor_positions(
             tile = state.tile(row, col)
             if not _is_current_anchor_placeable(tile, state.active_affix):
                 continue
-            scope = tuple(cell for cell in _scope_cells(row, col, rule.direction) if cell != (row, col))
+            scope = tuple(cell for cell in _rule_scope_cells_for_anchor(row, col, rule) if cell != (row, col))
             placeable = sum(1 for r, c in scope if _is_placeable(state.tile(r, c), state.active_affix))
             existing_matches = sum(1 for r, c in scope if _tile_matches_target(state.tile(r, c), rule.target_object))
             possible_matches = existing_matches + min(placeable, len(target_paints))
@@ -1481,6 +1555,13 @@ def _scope_cells(row: int, col: int, direction: PaintDirection) -> tuple[tuple[i
     if direction == PaintDirection.GLOBAL:
         return tuple((r, c) for r in range(BOARD_SIZE) for c in range(BOARD_SIZE))
     return ((row, col),)
+
+
+def _rule_scope_cells_for_anchor(row: int, col: int, rule: CurrentPaintRule) -> tuple[tuple[int, int], ...]:
+    cells: list[tuple[int, int]] = []
+    for direction in (rule.direction, *rule.extra_directions):
+        cells.extend(_scope_cells(row, col, direction))
+    return tuple(dict.fromkeys(cells))
 
 
 def _score_candidate(
@@ -1681,6 +1762,38 @@ def _apply_rule_affix(
         return replace(rule, paint=replace(rule.paint, level=rng.randint(1, MAX_LEVEL)))
     if affix.effect == AffixEffect.CHANGE_TARGET_OBJECT and affix.target_object is None:
         return replace(rule, target_object=_alternate_target_object(rule.target_object, rule.paint.category))
+    if affix.effect == AffixEffect.RANDOMIZE_CURRENT_DIRECTION:
+        return replace(
+            rule,
+            direction=rng.choice(
+                [
+                    PaintDirection.HORIZONTAL,
+                    PaintDirection.VERTICAL,
+                    PaintDirection.DIAGONAL,
+                    PaintDirection.ADJACENT,
+                    PaintDirection.GLOBAL,
+                ]
+            ),
+        )
+    if affix.effect == AffixEffect.RANDOMIZE_CURRENT_CONTENT:
+        next_category = _randomized_category(rule.paint.category, affix.target_object, rng)
+        return replace(rule, paint=_random_paint_with_category_level(rng, next_category, rule.paint.level))
+    if affix.effect == AffixEffect.ADD_RANDOM_SCOPE:
+        candidates = [
+            PaintDirection.HORIZONTAL,
+            PaintDirection.VERTICAL,
+            PaintDirection.DIAGONAL,
+            PaintDirection.ADJACENT,
+            PaintDirection.GLOBAL,
+        ]
+        existing = {rule.direction, *rule.extra_directions}
+        available = [direction for direction in candidates if direction not in existing]
+        extra = rng.choice(available or candidates)
+        return replace(
+            rule,
+            extra_directions=tuple(dict.fromkeys((*rule.extra_directions, extra))),
+            match_required=max(1, rule.match_required + max(0, affix.delta)),
+        )
     return apply_transform_affix(rule, affix)
 
 
@@ -1743,6 +1856,17 @@ def _resolve_anchor_affix(state: PuzzleState, affix: AffixRule | None) -> tuple[
     return state, ""
 
 
+def _apply_persistent_affix_after_install(state: PuzzleState) -> tuple[PuzzleState, int]:
+    affix = state.active_affix
+    if affix is None or not affix.persistent_until_match:
+        return state, 0
+    if affix.effect == AffixEffect.UPGRADE_GLOBAL_CATEGORY:
+        return _upgrade_global_category_paints(state, affix)
+    if affix.effect == AffixEffect.UPGRADE_GLOBAL_SAME_PAINT:
+        return _upgrade_global_same_paints(state, affix)
+    return state, 0
+
+
 def _upgrade_scope_paints(state: PuzzleState, affix: AffixRule, rng: random.Random) -> tuple[PuzzleState, int]:
     amount = max(1, affix.amount)
     candidates = [
@@ -1761,6 +1885,7 @@ def _upgrade_scope_paints(state: PuzzleState, affix: AffixRule, rng: random.Rand
             state=TileState.PAINT,
             paint=replace(tile.paint, level=min(MAX_LEVEL, tile.paint.level + amount)),
             buff_applied_id=tile.buff_applied_id,
+            affix_applied_id=tile.affix_applied_id,
         )
     return replace(state, tiles=tuple(tiles)), len(candidates)
 
@@ -1772,10 +1897,13 @@ def _upgrade_global_category_paints(state: PuzzleState, affix: AffixRule) -> tup
     for index, tile in enumerate(tiles):
         if tile.paint is None or not _paint_matches_target(tile.paint, affix.target_object or PaintObject.ALL):
             continue
+        if affix.persistent_until_match and not _tile_can_receive_persistent_affix(tile, state):
+            continue
         tiles[index] = Tile(
             state=TileState.PAINT,
             paint=replace(tile.paint, level=min(MAX_LEVEL, tile.paint.level + amount)),
             buff_applied_id=tile.buff_applied_id,
+            affix_applied_id=state.current_buff_id if affix.persistent_until_match else tile.affix_applied_id,
         )
         count += 1
     return replace(state, tiles=tuple(tiles)), count
@@ -1791,10 +1919,35 @@ def _upgrade_global_same_paints(state: PuzzleState, affix: AffixRule) -> tuple[P
     for index, tile in enumerate(tiles):
         if tile.paint is None or not _is_same_paint_kind(tile.paint, rule.paint):
             continue
+        if affix.persistent_until_match and not _tile_can_receive_persistent_affix(tile, state):
+            continue
         tiles[index] = Tile(
             state=TileState.PAINT,
             paint=replace(tile.paint, level=min(MAX_LEVEL, tile.paint.level + amount)),
             buff_applied_id=tile.buff_applied_id,
+            affix_applied_id=state.current_buff_id if affix.persistent_until_match else tile.affix_applied_id,
+        )
+        count += 1
+    return replace(state, tiles=tuple(tiles)), count
+
+
+def _upgrade_scope_same_paints(state: PuzzleState, affix: AffixRule) -> tuple[PuzzleState, int]:
+    rule = state.current_rule
+    if rule is None:
+        return state, 0
+    amount = max(1, affix.amount)
+    tiles = list(state.tiles)
+    count = 0
+    for row, col in _affix_scope_cells(state, affix):
+        index = row * BOARD_SIZE + col
+        tile = tiles[index]
+        if tile.paint is None or not _is_same_paint_kind(tile.paint, rule.paint):
+            continue
+        tiles[index] = Tile(
+            state=TileState.PAINT,
+            paint=replace(tile.paint, level=min(MAX_LEVEL, tile.paint.level + amount)),
+            buff_applied_id=tile.buff_applied_id,
+            affix_applied_id=tile.affix_applied_id,
         )
         count += 1
     return replace(state, tiles=tuple(tiles)), count
@@ -1811,7 +1964,7 @@ def _copy_self_to_scope(state: PuzzleState) -> tuple[PuzzleState, int]:
         tile = tiles[index]
         if tile.state != TileState.PAINT:
             continue
-        tiles[index] = Tile(state=TileState.PAINT, paint=rule.paint, buff_applied_id=None)
+        tiles[index] = Tile(state=TileState.PAINT, paint=rule.paint, buff_applied_id=None, affix_applied_id=None)
         count += 1
     return replace(state, tiles=tuple(tiles)), count
 
@@ -1843,7 +1996,7 @@ def _randomize_scope_paints(state: PuzzleState, affix: AffixRule, rng: random.Ra
             continue
         category = _randomized_category(tile.paint.category, affix.target_object, rng)
         next_paint = _random_paint_with_category_level(rng, category, tile.paint.level)
-        tiles[index] = Tile(state=TileState.PAINT, paint=next_paint, buff_applied_id=None)
+        tiles[index] = Tile(state=TileState.PAINT, paint=next_paint, buff_applied_id=None, affix_applied_id=None)
         count += 1
     return replace(state, tiles=tuple(tiles)), count
 
@@ -1856,7 +2009,11 @@ def _clear_scope_tiles(state: PuzzleState, affix: AffixRule, rng: random.Random)
         if state.tile(row, col).state == tile_state
     ]
     if affix.count is not None:
-        candidates = rng.sample(candidates, min(affix.count, len(candidates))) if candidates else []
+        count = min(affix.count, len(candidates))
+        if affix.nearest:
+            candidates = _nearest_indices_to_anchor(state, candidates)[:count]
+        else:
+            candidates = rng.sample(candidates, count) if candidates else []
     return _clear_tile_indices(state, candidates)
 
 
@@ -1873,7 +2030,7 @@ def _clear_global_tiles(state: PuzzleState, affix: AffixRule, rng: random.Random
 def _clear_tile_indices(state: PuzzleState, indices: list[int]) -> tuple[PuzzleState, int]:
     tiles = list(state.tiles)
     for index in indices:
-        tiles[index] = Tile(state=TileState.BLANK, paint=None, buff_applied_id=None)
+        tiles[index] = Tile(state=TileState.BLANK, paint=None, buff_applied_id=None, affix_applied_id=None)
     return replace(state, tiles=tuple(tiles)), len(indices)
 
 
@@ -1882,8 +2039,26 @@ def _affix_scope_cells(state: PuzzleState, affix: AffixRule | None) -> tuple[tup
     if rule is None or state.current_anchor is None:
         return ()
     row, col = state.current_anchor
-    direction = affix.direction if affix and affix.direction is not None else rule.direction
-    return tuple(cell for cell in _scope_cells(row, col, direction) if cell != state.current_anchor)
+    directions = [affix.direction if affix and affix.direction is not None else rule.direction]
+    if affix is None or affix.direction is None:
+        directions.extend(rule.extra_directions)
+    cells: list[tuple[int, int]] = []
+    for direction in directions:
+        cells.extend(cell for cell in _scope_cells(row, col, direction) if cell != state.current_anchor)
+    return tuple(dict.fromkeys(cells))
+
+
+def _nearest_indices_to_anchor(state: PuzzleState, indices: list[int]) -> list[int]:
+    if state.current_anchor is None:
+        return indices
+    anchor_row, anchor_col = state.current_anchor
+    return sorted(
+        indices,
+        key=lambda index: (
+            abs(index // BOARD_SIZE - anchor_row) + abs(index % BOARD_SIZE - anchor_col),
+            index,
+        ),
+    )
 
 
 def _randomized_category(

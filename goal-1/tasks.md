@@ -99,15 +99,46 @@ Next step:
 
 ## Task 4 - Add Structured Recommendation Explanation
 
-Status: pending
+Status: completed
 
 Work performed:
+- Added `RecommendationExplanation` to `huahua_assistant/game_model.py`.
+- Added optional `explanation` data to `PlacementRecommendation` while keeping the existing `reason` string intact.
+- Populated structured explanations for normal backpack placement recommendations.
+- Populated structured explanations for pending current-paint anchor placement recommendations.
+- Split recommendation explanation into:
+  - `immediate`
+  - `terrain`
+  - `risk`
+  - `resource`
+  - `expected`
+  - `value`
+  - `tags`
+  - `short`
+- Added compact Chinese `short` labels for key cases such as treasure-to-7, match completion, level-7 push, overwrite risk, terrain gain, and anchor placement.
 
 Validation evidence:
+- `python -m compileall huahua_assistant run_app.py` completed successfully.
+- `python -B` smoke test constructed a normal placement state and confirmed:
+  - `normal_count= 3`
+  - `normal_explanation= True`
+  - `normal_short= 推进1格`
+  - `normal_tags= ('treasure', 'high_value_gain')`
+- `python -B` smoke test constructed a pending initial-paint anchor state and confirmed:
+  - `anchor_count= 3`
+  - `anchor_explanation= True`
+  - `anchor_short= 可完成地形`
+  - `anchor_tags= ('anchor', 'can_complete')`
+- `git diff --check -- huahua_assistant/game_model.py` found no whitespace errors.
+- Code change committed as `488d1be Add structured recommendation explanations`.
 
 Remaining risk:
+- The structured explanation is available in the recommendation objects but is not yet shown in the side-panel UI or desktop-pet marker labels.
+- The numeric breakdown mirrors the current scoring model; future tuning should still use real high-value trajectory data once Task 7 strengthens logging.
+- Current UI mojibake remains outside this task's scope.
 
 Next step:
+- Connect the explanation output to the existing recommendation panel and desktop-pet marker labels so the user can see why a cell/backpack/affix is recommended.
 
 ## Task 5 - Connect Explanation Output To UI And Marker Labels
 

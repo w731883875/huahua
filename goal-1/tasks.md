@@ -289,15 +289,63 @@ Next step:
 
 ## Task 9 - Major Checkpoint 3
 
-Status: pending
+Status: completed
 
 Work performed:
+- Re-read the goal input, plan, and task list before starting the checkpoint.
+- Reviewed requirement drift after Tasks 7-8:
+  - The implementation still uses small coordinate-anchored desktop-pet marker windows instead of a broad full-screen overlay.
+  - The marker layer still does not inject clicks, control the game, read memory, or take over user input.
+  - Recommendation explanations are still present in the model, side-panel compact output, marker captions, and learning snapshots.
+  - Learning writes still reject non-`real_capture` sources and keep recommendation semantics separate from actual placement priors.
+- Reviewed capture safety:
+  - `run_app.py` installs `install_desktop_pet_markers(HuahuaApp)` at startup.
+  - Full capture, quick capture, and auto-follow capture are patched to hide desktop-pet markers before entering the original capture paths.
+  - The broad legacy overlay in `HuahuaApp._refresh_overlay()` remains effectively disabled unless patched by the desktop-pet marker module.
+- Reviewed UI/UX safety:
+  - The coordinate hint checkbox remains the feature toggle.
+  - Marker windows are small, topmost, transparent-background, and attempt Windows click-through/no-activate styles.
+  - The marker layer can be disabled by toggling the coordinate hint off.
+- Reviewed data consistency and rollback:
+  - Presentation changes remain isolated in `huahua_assistant/desktop_pet.py` plus the startup patch in `run_app.py`.
+  - Recommendation data added to learning stats is semantic recommendation context, not assumed user-click data.
+  - Simulation mode remains separate from real learning logs.
+- During validation, one first-pass test harness accidentally targeted real `runtime` learning paths. Restored the affected runtime files and re-ran the learning test with all learning paths redirected to an isolated temporary directory.
 
 Validation evidence:
+- `git status --short` was clean at the start of the checkpoint.
+- `python -m compileall huahua_assistant run_app.py` completed successfully.
+- `git diff --check` completed successfully.
+- `rg` checks confirmed:
+  - `run_app.py` imports and installs `install_desktop_pet_markers`.
+  - desktop-pet patch wraps `capture_async`, `quick_capture_async`, and `_auto_follow_tick`.
+  - learning entry points and stats filters require `source == "real_capture"`.
+  - recommendation explanation fields are compacted into real-capture steps and high-value observations.
+- `python -B` smoke test confirmed marker patch idempotency and capture-hide behavior:
+  - `marker_patch_idempotent=True`
+  - `hide_for_capture_order=withdraw,flush,flush`
+- `python -B` smoke test confirmed compact recommendation explanations preserve short text, tags, and numeric layers:
+  - `explanation_compact=True`
+  - `explanation_lines=3`
+- Isolated learning smoke test confirmed:
+  - simulation observations and trajectories are ignored
+  - real observations and trajectories are accepted
+  - high-value recommendation tags aggregate from real `recommendations`
+  - temporary test data was deleted afterward
+- `python -B` startup smoke test confirmed importing `run_app.py` installs the desktop-pet patch:
+  - `run_app_patch_installed=True`
+  - `refresh_name=patched_refresh_overlay`
+- After restoring validation artifacts and deleting generated cache files, `git status --short` was clean before this task-record update.
 
 Remaining risk:
+- Real game runtime testing is still needed to prove marker visibility and click-through behavior under the user's exact display mode.
+- Ordinary topmost Tk marker windows may not appear above true exclusive fullscreen; borderless/windowed fullscreen remains the supported first target.
+- `mss` still captures a desktop rectangle; marker hiding and DWM/Tk flushing reduce contamination risk, but true window capture remains the stronger future option if stale marker frames still appear.
+- Brush-stage marker coordinates are still approximate because recognition currently exposes the brush panel rect rather than exact per-card option rects.
+- Existing mojibake UI strings remain a readability issue and should be cleaned only in a focused future task to avoid broad regressions.
 
 Next step:
+- Run the final integration review and packaging-readiness notes, including user-facing behavior, remaining runtime risks, rollback path, and whether any final small fixes are required before marking the goal complete.
 
 ## Task 10 - Final Integration Review And Packaging Readiness Notes
 

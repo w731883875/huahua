@@ -174,15 +174,40 @@ Next step:
 
 ## Task 6 - Major Checkpoint 2
 
-Status: pending
+Status: completed
 
 Work performed:
+- Reviewed requirement drift after Tasks 4-5. The implementation still aligns with the plan: structured recommendation explanations exist in the decision model and are now surfaced in both the side panel and small desktop-pet markers.
+- Reviewed UI behavior. The old broad overlay remains effectively disabled in `HuahuaApp._refresh_overlay()`, while `desktop_pet.py` patches the app to use small marker windows only when the coordinate hint toggle is enabled.
+- Reviewed marker safety. The desktop-pet patch remains idempotent, uses click-through Windows styles, and hides marker windows before full capture, quick capture, and auto-follow capture ticks.
+- Reviewed data consistency. Learning entry points still reject non-`real_capture` sources; simulation mode remains separated and does not write learning records.
+- Reviewed rollback needs. Presentation changes are isolated in `huahua_assistant/desktop_pet.py` plus startup patch wiring in `run_app.py`; disabling/removing the patch can roll back marker presentation without removing recommendation logic.
+- Cleaned generated Python cache changes after validation so no `pyc` files are left dirty.
 
 Validation evidence:
+- `git status --short` was clean before the checkpoint checks.
+- `python -m compileall huahua_assistant run_app.py` completed successfully.
+- `python -B` smoke test confirmed `install_desktop_pet_markers(HuahuaApp)` is idempotent:
+  - `patch_idempotent= True`
+- `python -B` smoke test confirmed recommendation explanation UI helpers produce three explanation lines and preserve the short marker caption:
+  - `line_count= 3`
+  - `caption= \u5b9d\u7bb1\u52307`
+  - `fit= \u5b9d\u7bb1\u52307`
+- `python -B` smoke test confirmed learning filters reject simulation data and accept real-capture data:
+  - `sim_observation_exists= False`
+  - `sim_trajectory_saved= False`
+  - `real_observation_exists= True`
+  - `real_trajectory_saved= True`
+- `git diff --check` found no whitespace errors.
 
 Remaining risk:
+- Real game runtime testing is still required to prove the small topmost marker windows are visible and click-through under the user's exact display mode.
+- `mss` can still theoretically capture marker windows if Windows has not hidden them visually before screenshot; Task 8 should strengthen hide/settle capture safety.
+- Brush option marker coordinates are still approximate because the recognition observation does not expose per-card rectangles.
+- Existing mojibake strings remain a readability issue but were not broadened in this checkpoint.
 
 Next step:
+- Strengthen real-only trajectory and high-value logging so the tool records useful real-operation data for later probability-based recommendation tuning without accepting simulation or manually polluted scores.
 
 ## Task 7 - Strengthen Real-Only Trajectory And High-Value Logging
 

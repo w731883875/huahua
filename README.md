@@ -110,6 +110,53 @@ python -m huahua_assistant brush-order stack transform
 
 这个优先级参考了成熟 match-3/合成类玩法的通用策略：先完成关卡目标，再制造高价值特殊棋子，最后考虑连锁与空间管理。
 
+## 真实学习与配置
+
+真实 Capture 会写入轻量学习记录，模拟模式不会进入学习数据。低置信度截图仍会显示和允许纠错，但不会保存为高分轨迹。
+
+- `runtime/observations.jsonl`：真实识别事件、质量分、规则异常提醒。
+- `runtime/corrected_observations.jsonl`：`Verify Capture` 保存的人工纠错。
+- `runtime/high_score_trajectories.jsonl`：只自动保存高价值真实轨迹，例如出现6/7级宝箱或多个7级。
+- `runtime/stats.json`：从以上原始数据重建的统计摘要。
+
+当真实高分轨迹样本足够后，工具会把常用落点、常选大类、常选词缀作为“经验先验”轻量加到推荐分里。这个加分不会覆盖硬规则：低级宝箱覆盖高级宝箱、强制完成高风险等仍按规则扣分。
+
+轨迹动作短码：
+
+- `C`：放置新的初始颜料。
+- `P`：从背包安装颜料。
+- `F`：强制完成。
+- `R1` / `R2`：一阶段/二阶段刷新词缀。
+- `B`：二阶段词条选项变化。
+- `T`：地形变化。
+- `N`：出现新的初始颜料。
+
+可以新建 `runtime/strategy_config.json` 覆盖默认阈值，例如：
+
+```json
+{
+  "quality": {
+    "min_overall": 0.58,
+    "min_board": 0.48
+  },
+  "autosave": {
+    "min_internal_score": 3000.0,
+    "min_treasure6": 1,
+    "min_lv7": 3
+  },
+  "learning": {
+    "placement_min_samples": 30,
+    "placement_max_bonus": 180.0
+  }
+}
+```
+
+桌面按钮：
+
+- `纠错识别`：纠错本次真实识别，并把错误字段计入统计。
+- `识别统计`：查看识别高风险字段、词条冲突、真实轨迹数量。
+- `导出数据` / `合并数据`：导出或合并多个用户的真实学习数据。
+
 ## 打包 exe
 
 ```powershell

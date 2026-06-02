@@ -67,6 +67,8 @@ def capture_target(
     window_title: str = DEFAULT_WINDOW_TITLE,
     fallback_to_screen: bool = True,
     fallback_if_target_uncaptureable: bool = False,
+    activate: bool = True,
+    activation_delay: float = 0.35,
 ) -> CaptureResult:
     candidates = _target_candidates(window_title)
     matches = find_matching_windows(candidates)
@@ -80,12 +82,14 @@ def capture_target(
     captureable = [window for window in matches if window.captureable]
     window = max(captureable, key=lambda item: item.width * item.height) if captureable else None
     if window is not None:
-        activate_window(window.hwnd)
-        time.sleep(0.35)
-        refreshed_matches = find_matching_windows(candidates)
-        refreshed_captureable = [item for item in refreshed_matches if item.captureable]
-        if refreshed_captureable:
-            window = max(refreshed_captureable, key=lambda item: item.width * item.height)
+        if activate:
+            activate_window(window.hwnd)
+            if activation_delay > 0:
+                time.sleep(activation_delay)
+            refreshed_matches = find_matching_windows(candidates)
+            refreshed_captureable = [item for item in refreshed_matches if item.captureable]
+            if refreshed_captureable:
+                window = max(refreshed_captureable, key=lambda item: item.width * item.height)
         region = {
             "left": window.left,
             "top": window.top,

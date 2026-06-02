@@ -4,6 +4,7 @@ import random
 from dataclasses import dataclass, replace
 from enum import Enum
 
+from .config import config_value
 from .models import (
     BoardObservation,
     CurrentPaintObservation,
@@ -16,6 +17,17 @@ from .models import (
 
 BOARD_SIZE = 6
 MAX_LEVEL = 7
+# Value scale: one gameplay Lv7 is the base unit. Treasure values follow the
+# user's explicit box-to-gameplay equivalence. Monster Lv7 is a top-end
+# approximation because the supplied box-to-monster ratios are not mutually
+# consistent across treasure Lv5/Lv6/Lv7.
+GAMEPLAY_7_VALUE = 1000.0
+MONSTER_7_VALUE = GAMEPLAY_7_VALUE / 1.4
+TREASURE_LEVEL_VALUES = {
+    5: GAMEPLAY_7_VALUE,
+    6: GAMEPLAY_7_VALUE * 3.0,
+    7: GAMEPLAY_7_VALUE * 5.0,
+}
 
 
 class BrushType(str, Enum):
@@ -151,6 +163,11 @@ class PlacementOutcome:
     completes_match: bool
     current_next_level: int
     affected_paints: int
+    value_gain: float
+    placed_value_gain: float
+    overwritten_paint: Paint | None
+    overwrite_penalty: float
+    terrain_delta: float
     treasure_to_7: int
     gameplay_to_7: int
     monster_to_7: int
@@ -459,7 +476,13 @@ def _random_paint_with_category_level(rng: random.Random, category: PaintCategor
     return Paint(category=category, level=level, subtype=subtype, is_treasure=subtype == "宝箱")
 
 
-def recommend_placements(state: PuzzleState, limit: int = 5) -> list[PlacementRecommendation]:
+def recommend_placements(
+    state: PuzzleState,
+    limit: int = 5,
+    *,
+    include_lookahead: bool = True,
+    learning_stats: dict | None = None,
+) -> list[PlacementRecommendation]:
     rule = state.current_rule
     if rule is None:
         return []
@@ -479,6 +502,14 @@ def recommend_placements(state: PuzzleState, limit: int = 5) -> list[PlacementRe
                 continue
             outcome = _placement_outcome(state, rule, row, col, scoped_cells, paint)
             score = _score_candidate(state, rule, row, col, scoped_cells, outcome, paint)
+            lookahead_score = (
+                _candidate_lookahead_score(state, rule, row, col, paint, outcome)
+                if include_lookahead
+                else 0.0
+            )
+            score += lookahead_score
+            prior_score = _placement_policy_prior_score(learning_stats, row, col) if learning_stats else 0.0
+            score += prior_score
             if score <= 0:
                 continue
             recommendations.append(
@@ -489,10 +520,11 @@ def recommend_placements(state: PuzzleState, limit: int = 5) -> list[PlacementRe
                     score=score,
                     completes_match=outcome.completes_match,
                     affected=scoped_cells,
-                    reason=_reason(rule, outcome, paint),
+                    reason=_reason(rule, outcome, paint, lookahead_score, prior_score),
                 )
             )
 
+    recommendations = _dedupe_placement_recommendations(recommendations)
     recommendations.sort(key=lambda item: item.score, reverse=True)
     return recommendations[:limit]
 
@@ -564,7 +596,7 @@ def recommend_install_plan(state: PuzzleState) -> InstallPlan | None:
             sim_state = replace(sim_state, current_rule=replace(current_rule, match_current=current_rule.match_required))
             break
 
-        recs = recommend_placements(sim_state, limit=24)
+        recs = recommend_placements(sim_state, limit=24, include_lookahead=False)
         if not recs:
             break
         best = recs[0]
@@ -651,6 +683,49 @@ def install_backpack_paint(state: PuzzleState, backpack_index: int, row: int, co
     )
 
 
+def _simulate_install_without_next_rule(
+    state: PuzzleState,
+    rule: CurrentPaintRule,
+    row: int,
+    col: int,
+    paint: Paint,
+) -> tuple[PuzzleState, bool] | None:
+    scope = set(_placement_scope_cells(state, rule))
+    if (row, col) not in scope or not _is_placeable(state.tile(row, col), state.active_affix):
+        return None
+    tiles = list(state.tiles)
+    tiles[row * BOARD_SIZE + col] = Tile(state=TileState.PAINT, paint=paint, buff_applied_id=None, affix_applied_id=None)
+    backpack = sort_backpack_for_rule(_remove_one_paint(state.backpack, paint), rule)
+    placed_state = replace(state, tiles=tuple(tiles), backpack=backpack)
+    match_count = _current_match_count(placed_state, rule)
+    upgraded_state, _upgraded_count = _apply_current_rule_upgrade(placed_state, rule)
+    upgraded_state, _persistent_affix_count = _apply_persistent_affix_after_install(upgraded_state)
+    completed = match_count >= rule.match_required
+    next_rule = replace(rule, match_current=min(match_count, rule.match_required))
+    if completed:
+        upgraded_state = replace(
+            upgraded_state,
+            current_rule=None,
+            current_anchor=None,
+            active_affix=None,
+            current_buff_id=state.current_buff_id + 1,
+        )
+    else:
+        upgraded_state = replace(upgraded_state, current_rule=next_rule)
+    return upgraded_state, completed
+
+
+def _remove_one_paint(backpack: tuple[Paint, ...], paint: Paint) -> tuple[Paint, ...]:
+    removed = False
+    result: list[Paint] = []
+    for item in backpack:
+        if not removed and item == paint:
+            removed = True
+            continue
+        result.append(item)
+    return tuple(result)
+
+
 def force_complete_current_rule(state: PuzzleState, force_used: int, seed: int | None = None) -> ForceCompleteResult:
     rule = state.current_rule
     if rule is None:
@@ -729,10 +804,16 @@ def _advance_to_next_current_rule(state: PuzzleState) -> tuple[PuzzleState, str]
 def recommend_brush_types(
     state: PuzzleState,
     options: tuple[BrushType, ...] | list[BrushType],
+    *,
+    learning_stats: dict | None = None,
 ) -> list[BrushRecommendation]:
     normalized = normalize_brush_options(options)
     recommendations = [
-        BrushRecommendation(brush_type=brush_type, score=_score_brush_type(state, brush_type), reason=_brush_reason(state, brush_type))
+        BrushRecommendation(
+            brush_type=brush_type,
+            score=_score_brush_type(state, brush_type) + _brush_policy_prior_score(learning_stats, brush_type),
+            reason=_brush_reason(state, brush_type, _brush_policy_prior_score(learning_stats, brush_type)),
+        )
         for brush_type in normalized
     ]
     recommendations.sort(key=lambda item: item.score, reverse=True)
@@ -742,9 +823,15 @@ def recommend_brush_types(
 def recommend_affixes(
     state: PuzzleState,
     options: tuple[AffixRule, ...] | list[AffixRule],
+    *,
+    learning_stats: dict | None = None,
 ) -> list[AffixRecommendation]:
     recommendations = [
-        AffixRecommendation(affix=affix, score=_score_affix(state, affix), reason=_affix_reason(state, affix))
+        AffixRecommendation(
+            affix=affix,
+            score=_score_affix(state, affix) + _affix_policy_prior_score(learning_stats, affix),
+            reason=_affix_reason(state, affix, _affix_policy_prior_score(learning_stats, affix)),
+        )
         for affix in options
     ]
     recommendations.sort(key=lambda item: item.score, reverse=True)
@@ -891,21 +978,30 @@ def _recommend_force_complete(
     reward = _force_completion_reward(rule)
     risk = _expected_force_damage(state, damage_count)
     natural = recommend_placements(state, limit=1)
-    natural_completes = bool(natural and natural[0].completes_match)
+    current_already_complete = _current_match_count(state, rule) >= rule.match_required
+    natural_completes = current_already_complete or bool(natural and natural[0].completes_match)
     score = reward - risk
+    protected_treasures = _protected_treasure_count(state)
     reason_parts = [
         f"立即完成当前匹配，预计收益{reward:.0f}",
         f"第{resources.force_used + 1}次会随机破坏{damage_count}个颜料，风险{risk:.0f}",
     ]
+    if protected_treasures:
+        score -= protected_treasures * float(config_value("force.protected_treasure_penalty", 260.0))
+        reason_parts.append(f"棋盘已有{protected_treasures}个6/7级宝箱，强制破坏风险需保守")
     if natural_completes:
-        score -= 900.0
+        score -= float(config_value("force.natural_completion_penalty", 900.0))
         reason_parts.append("已有自然完成落点，强制完成应保留")
     else:
-        score += 450.0
+        score += float(config_value("force.no_natural_completion_bonus", 450.0))
         reason_parts.append("当前没有自然完成，救场价值上升")
     if rule.paint.is_treasure:
-        reason_parts.append("当前是宝箱，强制收益更高")
-    recommended = score >= 350.0
+        if rule.paint.level >= 6 and not natural_completes:
+            score += float(config_value("force.high_treasure_rescue_bonus", 520.0))
+            reason_parts.append("当前是高等级宝箱且自然完成困难，强制救场价值高")
+        else:
+            reason_parts.append("当前是宝箱，强制收益更高")
+    recommended = score >= float(config_value("force.recommend_threshold", 350.0))
     if not recommended:
         reason_parts.append("暂不建议，除非局面即将卡死")
     return SpecialActionRecommendation(
@@ -935,6 +1031,10 @@ def _recommend_refresh_stage1(
         f"当前最佳{current_best.brush_type.value}={current_best.score:.0f}，"
         f"理想最佳{ideal_best.brush_type.value}={ideal_best.score:.0f}"
     )
+    rule = state.current_rule
+    if rule is not None and rule.paint.is_treasure and BrushType.STACK not in brush_scenario.stage1_options:
+        score += float(config_value("refresh.treasure_missing_stack_bonus", 420.0))
+        reason += "；当前是宝箱但一阶段没有堆砌，建议积极刷新赌堆砌"
     if missing_ideal:
         score += 120.0
         reason += "；理想大类未出现，可考虑阶段1刷新"
@@ -943,7 +1043,7 @@ def _recommend_refresh_stage1(
     return SpecialActionRecommendation(
         action=SpecialAction.REFRESH_STAGE1,
         score=score,
-        recommended=score >= 120.0,
+        recommended=score >= float(config_value("refresh.stage1_threshold", 120.0)),
         reason=reason,
     )
 
@@ -967,57 +1067,89 @@ def _recommend_refresh_stage2(
         f"当前最佳词条{current_best.score:.0f}，"
         f"{brush_scenario.chosen_stage1.value}理想词条{ideal_best.score:.0f}"
     )
-    if score >= 120.0:
+    rule = state.current_rule
+    has_premium_treasure_affix = any(_is_treasure_premium_affix(affix) for affix in brush_scenario.stage2_options)
+    if (
+        rule is not None
+        and rule.paint.is_treasure
+        and brush_scenario.chosen_stage1 == BrushType.STACK
+        and not has_premium_treasure_affix
+    ):
+        score += float(config_value("refresh.treasure_missing_premium_stage2_bonus", 520.0))
+        reason += "；当前是宝箱堆砌但没出复制/同宝箱/随机玩法赌箱子，建议刷新二阶段"
+    elif rule is not None and rule.paint.is_treasure and has_premium_treasure_affix:
+        score -= float(config_value("refresh.treasure_has_premium_stage2_penalty", 760.0))
+        reason += "；已命中宝箱优质词条，通常不再刷新"
+    stage2_threshold = float(config_value("refresh.stage2_threshold", 120.0))
+    if score >= stage2_threshold:
         reason += "；当前二阶段词条偏弱，可考虑刷新"
     else:
         reason += "；当前词条可接受，刷新价值不足"
     return SpecialActionRecommendation(
         action=SpecialAction.REFRESH_STAGE2,
         score=score,
-        recommended=score >= 120.0,
+        recommended=score >= stage2_threshold,
         reason=reason,
     )
 
 
+def _is_treasure_premium_affix(affix: AffixRule) -> bool:
+    if affix.effect == AffixEffect.COPY_SELF_TO_SCOPE:
+        return True
+    if affix.effect == AffixEffect.UPGRADE_GLOBAL_SAME_PAINT:
+        return True
+    if affix.effect == AffixEffect.UPGRADE_SCOPE_SAME_PAINT:
+        return True
+    if affix.effect == AffixEffect.RANDOMIZE_SCOPE_CATEGORY and affix.target_object == PaintObject.GAMEPLAY:
+        return True
+    if affix.effect == AffixEffect.RANDOMIZE_SCOPE_ANY:
+        return True
+    return False
+
+
 def _force_completion_reward(rule: CurrentPaintRule) -> float:
     next_level = min(MAX_LEVEL, rule.paint.level + rule.upgrade_amount)
-    reward = 900.0
-    if rule.paint.is_treasure:
-        reward += 1400.0
-        if next_level >= MAX_LEVEL:
-            reward += 6500.0
-    elif next_level >= MAX_LEVEL and rule.paint.category == PaintCategory.GAMEPLAY:
-        reward += 3000.0
-    elif next_level >= MAX_LEVEL and rule.paint.category == PaintCategory.MONSTER:
-        reward += 2400.0
-    elif next_level >= 6:
-        reward += 450.0
-    return reward
+    return 900.0 + _paint_upgrade_gain(rule.paint, next_level) * 1.35
 
 
 def _expected_force_damage(state: PuzzleState, damage_count: int) -> float:
     paint_values = [_paint_damage_value(tile.paint) for tile in state.tiles if tile.state == TileState.PAINT]
     if not paint_values:
         return 0.0
+    hits = min(damage_count, len(paint_values))
     average_value = sum(paint_values) / len(paint_values)
-    return average_value * min(damage_count, len(paint_values))
+    tail_values = sorted(paint_values, reverse=True)[:hits]
+    tail_average = sum(tail_values) / len(tail_values)
+    high_value_pressure = sum(
+        1
+        for tile in state.tiles
+        if tile.paint is not None and _paint_strategic_value(tile.paint) >= TREASURE_LEVEL_VALUES[5]
+    )
+    pressure_ratio = min(0.75, high_value_pressure / max(1, len(paint_values)))
+    return hits * (average_value * (1.0 - pressure_ratio) + tail_average * pressure_ratio)
 
 
 def _paint_damage_value(paint: Paint | None) -> float:
     if paint is None:
         return 320.0
-    value = paint.level * 90.0
-    if paint.is_treasure:
-        value += 2200.0
-    elif paint.category == PaintCategory.GAMEPLAY:
-        value += 520.0
-    elif paint.category == PaintCategory.MONSTER:
-        value += 420.0
-    if paint.level >= MAX_LEVEL:
-        value += 2400.0
-    elif paint.level >= 6:
-        value += 800.0
+    value = _paint_strategic_value(paint)
+    if paint.is_treasure and paint.level >= 7:
+        return value * 1.65
+    if paint.is_treasure and paint.level >= 6:
+        return value * 1.45
+    if paint.is_treasure and paint.level >= 5:
+        return value * 1.25
+    if paint.level >= 7:
+        return value * 1.15
     return value
+
+
+def _protected_treasure_count(state: PuzzleState) -> int:
+    return sum(
+        1
+        for tile in state.tiles
+        if tile.paint is not None and tile.paint.is_treasure and tile.paint.level >= 6
+    )
 
 
 def _score_brush_type(state: PuzzleState, brush_type: BrushType) -> float:
@@ -1032,23 +1164,39 @@ def _score_brush_type(state: PuzzleState, brush_type: BrushType) -> float:
         BrushType.STACK: 24.0,
         BrushType.SPREAD: 16.0,
     }[brush_type]
-    return average_top + baseline
+    bonus = _brush_strategy_bonus(state, brush_type)
+    return average_top + baseline + bonus
 
 
-def _brush_reason(state: PuzzleState, brush_type: BrushType) -> str:
+def _brush_strategy_bonus(state: PuzzleState, brush_type: BrushType) -> float:
+    rule = state.current_rule
+    if rule is None:
+        return 0.0
+    if rule.paint.is_treasure and brush_type == BrushType.STACK:
+        return 420.0 + rule.paint.level * 35.0
+    if rule.paint.is_treasure and brush_type == BrushType.TRANSFORM:
+        return -90.0 if _current_rule_fit_score(state, rule) >= 0.55 else 0.0
+    if rule.paint.is_treasure and brush_type == BrushType.SPREAD:
+        blocked_pressure = _count_tiles(state, TileState.BLOCKED) + _count_tiles(state, TileState.VOID)
+        return 80.0 if blocked_pressure >= 10 else -60.0
+    return 0.0
+
+
+def _brush_reason(state: PuzzleState, brush_type: BrushType, prior_score: float = 0.0) -> str:
+    suffix = f"；经验先验+{prior_score:.0f}" if prior_score >= 15 else ""
     if brush_type == BrushType.TRANSFORM:
         if state.current_rule and state.current_rule.match_required >= 4:
-            return "可救场：改方向/改目标/降低匹配数"
-        return "可修正调色目标，适合当前目标不顺时"
+            return "可救场：改方向/改目标/降低匹配数" + suffix
+        return "可修正调色目标，适合当前目标不顺时" + suffix
     if brush_type == BrushType.STACK:
-        if state.current_rule and state.current_rule.paint.level >= 5:
-            return "冲级优先：当前颜料接近7级"
         if state.current_rule and state.current_rule.paint.is_treasure:
-            return "宝箱优先：可赌复制或额外升级"
-        return "提升收益稳定，适合做7级"
+            return "宝箱优先堆砌：赌复制/同宝箱变化/额外升级，除非地形严重卡死" + suffix
+        if state.current_rule and state.current_rule.paint.level >= 5:
+            return "冲级优先：当前颜料接近7级" + suffix
+        return "提升收益稳定，适合做7级" + suffix
     if _count_tiles(state, TileState.BLOCKED) + _count_tiles(state, TileState.VOID) >= 8:
-        return "清场优先：当前可用空间偏少"
-    return "扩展落点，适合被阻挡/虚空卡住时"
+        return "清场优先：当前可用空间偏少" + suffix
+    return "扩展落点，适合被阻挡/虚空卡住时" + suffix
 
 
 def _score_affix(state: PuzzleState, affix: AffixRule) -> float:
@@ -1078,32 +1226,23 @@ def _score_affix(state: PuzzleState, affix: AffixRule) -> float:
     if affix.effect == AffixEffect.UPGRADE_SELF:
         return _level_gain_score(rule.paint, affix.amount, multiplier=1.15)
     if affix.effect == AffixEffect.UPGRADE_IN_SCOPE:
-        affected = _best_scope_paint_count(state, rule.direction)
-        count = affix.count if affix.count is not None else affected
-        return min(affected, count) * _level_gain_score(rule.paint, affix.amount, multiplier=0.45)
+        return _best_scope_upgrade_gain(state, affix, amount=affix.amount, count=affix.count) * 0.70
     if affix.effect == AffixEffect.UPGRADE_SCOPE_SAME_PAINT:
-        same_scope = sum(
-            1
-            for row, col in current_scope_cells(state, include_anchor=False)
-            if state.tile(row, col).paint is not None and _is_same_paint_kind(state.tile(row, col).paint, rule.paint)
-        )
-        return same_scope * _level_gain_score(rule.paint, affix.amount, multiplier=0.52)
+        return _scope_same_upgrade_gain(state, affix.amount) * 0.82
     if affix.effect == AffixEffect.UPGRADE_GLOBAL_CATEGORY:
-        target_count = _count_category_paints(state, affix.target_object)
-        return target_count * affix.amount * 65.0 + (35.0 if affix.persistent_until_match else 0.0)
+        return _global_category_upgrade_gain(state, affix.target_object, affix.amount) * 0.80 + (
+            180.0 if affix.persistent_until_match else 0.0
+        )
     if affix.effect == AffixEffect.UPGRADE_GLOBAL_SAME_PAINT:
-        same_count = _count_same_paints_as_current(state)
-        return same_count * affix.amount * 95.0 + (55.0 if affix.persistent_until_match else 0.0)
+        return _global_same_upgrade_gain(state, affix.amount) * 0.92 + (
+            220.0 if affix.persistent_until_match else 0.0
+        ) + _treasure_affix_bonus(state, affix)
     if affix.effect == AffixEffect.COPY_SELF_TO_SCOPE:
-        scope_count = _best_scope_paint_count(state, rule.direction)
-        treasure_bonus = 400.0 if rule.paint.is_treasure else 0.0
-        return scope_count * (95.0 + rule.paint.level * 12.0) + treasure_bonus
+        return _copy_self_value_gain(state) * 1.15 + _treasure_affix_bonus(state, affix)
     if affix.effect == AffixEffect.RANDOMIZE_SCOPE_CATEGORY:
-        scope_count = _best_scope_paint_count(state, rule.direction)
-        treasure_expectation = 85.0 if affix.target_object == PaintObject.GAMEPLAY else 0.0
-        return scope_count * (55.0 + treasure_expectation)
+        return _randomize_scope_expected_gain(state, affix.target_object) * 0.75 + _treasure_affix_bonus(state, affix)
     if affix.effect == AffixEffect.RANDOMIZE_SCOPE_ANY:
-        return _best_scope_paint_count(state, rule.direction) * 45.0
+        return _randomize_scope_expected_gain(state, PaintObject.ALL) * 0.58 + _treasure_affix_bonus(state, affix)
     if affix.effect == AffixEffect.CLEAR_TILE_IN_SCOPE:
         clearable = _best_clearable_count(state, affix.target_object or PaintObject.BLOCKED_TILE, affix.direction or rule.direction)
         count = affix.count if affix.count is not None else clearable
@@ -1159,45 +1298,67 @@ def _clamp01(value: float) -> float:
     return max(0.0, min(1.0, value))
 
 
-def _affix_reason(state: PuzzleState, affix: AffixRule) -> str:
+def _treasure_affix_bonus(state: PuzzleState, affix: AffixRule) -> float:
     rule = state.current_rule
+    if rule is None or not rule.paint.is_treasure or affix.brush_type != BrushType.STACK:
+        return 0.0
+    if affix.effect == AffixEffect.COPY_SELF_TO_SCOPE:
+        return 900.0 + rule.paint.level * 120.0
+    if affix.effect == AffixEffect.UPGRADE_GLOBAL_SAME_PAINT:
+        return 520.0 + affix.amount * 180.0
+    if affix.effect == AffixEffect.RANDOMIZE_SCOPE_CATEGORY and affix.target_object == PaintObject.GAMEPLAY:
+        return 360.0
+    if affix.effect == AffixEffect.RANDOMIZE_SCOPE_ANY:
+        return 240.0
+    return 0.0
+
+
+def _affix_reason(state: PuzzleState, affix: AffixRule, prior_score: float = 0.0) -> str:
+    rule = state.current_rule
+    suffix = f"；经验先验+{prior_score:.0f}" if prior_score >= 15 else ""
     if affix.effect == AffixEffect.MATCH_REQUIRED_DELTA:
-        return "降低完成门槛，救场价值高"
+        return "降低完成门槛，救场价值高" + suffix
     if affix.effect == AffixEffect.CHANGE_DIRECTION:
-        return f"改为{_direction_label(affix.direction or PaintDirection.UNKNOWN)}，寻找更高匹配范围"
+        return f"改为{_direction_label(affix.direction or PaintDirection.UNKNOWN)}，寻找更高匹配范围" + suffix
     if affix.effect == AffixEffect.REROLL_CURRENT_RULE:
-        return "重新随机一张初始颜料，当前目标/地形不顺时救场"
+        return "重新随机一张初始颜料，当前目标/地形不顺时救场" + suffix
     if affix.effect == AffixEffect.RANDOMIZE_CURRENT_LEVEL:
-        return "随机改变当前初始颜料等级，赌高等级收益"
+        return "随机改变当前初始颜料等级，赌高等级收益" + suffix
     if affix.effect == AffixEffect.RANDOMIZE_CURRENT_DIRECTION:
-        return "随机改变当前初始颜料方向，适合当前范围卡住时救场"
+        return "随机改变当前初始颜料方向，适合当前范围卡住时救场" + suffix
     if affix.effect == AffixEffect.RANDOMIZE_CURRENT_CONTENT:
-        return "随机改变当前初始颜料内容但保留等级，可赌更高价值类型"
+        return "随机改变当前初始颜料内容但保留等级，可赌更高价值类型" + suffix
     if affix.effect == AffixEffect.ADD_RANDOM_SCOPE:
-        return "增加一种作用范围但提高进度要求，适合背包供给充足时扩大收益"
+        return "增加一种作用范围但提高进度要求，适合背包供给充足时扩大收益" + suffix
     if affix.effect == AffixEffect.UPGRADE_SELF:
-        return f"自身提升{affix.amount}级，直接冲级"
+        return f"自身提升{affix.amount}级，直接冲级" + suffix
     if affix.effect == AffixEffect.UPGRADE_SCOPE_SAME_PAINT:
-        return "范围内同内容颜料额外提升，适合同类已铺开时冲级"
+        if rule and rule.paint.is_treasure:
+            return "范围内同宝箱额外提升，适合已有同宝箱时继续冲级" + suffix
+        return "范围内同内容颜料额外提升，适合同类已铺开时冲级" + suffix
     if affix.effect == AffixEffect.COPY_SELF_TO_SCOPE:
         if rule and rule.paint.is_treasure:
-            return "宝箱复制潜力最高"
-        return "把范围内颜料替换为当前颜料，适合复制高等级"
+            return "宝箱复制潜力最高：赌把范围内颜料变成同宝箱" + suffix
+        return "把范围内颜料替换为当前颜料，适合复制高等级" + suffix
     if affix.effect == AffixEffect.RANDOMIZE_SCOPE_CATEGORY and affix.target_object == PaintObject.GAMEPLAY:
-        return "随机玩法可赌宝箱"
+        if rule and rule.paint.is_treasure:
+            return "随机玩法可赌宝箱，当前初始是宝箱时可作为次优赌法" + suffix
+        return "随机玩法可赌宝箱" + suffix
     if affix.effect in {AffixEffect.CLEAR_TILE_IN_SCOPE, AffixEffect.CLEAR_RANDOM_TILE_GLOBAL}:
-        return "清理特殊地块，扩大后续空间"
+        return "清理特殊地块，扩大后续空间" + suffix
     if affix.effect in {
         AffixEffect.ALLOW_PLACE_ON_BLOCKED,
         AffixEffect.ALLOW_PLACE_ON_VOID_LOSE_SELF,
         AffixEffect.ALLOW_PLACE_ON_PAINT_LOSE_SELF,
     }:
-        return "增加特殊落点，注意可能失去自身内容"
+        return "增加特殊落点，注意可能失去自身内容" + suffix
     if affix.effect == AffixEffect.UPGRADE_GLOBAL_CATEGORY:
-        return "疑似持续全图升级，长期收益较高"
+        return "疑似持续全图升级，按实际7级/宝箱价值收益估分" + suffix
     if affix.effect == AffixEffect.UPGRADE_GLOBAL_SAME_PAINT:
-        return "全图同名/同宝箱颜料提升，适合当前颜料价值高或同类多时"
-    return "按当前局面估算收益"
+        if rule and rule.paint.is_treasure:
+            return "全图同宝箱提升，当前宝箱局优先级很高" + suffix
+        return "全图同名/同宝箱颜料提升，适合当前颜料价值高或同类多时" + suffix
+    return "按当前局面估算收益" + suffix
 
 
 def build_affix_catalog() -> tuple[AffixRule, ...]:
@@ -1240,6 +1401,7 @@ def build_affix_catalog() -> tuple[AffixRule, ...]:
         AffixRule(BrushType.STACK, "范围内颜料类型与等级替换为自身", AffixEffect.COPY_SELF_TO_SCOPE),
         AffixRule(BrushType.STACK, "范围内颜料变成随机玩法类型颜料", AffixEffect.RANDOMIZE_SCOPE_CATEGORY, target_object=PaintObject.GAMEPLAY),
         AffixRule(BrushType.STACK, "范围内颜料变成随机怪物类型颜料", AffixEffect.RANDOMIZE_SCOPE_CATEGORY, target_object=PaintObject.MONSTER),
+        AffixRule(BrushType.STACK, "将作用范围内的颜料转变为同等级的随机怪物颜料", AffixEffect.RANDOMIZE_SCOPE_CATEGORY, target_object=PaintObject.MONSTER),
         AffixRule(BrushType.STACK, "范围内颜料变成随机类型颜料", AffixEffect.RANDOMIZE_SCOPE_ANY),
         AffixRule(BrushType.STACK, "将作用范围内的颜料转变为同等级的随机颜料", AffixEffect.RANDOMIZE_SCOPE_ANY),
         AffixRule(BrushType.SPREAD, "横向随机阻挡地块变为空白地块", AffixEffect.CLEAR_TILE_IN_SCOPE, direction=PaintDirection.HORIZONTAL, target_object=PaintObject.BLOCKED_TILE, count=1),
@@ -1411,20 +1573,176 @@ def _direction_affix_score(state: PuzzleState, affix: AffixRule) -> float:
     return 45.0 + gain * 45.0
 
 
+def _paint_strategic_value(paint: Paint) -> float:
+    level = max(1, min(MAX_LEVEL, paint.level))
+    if paint.is_treasure:
+        if level >= 7:
+            return TREASURE_LEVEL_VALUES[7]
+        if level == 6:
+            return TREASURE_LEVEL_VALUES[6]
+        if level == 5:
+            return TREASURE_LEVEL_VALUES[5]
+        return {1: 260.0, 2: 420.0, 3: 620.0, 4: 820.0}.get(level, 260.0)
+    if paint.category == PaintCategory.GAMEPLAY:
+        return {1: 25.0, 2: 60.0, 3: 120.0, 4: 220.0, 5: 380.0, 6: 560.0, 7: GAMEPLAY_7_VALUE}[level]
+    if paint.category == PaintCategory.MONSTER:
+        return {1: 18.0, 2: 44.0, 3: 88.0, 4: 160.0, 5: 280.0, 6: 410.0, 7: MONSTER_7_VALUE}[level]
+    return level * 45.0
+
+
+def _paint_upgrade_gain(paint: Paint, next_level: int) -> float:
+    next_paint = replace(paint, level=max(1, min(MAX_LEVEL, next_level)))
+    return max(0.0, _paint_strategic_value(next_paint) - _paint_strategic_value(paint))
+
+
 def _level_gain_score(paint: Paint, amount: int, multiplier: float = 1.0) -> float:
     next_level = min(MAX_LEVEL, paint.level + amount)
-    score = amount * 55.0
-    if paint.is_treasure:
-        score += 220.0
-        if next_level >= MAX_LEVEL:
-            score += 900.0
-    elif next_level >= MAX_LEVEL and paint.category == PaintCategory.GAMEPLAY:
-        score += 430.0
-    elif next_level >= MAX_LEVEL:
-        score += 340.0
-    elif next_level >= 6:
-        score += 90.0
+    score = _paint_upgrade_gain(paint, next_level)
+    if score <= 0:
+        return amount * 12.0 * multiplier
     return score * multiplier
+
+
+def _candidate_scope_sets(
+    state: PuzzleState,
+    direction: PaintDirection | None = None,
+    *,
+    include_extra_directions: bool = True,
+) -> tuple[tuple[tuple[int, int], ...], ...]:
+    rule = state.current_rule
+    if rule is None:
+        return ()
+    if state.current_anchor is not None:
+        anchors = (state.current_anchor,)
+    else:
+        anchors = tuple(
+            (row, col)
+            for row in range(BOARD_SIZE)
+            for col in range(BOARD_SIZE)
+            if _is_current_anchor_placeable(state.tile(row, col), state.active_affix)
+        )
+    scopes: list[tuple[tuple[int, int], ...]] = []
+    for row, col in anchors:
+        directions = [direction or rule.direction]
+        if direction is None and include_extra_directions:
+            directions.extend(rule.extra_directions)
+        cells: list[tuple[int, int]] = []
+        for item in directions:
+            cells.extend(cell for cell in _scope_cells(row, col, item) if cell != (row, col))
+        scopes.append(tuple(dict.fromkeys(cells)))
+    return tuple(scopes)
+
+
+def _best_scope_upgrade_gain(
+    state: PuzzleState,
+    affix: AffixRule,
+    *,
+    amount: int,
+    count: int | None = None,
+) -> float:
+    best = 0.0
+    for scope in _candidate_scope_sets(state, affix.direction):
+        gains = [
+            _paint_upgrade_gain(tile.paint, min(MAX_LEVEL, tile.paint.level + max(1, amount)))
+            for row, col in scope
+            if (tile := state.tile(row, col)).state == TileState.PAINT and tile.paint is not None
+        ]
+        if not gains:
+            continue
+        if count is None:
+            value = sum(gains)
+        else:
+            value = (sum(gains) / len(gains)) * min(count, len(gains))
+        best = max(best, value)
+    return best
+
+
+def _scope_same_upgrade_gain(state: PuzzleState, amount: int) -> float:
+    rule = state.current_rule
+    if rule is None:
+        return 0.0
+    best = 0.0
+    for scope in _candidate_scope_sets(state):
+        value = 0.0
+        for row, col in scope:
+            tile = state.tile(row, col)
+            if tile.paint is None or not _is_same_paint_kind(tile.paint, rule.paint):
+                continue
+            value += _paint_upgrade_gain(tile.paint, min(MAX_LEVEL, tile.paint.level + max(1, amount)))
+        best = max(best, value)
+    return best
+
+
+def _global_category_upgrade_gain(
+    state: PuzzleState,
+    target: PaintObject | None,
+    amount: int,
+) -> float:
+    return sum(
+        _paint_upgrade_gain(tile.paint, min(MAX_LEVEL, tile.paint.level + max(1, amount)))
+        for tile in state.tiles
+        if tile.paint is not None and _paint_matches_target(tile.paint, target or PaintObject.ALL)
+    )
+
+
+def _global_same_upgrade_gain(state: PuzzleState, amount: int) -> float:
+    rule = state.current_rule
+    if rule is None:
+        return 0.0
+    return sum(
+        _paint_upgrade_gain(tile.paint, min(MAX_LEVEL, tile.paint.level + max(1, amount)))
+        for tile in state.tiles
+        if tile.paint is not None and _is_same_paint_kind(tile.paint, rule.paint)
+    )
+
+
+def _copy_self_value_gain(state: PuzzleState) -> float:
+    rule = state.current_rule
+    if rule is None:
+        return 0.0
+    current_value = _paint_strategic_value(rule.paint)
+    best = 0.0
+    for scope in _candidate_scope_sets(state):
+        value = 0.0
+        copied = 0
+        for row, col in scope:
+            tile = state.tile(row, col)
+            if tile.state != TileState.PAINT:
+                continue
+            copied += 1
+            value += current_value - (_paint_strategic_value(tile.paint) if tile.paint is not None else 0.0)
+        if rule.paint.is_treasure:
+            value += copied * current_value * 0.18
+        best = max(best, value)
+    return best
+
+
+def _randomize_scope_expected_gain(state: PuzzleState, target: PaintObject | None) -> float:
+    best = 0.0
+    for scope in _candidate_scope_sets(state):
+        value = 0.0
+        for row, col in scope:
+            tile = state.tile(row, col)
+            if tile.state != TileState.PAINT or tile.paint is None:
+                continue
+            expected = _expected_randomized_paint_value(tile.paint.level, target)
+            value += expected - _paint_strategic_value(tile.paint)
+        best = max(best, value)
+    return best
+
+
+def _expected_randomized_paint_value(level: int, target: PaintObject | None) -> float:
+    level = max(1, min(MAX_LEVEL, level))
+    monster_value = _paint_strategic_value(Paint(PaintCategory.MONSTER, level, subtype="随机怪物"))
+    gameplay_value = _paint_strategic_value(Paint(PaintCategory.GAMEPLAY, level, subtype="随机玩法"))
+    treasure_value = _paint_strategic_value(Paint(PaintCategory.GAMEPLAY, level, subtype="宝箱", is_treasure=True))
+    treasure_chance = 0.03
+    gameplay_expected = gameplay_value * (1.0 - treasure_chance) + treasure_value * treasure_chance
+    if target == PaintObject.MONSTER:
+        return monster_value
+    if target == PaintObject.GAMEPLAY:
+        return gameplay_expected
+    return monster_value * 0.50 + gameplay_expected * 0.50
 
 
 def _best_scope_paint_count(state: PuzzleState, direction: PaintDirection) -> int:
@@ -1502,20 +1820,33 @@ def _recommend_current_anchor_positions(
             scope = tuple(cell for cell in _rule_scope_cells_for_anchor(row, col, rule) if cell != (row, col))
             placeable = sum(1 for r, c in scope if _is_placeable(state.tile(r, c), state.active_affix))
             existing_matches = sum(1 for r, c in scope if _tile_matches_target(state.tile(r, c), rule.target_object))
+            existing_value_gain = _scope_upgrade_value_gain(state, scope, rule)
             possible_matches = existing_matches + min(placeable, len(target_paints))
             progress_ratio = min(1.0, possible_matches / max(1, rule.match_required))
             center_bonus = _cell_priority((row, col)) * 4.0
-            score = progress_ratio * 600.0 + placeable * 18.0 + existing_matches * 60.0 + center_bonus
+            terrain_delta = _current_anchor_terrain_delta(state, row, col, rule.paint)
+            score = (
+                progress_ratio * 600.0
+                + placeable * 18.0
+                + existing_matches * 60.0
+                + existing_value_gain * 1.3
+                + center_bonus
+                + _special_anchor_tile_bonus(tile, state.active_affix)
+                + terrain_delta * float(config_value("placement.terrain_delta_weight", 1.15))
+            )
+            if terrain_delta < 0:
+                score += terrain_delta * float(config_value("placement.bad_terrain_extra_weight", 0.65))
             if possible_matches >= rule.match_required:
                 score += 500.0
-            if tile.state != TileState.BLANK:
-                score += 120.0
             reason = (
                 f"放置初始颜料，{_direction_label(rule.direction)}范围可凑"
                 f"{min(possible_matches, rule.match_required)}/{rule.match_required}"
             )
             if tile.state != TileState.BLANK:
                 reason += f"，使用特殊词条落在{tile.state.value}"
+            if abs(terrain_delta) >= 30:
+                sign = "+" if terrain_delta > 0 else ""
+                reason += f"，地形{sign}{terrain_delta:.0f}"
             recommendations.append(
                 PlacementRecommendation(
                     row=row,
@@ -1530,6 +1861,37 @@ def _recommend_current_anchor_positions(
 
     recommendations.sort(key=lambda item: item.score, reverse=True)
     return recommendations[:limit]
+
+
+def _scope_upgrade_value_gain(
+    state: PuzzleState,
+    scope: tuple[tuple[int, int], ...],
+    rule: CurrentPaintRule,
+) -> float:
+    gain = 0.0
+    for row, col in scope:
+        tile = state.tile(row, col)
+        if tile.paint is None or not _tile_matches_target(tile, rule.target_object):
+            continue
+        if not _tile_can_receive_current_buff(tile, state):
+            continue
+        gain += _paint_upgrade_gain(tile.paint, min(MAX_LEVEL, tile.paint.level + rule.upgrade_amount))
+    return gain
+
+
+def _special_anchor_tile_bonus(tile: Tile, affix: AffixRule | None) -> float:
+    if affix is None:
+        return 0.0
+    if tile.state == TileState.BLOCKED and affix.effect == AffixEffect.ALLOW_PLACE_ON_BLOCKED:
+        return 120.0
+    if tile.state == TileState.VOID and affix.effect == AffixEffect.ALLOW_PLACE_ON_VOID_LOSE_SELF:
+        return 55.0
+    if tile.state == TileState.PAINT and affix.effect == AffixEffect.ALLOW_PLACE_ON_PAINT_LOSE_SELF:
+        # This special case keeps the old paint and only uses the cell as an
+        # anchor, so it is not the same risk profile as overwriting a backpack
+        # paint onto an existing high-value piece.
+        return 75.0
+    return 0.0
 
 
 def _scope_cells(row: int, col: int, direction: PaintDirection) -> tuple[tuple[int, int], ...]:
@@ -1583,28 +1945,320 @@ def _score_candidate(
         missing = rule.match_required - outcome.match_count
         score += max(0, 4 - missing) * 45.0
 
+    score += outcome.value_gain * 2.4
+    score += outcome.placed_value_gain * (0.9 if placed_paint.is_treasure else 0.35)
     if placed_paint.is_treasure:
-        score += 1200.0
-        if outcome.current_next_level >= MAX_LEVEL:
-            score += 6000.0
-    elif outcome.current_next_level >= MAX_LEVEL:
-        if placed_paint.category == PaintCategory.GAMEPLAY:
-            score += 2800.0
-        elif placed_paint.category == PaintCategory.MONSTER:
-            score += 2200.0
-        else:
-            score += 1600.0
-    elif outcome.current_next_level >= 6:
-        score += 350.0
-
-    score += outcome.treasure_to_7 * 5000.0
-    score += outcome.gameplay_to_7 * 1800.0
-    score += outcome.monster_to_7 * 1400.0
-    score += max(0, outcome.any_to_7 - outcome.treasure_to_7 - outcome.gameplay_to_7 - outcome.monster_to_7) * 900.0
-    score += outcome.treasure_upgrades * 600.0
+        score += _paint_strategic_value(placed_paint) * 0.95
+    if outcome.treasure_to_7:
+        score += outcome.treasure_to_7 * TREASURE_LEVEL_VALUES[7] * 1.25
+    if outcome.gameplay_to_7:
+        score += outcome.gameplay_to_7 * GAMEPLAY_7_VALUE * 0.95
+    if outcome.monster_to_7:
+        score += outcome.monster_to_7 * MONSTER_7_VALUE * 0.95
+    if outcome.current_next_level >= 6 and not placed_paint.is_treasure:
+        score += _paint_strategic_value(replace(placed_paint, level=outcome.current_next_level)) * 0.18
     score += outcome.affected_paints * (22.0 if outcome.completes_match else 6.0)
     score += _future_space_value(state, row, col, affected)
+    score -= outcome.overwrite_penalty
+    score += outcome.terrain_delta * float(config_value("placement.terrain_delta_weight", 1.15))
     return score
+
+
+def _candidate_lookahead_score(
+    state: PuzzleState,
+    rule: CurrentPaintRule,
+    row: int,
+    col: int,
+    paint: Paint,
+    outcome: PlacementOutcome,
+) -> float:
+    simulated = _simulate_install_without_next_rule(state, rule, row, col, paint)
+    if simulated is None:
+        return 0.0
+    next_state, completed = simulated
+    settled_terrain_delta = _terrain_value(next_state) - _terrain_value(state) - outcome.terrain_delta
+    score = settled_terrain_delta * 0.35
+    score += _high_value_position_delta(state, next_state) * 0.12
+    if completed:
+        score += _post_match_board_value(next_state) * 0.20
+        score += _pending_anchor_opportunity_score(next_state, rule) * 0.18
+    else:
+        next_rule = next_state.current_rule
+        if next_rule is not None:
+            next_recs = recommend_placements(next_state, limit=3, include_lookahead=False)
+            if next_recs:
+                score += next_recs[0].score * 0.22
+                if any(rec.completes_match for rec in next_recs[:3]):
+                    score += 180.0
+            score += _current_rule_completion_potential(next_state, next_rule) * 160.0
+    if outcome.completes_match and _paint_strategic_value(paint) >= TREASURE_LEVEL_VALUES[5]:
+        score += 120.0
+    if outcome.terrain_delta < 0:
+        score += outcome.terrain_delta * float(config_value("placement.bad_terrain_extra_weight", 0.65))
+    return score
+
+
+def _dedupe_placement_recommendations(
+    recommendations: list[PlacementRecommendation],
+) -> list[PlacementRecommendation]:
+    best_by_key: dict[tuple[int, int, tuple | None], PlacementRecommendation] = {}
+    for recommendation in recommendations:
+        paint_key = _paint_recommendation_key(recommendation.paint)
+        key = (recommendation.row, recommendation.col, paint_key)
+        current = best_by_key.get(key)
+        if current is None or recommendation.score > current.score:
+            best_by_key[key] = recommendation
+    return list(best_by_key.values())
+
+
+def _paint_recommendation_key(paint: Paint | None) -> tuple | None:
+    if paint is None:
+        return None
+    return (paint.category.value, paint.level, paint.is_treasure)
+
+
+def _placement_policy_prior_score(stats: dict | None, row: int, col: int) -> float:
+    if not stats:
+        return 0.0
+    samples = (stats.get("policy_prior_samples") or {}).get("placements", 0)
+    if samples < int(config_value("learning.placement_min_samples", 30)):
+        return 0.0
+    cells = stats.get("placement_cells") or {}
+    zones = stats.get("placement_zones") or {}
+    cell_key = f"{row},{col}"
+    zone = _cell_zone_for_policy(row, col)
+    cell_ratio = cells.get(cell_key, 0) / max(1, samples)
+    zone_total = sum(zones.values()) or samples
+    zone_ratio = zones.get(zone, 0) / max(1, zone_total)
+    score = cell_ratio * 420.0 + zone_ratio * 160.0
+    return min(float(config_value("learning.placement_max_bonus", 180.0)), score)
+
+
+def _brush_policy_prior_score(stats: dict | None, brush_type: BrushType) -> float:
+    if not stats:
+        return 0.0
+    samples = (stats.get("policy_prior_samples") or {}).get("brushes", 0)
+    if samples < int(config_value("learning.brush_min_samples", 20)):
+        return 0.0
+    brush_code = {
+        BrushType.TRANSFORM: "1",
+        BrushType.STACK: "2",
+        BrushType.SPREAD: "3",
+    }[brush_type]
+    brush_codes = stats.get("trajectory_brush_codes") or {}
+    brushes = stats.get("trajectory_brushes") or {}
+    count = brush_codes.get(brush_code, brushes.get(brush_type.value, 0))
+    ratio = count / max(1, samples)
+    return min(float(config_value("learning.brush_max_bonus", 130.0)), ratio * 260.0)
+
+
+def _affix_policy_prior_score(stats: dict | None, affix: AffixRule) -> float:
+    if not stats:
+        return 0.0
+    samples = (stats.get("policy_prior_samples") or {}).get("affixes", 0)
+    if samples < int(config_value("learning.affix_min_samples", 20)):
+        return 0.0
+    affix_codes = stats.get("trajectory_affix_codes") or {}
+    affixes = stats.get("trajectory_affixes") or {}
+    code = _affix_policy_code(affix)
+    count = affix_codes.get(code, affixes.get(affix.name, 0)) if code else affixes.get(affix.name, 0)
+    ratio = count / max(1, samples)
+    return min(float(config_value("learning.affix_max_bonus", 150.0)), ratio * 360.0)
+
+
+def _affix_policy_code(affix: AffixRule) -> str | None:
+    counters: dict[BrushType, int] = {brush_type: 0 for brush_type in BrushType}
+    brush_codes = {
+        BrushType.TRANSFORM: "1",
+        BrushType.STACK: "2",
+        BrushType.SPREAD: "3",
+    }
+    for item in build_affix_catalog():
+        counters[item.brush_type] += 1
+        if item.brush_type == affix.brush_type and item.name == affix.name:
+            return f"{brush_codes[item.brush_type]}-{counters[item.brush_type]}"
+    return None
+
+
+def _cell_zone_for_policy(row: int, col: int) -> str:
+    if row in {0, BOARD_SIZE - 1} and col in {0, BOARD_SIZE - 1}:
+        return "corner"
+    if row in {0, BOARD_SIZE - 1} or col in {0, BOARD_SIZE - 1}:
+        return "edge"
+    if row in {2, 3} and col in {2, 3}:
+        return "center"
+    return "inner"
+
+
+def _board_position_value(state: PuzzleState) -> float:
+    paint_value = 0.0
+    for row in range(BOARD_SIZE):
+        for col in range(BOARD_SIZE):
+            tile = state.tile(row, col)
+            if tile.paint is None:
+                continue
+            paint_value += _paint_strategic_value(tile.paint)
+            paint_value += _cell_priority((row, col)) * (18.0 if tile.paint.is_treasure else 4.0)
+    return paint_value + _terrain_value(state)
+
+
+def _high_value_position_delta(previous: PuzzleState, current: PuzzleState) -> float:
+    previous_value = _high_value_position_value(previous)
+    current_value = _high_value_position_value(current)
+    return current_value - previous_value
+
+
+def _high_value_position_value(state: PuzzleState) -> float:
+    value = 0.0
+    for row in range(BOARD_SIZE):
+        for col in range(BOARD_SIZE):
+            tile = state.tile(row, col)
+            if tile.paint is None:
+                continue
+            strategic = _paint_strategic_value(tile.paint)
+            if strategic < GAMEPLAY_7_VALUE:
+                continue
+            value += _cell_priority((row, col)) * (35.0 if tile.paint.is_treasure else 12.0)
+    return value
+
+
+def _terrain_value(state: PuzzleState) -> float:
+    blanks = _count_tiles(state, TileState.BLANK)
+    blocked = _count_tiles(state, TileState.BLOCKED)
+    voids = _count_tiles(state, TileState.VOID)
+    faded = _count_tiles(state, TileState.FADED)
+    open_components = _blank_components(state)
+    largest_open = max(open_components, default=0)
+    fragmentation_penalty = max(0, len(open_components) - 1) * 18.0
+    return (
+        blanks * 18.0
+        + largest_open * 9.0
+        - blocked * 22.0
+        - voids * 10.0
+        - faded * 35.0
+        - fragmentation_penalty
+    )
+
+
+def _blank_components(state: PuzzleState) -> list[int]:
+    seen: set[tuple[int, int]] = set()
+    components: list[int] = []
+    for row in range(BOARD_SIZE):
+        for col in range(BOARD_SIZE):
+            if (row, col) in seen or state.tile(row, col).state != TileState.BLANK:
+                continue
+            stack = [(row, col)]
+            seen.add((row, col))
+            size = 0
+            while stack:
+                r, c = stack.pop()
+                size += 1
+                for nr, nc in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)):
+                    if not (0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE):
+                        continue
+                    if (nr, nc) in seen or state.tile(nr, nc).state != TileState.BLANK:
+                        continue
+                    seen.add((nr, nc))
+                    stack.append((nr, nc))
+            components.append(size)
+    return components
+
+
+def _post_match_board_value(state: PuzzleState) -> float:
+    blank_count = _count_tiles(state, TileState.BLANK)
+    paint_count = _count_tiles(state, TileState.PAINT)
+    high_value_count = sum(1 for tile in state.tiles if tile.paint is not None and _paint_strategic_value(tile.paint) >= GAMEPLAY_7_VALUE)
+    return blank_count * 28.0 + paint_count * 10.0 + high_value_count * 160.0 + _terrain_value(state) * 0.35
+
+
+def _pending_anchor_opportunity_score(state: PuzzleState, previous_rule: CurrentPaintRule) -> float:
+    blanks = [(row, col) for row in range(BOARD_SIZE) for col in range(BOARD_SIZE) if state.tile(row, col).state == TileState.BLANK]
+    if not blanks:
+        return -500.0
+    directions = (
+        previous_rule.direction,
+        PaintDirection.HORIZONTAL,
+        PaintDirection.VERTICAL,
+        PaintDirection.DIAGONAL,
+        PaintDirection.ADJACENT,
+    )
+    target_objects = (previous_rule.target_object, PaintObject.GAMEPLAY, PaintObject.MONSTER, PaintObject.ALL)
+    best = 0.0
+    for row, col in blanks:
+        for direction in dict.fromkeys(directions):
+            scope = tuple(cell for cell in _scope_cells(row, col, direction) if cell != (row, col))
+            placeable = sum(1 for r, c in scope if _is_placeable(state.tile(r, c), state.active_affix))
+            for target in dict.fromkeys(target_objects):
+                existing = sum(1 for r, c in scope if _tile_matches_target(state.tile(r, c), target))
+                target_supply = sum(1 for paint in state.backpack if _paint_matches_target(paint, target))
+                possible = existing + min(placeable, target_supply)
+                fit = min(1.0, possible / max(1, previous_rule.match_required))
+                value_gain = _scope_upgrade_value_gain(state, scope, replace(previous_rule, direction=direction, target_object=target))
+                best = max(best, fit * 260.0 + placeable * 10.0 + existing * 24.0 + value_gain * 0.18)
+    return best
+
+
+def _current_rule_completion_potential(state: PuzzleState, rule: CurrentPaintRule) -> float:
+    current = _current_match_count(state, rule)
+    needed = max(0, rule.match_required - current)
+    if needed == 0:
+        return 1.0
+    scope = _placement_scope_cells(state, rule)
+    placeable = sum(1 for row, col in scope if _is_placeable(state.tile(row, col), state.active_affix))
+    supply = sum(1 for paint in state.backpack if _paint_matches_target(paint, rule.target_object))
+    possible = min(needed, placeable, supply)
+    return min(1.0, (current + possible) / max(1, rule.match_required))
+
+
+def _overwritten_paint_for_install(tile: Tile, affix: AffixRule | None) -> Paint | None:
+    if tile.state != TileState.PAINT or tile.paint is None:
+        return None
+    if affix is not None and affix.effect == AffixEffect.ALLOW_PLACE_ON_PAINT_LOSE_SELF:
+        return tile.paint
+    return None
+
+
+def _overwrite_penalty(overwritten: Paint | None, placed: Paint) -> float:
+    if overwritten is None:
+        return 0.0
+
+    overwritten_value = _paint_strategic_value(overwritten)
+    placed_value = _paint_strategic_value(placed)
+    value_loss = max(0.0, overwritten_value - placed_value)
+    penalty = overwritten_value * float(config_value("placement.overwrite_value_weight", 0.72)) + value_loss * 1.45
+
+    if overwritten.is_treasure:
+        penalty += float(config_value("placement.overwrite_treasure_base_penalty", 900.0))
+        if not placed.is_treasure:
+            penalty += float(config_value("placement.overwrite_treasure_with_non_treasure_penalty", 950.0))
+        elif placed.level < overwritten.level:
+            penalty += (overwritten.level - placed.level) * float(
+                config_value("placement.low_treasure_over_high_treasure_penalty", 1400.0)
+            )
+        if overwritten.level >= 6:
+            penalty += float(config_value("placement.overwrite_high_treasure_penalty", 2200.0))
+    elif overwritten.level >= 7:
+        penalty += float(config_value("placement.overwrite_level7_penalty", 1000.0))
+    elif overwritten.level >= 6:
+        penalty += float(config_value("placement.overwrite_level6_penalty", 420.0))
+
+    if placed.is_treasure and not overwritten.is_treasure and placed.level >= 5:
+        penalty *= float(config_value("placement.treasure_overwrite_discount", 0.65))
+    return penalty
+
+
+def _placement_terrain_delta(state: PuzzleState, row: int, col: int, placed_paint: Paint) -> float:
+    tiles = list(state.tiles)
+    tiles[row * BOARD_SIZE + col] = Tile(state=TileState.PAINT, paint=placed_paint, buff_applied_id=None, affix_applied_id=None)
+    next_state = replace(state, tiles=tuple(tiles))
+    return _terrain_value(next_state) - _terrain_value(state)
+
+
+def _current_anchor_terrain_delta(state: PuzzleState, row: int, col: int, paint: Paint) -> float:
+    tiles = list(state.tiles)
+    tiles[row * BOARD_SIZE + col] = _tile_after_current_anchor_placement(state.tile(row, col), paint, state.active_affix)
+    next_state = replace(state, tiles=tuple(tiles))
+    return _terrain_value(next_state) - _terrain_value(state)
 
 
 def _placement_outcome(
@@ -1615,6 +2269,9 @@ def _placement_outcome(
     affected: tuple[tuple[int, int], ...],
     placed_paint: Paint,
 ) -> PlacementOutcome:
+    overwritten_paint = _overwritten_paint_for_install(state.tile(row, col), state.active_affix)
+    overwrite_penalty = _overwrite_penalty(overwritten_paint, placed_paint)
+    terrain_delta = _placement_terrain_delta(state, row, col, placed_paint)
     match_count = sum(
         1
         for r, c in affected
@@ -1626,7 +2283,13 @@ def _placement_outcome(
         MAX_LEVEL,
         placed_paint.level + (rule.upgrade_amount if _paint_matches_target(placed_paint, rule.target_object) else 0),
     )
+    placed_value_gain = (
+        _paint_upgrade_gain(placed_paint, current_next_level)
+        if _paint_matches_target(placed_paint, rule.target_object)
+        else 0.0
+    )
     affected_paints = 0
+    value_gain = 0.0
     treasure_to_7 = 0
     gameplay_to_7 = 0
     monster_to_7 = 0
@@ -1651,6 +2314,7 @@ def _placement_outcome(
             continue
         affected_paints += 1
         next_level = min(MAX_LEVEL, paint.level + rule.upgrade_amount)
+        value_gain += _paint_upgrade_gain(paint, next_level)
         if paint.is_treasure:
             treasure_upgrades += 1
             if paint.level < MAX_LEVEL <= next_level:
@@ -1669,6 +2333,11 @@ def _placement_outcome(
         completes_match=completes,
         current_next_level=current_next_level,
         affected_paints=affected_paints,
+        value_gain=value_gain,
+        placed_value_gain=placed_value_gain,
+        overwritten_paint=overwritten_paint,
+        overwrite_penalty=overwrite_penalty,
+        terrain_delta=terrain_delta,
         treasure_to_7=treasure_to_7,
         gameplay_to_7=gameplay_to_7,
         monster_to_7=monster_to_7,
@@ -1695,13 +2364,22 @@ def _cell_priority(cell: tuple[int, int]) -> float:
     return 8.0 - abs(row - 2.5) - abs(col - 2.5)
 
 
-def _reason(rule: CurrentPaintRule, outcome: PlacementOutcome, placed_paint: Paint) -> str:
+def _reason(
+    rule: CurrentPaintRule,
+    outcome: PlacementOutcome,
+    placed_paint: Paint,
+    lookahead_score: float = 0.0,
+    prior_score: float = 0.0,
+) -> str:
     parts = [
         f"用{_paint_label(placed_paint)}",
         f"{_direction_label(rule.direction)} {_target_label(rule.target_object)} {outcome.match_count}/{rule.match_required}",
     ]
     if outcome.completes_match:
         parts.append(f"完成匹配，触发提升{rule.upgrade_amount}级")
+    total_gain = outcome.value_gain
+    if total_gain >= 250:
+        parts.append(f"战略价值+{total_gain:.0f}")
     if placed_paint.is_treasure and outcome.current_next_level >= MAX_LEVEL and outcome.completes_match:
         parts.append("该宝箱可到7级")
     elif placed_paint.is_treasure:
@@ -1714,6 +2392,16 @@ def _reason(rule: CurrentPaintRule, outcome: PlacementOutcome, placed_paint: Pai
         parts.append(f"玩法到7级x{outcome.gameplay_to_7}")
     if outcome.monster_to_7:
         parts.append(f"怪物到7级x{outcome.monster_to_7}")
+    if outcome.overwritten_paint is not None and outcome.overwrite_penalty >= 120:
+        parts.append(f"覆盖{_paint_label(outcome.overwritten_paint)} -{outcome.overwrite_penalty:.0f}")
+    if abs(outcome.terrain_delta) >= 30:
+        sign = "+" if outcome.terrain_delta > 0 else ""
+        parts.append(f"落点地形{sign}{outcome.terrain_delta:.0f}")
+    if abs(lookahead_score) >= 90:
+        sign = "+" if lookahead_score > 0 else ""
+        parts.append(f"后续地形{sign}{lookahead_score:.0f}")
+    if prior_score >= 25:
+        parts.append(f"经验先验+{prior_score:.0f}")
     return "，".join(parts)
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from collections import Counter
@@ -10,6 +11,8 @@ from typing import Any
 
 RUNTIME_DIR = Path("runtime")
 OBSERVATION_LOG = RUNTIME_DIR / "observations.jsonl"
+CORRECTION_LOG = RUNTIME_DIR / "corrected_observations.jsonl"
+TRAJECTORY_LOG = RUNTIME_DIR / "high_score_trajectories.jsonl"
 STATS_PATH = RUNTIME_DIR / "stats.json"
 
 
@@ -25,19 +28,108 @@ def record_observation(event_type: str, payload: dict[str, Any], *, source: str)
     }
     with OBSERVATION_LOG.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
-    _write_stats(_load_events())
+    _write_stats(_load_events(), _load_corrections(), _load_trajectories())
+
+
+def record_correction(payload: dict[str, Any], *, source: str) -> None:
+    if source != "real_capture":
+        return
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    event = {
+        "ts": time.time(),
+        "event": "corrected_observation",
+        "source": source,
+        "payload": _jsonable(payload),
+    }
+    with CORRECTION_LOG.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+    _write_stats(_load_events(), _load_corrections(), _load_trajectories())
+
+
+def record_high_score_trajectory(payload: dict[str, Any], *, source: str) -> bool:
+    if source != "real_capture":
+        return False
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    payload_hash = _payload_hash(payload)
+    existing_hashes = {_payload_hash(event.get("payload") or {}) for event in _load_trajectories()}
+    if payload_hash in existing_hashes:
+        return False
+    event = {
+        "ts": time.time(),
+        "event": "high_score_trajectory",
+        "source": source,
+        "payload": _jsonable(payload),
+        "payload_hash": payload_hash,
+    }
+    with TRAJECTORY_LOG.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+    _write_stats(_load_events(), _load_corrections(), _load_trajectories())
+    return True
+
+
+def export_learning_bundle(path: str | Path) -> dict[str, Any]:
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    observations = _dedupe_events(_load_events())
+    trajectories = _dedupe_events(_load_trajectories())
+    corrections = _dedupe_events(_load_corrections())
+    bundle = {
+        "schema": "huahua-learning-bundle-v1",
+        "exported_at": time.time(),
+        "stats": load_learning_stats(),
+        "observations": observations,
+        "trajectories": trajectories,
+        "corrections": corrections,
+    }
+    output.write_text(json.dumps(bundle, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    return {
+        "path": str(output),
+        "observations": len(observations),
+        "trajectories": len(trajectories),
+        "corrections": len(corrections),
+    }
+
+
+def merge_learning_bundle(path: str | Path) -> dict[str, Any]:
+    bundle_path = Path(path)
+    data = json.loads(bundle_path.read_text(encoding="utf-8"))
+    observations = data.get("observations") or []
+    trajectories = data.get("trajectories") or []
+    corrections = data.get("corrections") or []
+    added_observations = _append_unique_events(OBSERVATION_LOG, observations, event_name="observation")
+    added_trajectories = _append_unique_events(TRAJECTORY_LOG, trajectories, event_name="high_score_trajectory")
+    added_corrections = _append_unique_events(CORRECTION_LOG, corrections, event_name="corrected_observation")
+    _write_stats(_load_events(), _load_corrections(), _load_trajectories())
+    return {
+        "path": str(bundle_path),
+        "added_observations": added_observations,
+        "added_trajectories": added_trajectories,
+        "added_corrections": added_corrections,
+    }
 
 
 def load_learning_stats() -> dict[str, Any]:
     # Rebuild from raw events so old stat files cannot keep pre-filter data.
-    return _build_stats(_load_events())
+    return _build_stats(_load_events(), _load_corrections(), _load_trajectories())
 
 
 def _load_events() -> list[dict[str, Any]]:
-    if not OBSERVATION_LOG.exists():
+    return _load_jsonl(OBSERVATION_LOG)
+
+
+def _load_corrections() -> list[dict[str, Any]]:
+    return _load_jsonl(CORRECTION_LOG)
+
+
+def _load_trajectories() -> list[dict[str, Any]]:
+    return _load_jsonl(TRAJECTORY_LOG)
+
+
+def _load_jsonl(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
         return []
     events: list[dict[str, Any]] = []
-    for line in OBSERVATION_LOG.read_text(encoding="utf-8").splitlines():
+    for line in path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
         try:
@@ -47,23 +139,107 @@ def _load_events() -> list[dict[str, Any]]:
     return events
 
 
-def _write_stats(events: list[dict[str, Any]]) -> None:
+def _dedupe_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    result: list[dict[str, Any]] = []
+    for event in events:
+        if event.get("source") != "real_capture":
+            continue
+        key = event.get("payload_hash") or _payload_hash(event.get("payload") or {})
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(event)
+    return result
+
+
+def _append_unique_events(path: Path, incoming: list[dict[str, Any]], *, event_name: str) -> int:
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    existing_hashes = {
+        event.get("payload_hash") or _payload_hash(event.get("payload") or {})
+        for event in _load_jsonl(path)
+        if event.get("source") == "real_capture"
+    }
+    added = 0
+    with path.open("a", encoding="utf-8") as handle:
+        for event in incoming:
+            if event.get("source") != "real_capture":
+                continue
+            payload = event.get("payload") or {}
+            payload_hash = event.get("payload_hash") or _payload_hash(payload)
+            if payload_hash in existing_hashes:
+                continue
+            merged = {
+                "ts": event.get("ts", time.time()),
+                "event": event.get("event") or event_name,
+                "source": "real_capture",
+                "payload": _jsonable(payload),
+                "payload_hash": payload_hash,
+            }
+            handle.write(json.dumps(merged, ensure_ascii=False, sort_keys=True) + "\n")
+            existing_hashes.add(payload_hash)
+            added += 1
+    return added
+
+
+def _write_stats(
+    events: list[dict[str, Any]],
+    corrections: list[dict[str, Any]],
+    trajectories: list[dict[str, Any]] | None = None,
+) -> None:
     STATS_PATH.write_text(
-        json.dumps(_build_stats(events), ensure_ascii=False, indent=2, sort_keys=True),
+        json.dumps(_build_stats(events, corrections, trajectories), ensure_ascii=False, indent=2, sort_keys=True),
         encoding="utf-8",
     )
 
 
-def _build_stats(events: list[dict[str, Any]]) -> dict[str, Any]:
+def _build_stats(
+    events: list[dict[str, Any]],
+    corrections: list[dict[str, Any]] | None = None,
+    trajectories: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     events = [event for event in events if event.get("source") == "real_capture"]
+    corrections = [event for event in (corrections or []) if event.get("source") == "real_capture"]
+    trajectories = [event for event in (trajectories or []) if event.get("source") == "real_capture"]
     event_counts = Counter(event.get("event", "unknown") for event in events)
     affix_seen = Counter()
+    affix_code_seen = Counter()
     stage1_seen = Counter()
+    stage1_code_seen = Counter()
     current_seen = Counter()
+    current_code_seen = Counter()
     mismatch_seen = Counter()
+    anomaly_seen = Counter()
+    anomaly_severity = Counter()
     backpack_levels = Counter()
     backpack_categories = Counter()
+    correction_fields = Counter()
+    correction_samples = Counter()
+    trajectory_actions = Counter()
+    inferred_actions = Counter()
+    inferred_action_codes = Counter()
+    inferred_action_details = Counter()
+    placement_cells = Counter()
+    placement_zones = Counter()
+    upgrade_events = 0
+    forced_events = 0
+    refresh_events = Counter()
+    trajectory_brushes = Counter()
+    trajectory_brush_codes = Counter()
+    trajectory_affixes = Counter()
+    trajectory_affix_codes = Counter()
+    trajectory_scores: list[float] = []
     treasure_count = 0
+    quick_steps = 0
+    quick_actions = Counter()
+    quick_elapsed: list[float] = []
+    finished_runs = 0
+    finished_scores: list[float] = []
+    ignored_quick_steps = 0
+    skipped_finished_runs = 0
+    high_value_seen = 0
+    high_value_best_score = 0.0
+    high_value_counts = Counter()
 
     for event in events:
         payload = event.get("payload") or {}
@@ -71,14 +247,22 @@ def _build_stats(events: list[dict[str, Any]]) -> dict[str, Any]:
         if event_type == "brush_options":
             for item in payload.get("stage1_options") or []:
                 stage1_seen[item] += 1
+            for item in payload.get("stage1_codes") or []:
+                stage1_code_seen[str(item)] += 1
             for item in payload.get("stage2_options") or []:
                 affix_seen[item] += 1
+            for item in payload.get("stage2_codes") or []:
+                affix_code_seen[str(item)] += 1
         elif event_type == "current_paint":
             key = "|".join(
                 str(payload.get(name))
                 for name in ("category", "level", "direction", "target", "match_required", "upgrade_amount")
             )
             current_seen[key] += 1
+            if payload.get("rule_code"):
+                current_code_seen[str(payload.get("rule_code"))] += 1
+            elif payload.get("paint_code"):
+                current_code_seen[str(payload.get("paint_code"))] += 1
         elif event_type == "backpack_capture":
             for paint in payload.get("paints") or []:
                 backpack_levels[str(paint.get("level"))] += 1
@@ -86,18 +270,164 @@ def _build_stats(events: list[dict[str, Any]]) -> dict[str, Any]:
                 treasure_count += 1 if paint.get("is_treasure") else 0
         elif event_type == "rule_mismatch":
             mismatch_seen[str(payload.get("kind", "unknown"))] += 1
+        elif event_type == "rule_anomaly":
+            anomaly_seen[str(payload.get("kind", "unknown"))] += 1
+            anomaly_severity[str(payload.get("severity", "unknown"))] += 1
+        elif event_type == "quick_capture_step":
+            quick_steps += 1
+            inferred = payload.get("inferred_action") or {}
+            quick_actions[str(inferred.get("type", "unknown"))] += 1
+            if inferred.get("code"):
+                inferred_action_codes[str(inferred.get("code"))] += 1
+            elapsed = (payload.get("quality") or {}).get("elapsed")
+            if isinstance(elapsed, (int, float)):
+                quick_elapsed.append(float(elapsed))
+        elif event_type == "run_session_finished":
+            finished_runs += 1
+            final_score = payload.get("internal_score", payload.get("final_score"))
+            if isinstance(final_score, (int, float)):
+                finished_scores.append(float(final_score))
+        elif event_type == "quick_capture_ignored":
+            ignored_quick_steps += 1
+        elif event_type == "run_session_finish_skipped":
+            skipped_finished_runs += 1
+        elif event_type == "high_value_seen":
+            high_value_seen += 1
+            known = payload.get("known") or {}
+            score = payload.get("score")
+            if isinstance(score, (int, float)):
+                high_value_best_score = max(high_value_best_score, float(score))
+            for key in ("treasure7", "treasure6", "treasure5", "gameplay7", "monster7", "lv7"):
+                high_value_counts[key] += int(known.get(key, 0) or 0)
+
+    for event in corrections:
+        payload = event.get("payload") or {}
+        original = payload.get("original") or {}
+        corrected = payload.get("corrected") or {}
+        fields = set(original) | {key for key in corrected if key != "note"}
+        changed_fields = set(payload.get("changed_fields") or [])
+        for field in fields:
+            correction_samples[str(field)] += 1
+        for field in changed_fields:
+            correction_fields[str(field)] += 1
+
+    for event in trajectories:
+        payload = event.get("payload") or {}
+        final_score = payload.get("internal_score", payload.get("final_score"))
+        if isinstance(final_score, (int, float)):
+            trajectory_scores.append(float(final_score))
+        for step in payload.get("steps") or []:
+            action = step.get("action") or step.get("type") or "unknown"
+            inferred = step.get("inferred_action") or {}
+            trajectory_actions[str(action)] += 1
+            inferred_type = str(inferred.get("type", "unknown"))
+            inferred_actions[inferred_type] += 1
+            if inferred.get("code"):
+                inferred_action_codes[str(inferred.get("code"))] += 1
+            detail = inferred.get("detail") if isinstance(inferred.get("detail"), dict) else {}
+            if detail.get("code"):
+                inferred_action_details[str(detail.get("code"))] += 1
+            summary = inferred.get("summary") if isinstance(inferred.get("summary"), dict) else {}
+            upgrade_events += int(summary.get("upgrade_count", 0) or 0)
+            if inferred_type == "force_complete":
+                forced_events += 1
+            if inferred_type == "refresh_affix":
+                refresh_events[str(inferred.get("stage", "unknown"))] += 1
+            if inferred_type in {"install_paint", "place_current_paint", "new_current_paint"}:
+                for cell in _placement_cells_from_inferred(inferred):
+                    row = cell.get("r")
+                    col = cell.get("c")
+                    if not isinstance(row, int) or not isinstance(col, int):
+                        continue
+                    placement_cells[f"{row},{col}"] += 1
+                    placement_zones[_cell_zone(row, col)] += 1
+            brush = step.get("brush") or {}
+            chosen_brush = brush.get("chosen")
+            if chosen_brush:
+                trajectory_brushes[str(chosen_brush)] += 1
+            chosen_brush_code = brush.get("chosen_code")
+            if chosen_brush_code:
+                trajectory_brush_codes[str(chosen_brush_code)] += 1
+            for affix_name in brush.get("stage2") or []:
+                trajectory_affixes[str(affix_name)] += 1
+            for code in brush.get("stage2_codes") or []:
+                trajectory_affix_codes[str(code)] += 1
+            if step.get("brush_type"):
+                trajectory_brushes[str(step.get("brush_type"))] += 1
+            if step.get("brush_code"):
+                trajectory_brush_codes[str(step.get("brush_code"))] += 1
+            if step.get("affix"):
+                trajectory_affixes[str(step.get("affix"))] += 1
+            if step.get("affix_code"):
+                trajectory_affix_codes[str(step.get("affix_code"))] += 1
 
     total_backpack = sum(backpack_levels.values())
+    field_accuracy = {}
+    risky_fields = []
+    for field, samples in correction_samples.items():
+        errors = correction_fields[field]
+        error_rate = errors / samples if samples else 0.0
+        field_accuracy[field] = {
+            "samples": samples,
+            "errors": errors,
+            "accuracy": 1.0 - error_rate,
+            "error_rate": error_rate,
+        }
+        if samples >= 3 and error_rate >= 0.25:
+            risky_fields.append(field)
+    risky_fields.sort(key=lambda field: (field_accuracy[field]["error_rate"], field_accuracy[field]["errors"]), reverse=True)
     return {
         "total_events": len(events),
         "event_counts": dict(event_counts),
         "stage1_seen": dict(stage1_seen),
+        "stage1_code_seen": dict(stage1_code_seen),
         "affix_seen": dict(affix_seen),
+        "affix_code_seen": dict(affix_code_seen),
         "current_paint_seen": dict(current_seen),
+        "current_paint_code_seen": dict(current_code_seen),
         "rule_mismatches": dict(mismatch_seen),
+        "rule_anomalies": dict(anomaly_seen),
+        "rule_anomaly_severity": dict(anomaly_severity),
         "backpack_levels": dict(backpack_levels),
         "backpack_categories": dict(backpack_categories),
+        "corrections": len(corrections),
+        "correction_fields": dict(correction_fields),
+        "correction_samples": dict(correction_samples),
+        "field_accuracy": field_accuracy,
+        "risky_fields": risky_fields,
+        "trajectories": len(trajectories),
+        "trajectory_actions": dict(trajectory_actions),
+        "inferred_actions": dict(inferred_actions),
+        "inferred_action_codes": dict(inferred_action_codes),
+        "inferred_action_details": dict(inferred_action_details),
+        "placement_cells": dict(placement_cells),
+        "placement_zones": dict(placement_zones),
+        "upgrade_events": upgrade_events,
+        "forced_events": forced_events,
+        "refresh_events": dict(refresh_events),
+        "trajectory_brushes": dict(trajectory_brushes),
+        "trajectory_brush_codes": dict(trajectory_brush_codes),
+        "trajectory_affixes": dict(trajectory_affixes),
+        "trajectory_affix_codes": dict(trajectory_affix_codes),
+        "policy_prior_samples": {
+            "placements": sum(placement_cells.values()),
+            "brushes": max(sum(trajectory_brushes.values()), sum(trajectory_brush_codes.values())),
+            "affixes": max(sum(trajectory_affixes.values()), sum(trajectory_affix_codes.values())),
+        },
+        "trajectory_best_score": max(trajectory_scores) if trajectory_scores else None,
+        "trajectory_avg_score": (sum(trajectory_scores) / len(trajectory_scores)) if trajectory_scores else None,
         "treasure_ratio": treasure_count / total_backpack if total_backpack else 0.0,
+        "quick_capture_steps": quick_steps,
+        "quick_capture_ignored": ignored_quick_steps,
+        "quick_capture_actions": dict(quick_actions),
+        "quick_capture_avg_elapsed": (sum(quick_elapsed) / len(quick_elapsed)) if quick_elapsed else None,
+        "finished_runs": finished_runs,
+        "finished_skipped": skipped_finished_runs,
+        "finished_best_score": max(finished_scores) if finished_scores else None,
+        "finished_avg_score": (sum(finished_scores) / len(finished_scores)) if finished_scores else None,
+        "high_value_seen": high_value_seen,
+        "high_value_best_score": high_value_best_score if high_value_seen else None,
+        "high_value_counts": dict(high_value_counts),
     }
 
 
@@ -113,3 +443,34 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
     return value
+
+
+def _placement_cells_from_inferred(inferred: dict[str, Any]) -> list[dict[str, Any]]:
+    cells = [cell for cell in inferred.get("changed_cells") or [] if isinstance(cell, dict)]
+    installed = [
+        cell
+        for cell in cells
+        if cell.get("to_state") == "P"
+        and (cell.get("from_state") != "P" or cell.get("from_paint") is None)
+    ]
+    if installed:
+        return installed[:3]
+    if inferred.get("type") not in {"install_paint", "place_current_paint"}:
+        return []
+    # Fallback for old trajectory payloads that did not include state transitions.
+    return cells[:1]
+
+
+def _cell_zone(row: int, col: int) -> str:
+    if row in {0, 5} and col in {0, 5}:
+        return "corner"
+    if row in {0, 5} or col in {0, 5}:
+        return "edge"
+    if row in {2, 3} and col in {2, 3}:
+        return "center"
+    return "inner"
+
+
+def _payload_hash(payload: dict[str, Any]) -> str:
+    encoded = json.dumps(_jsonable(payload), ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()

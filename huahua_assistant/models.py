@@ -19,6 +19,7 @@ class RegionKind(str, Enum):
     BACKPACK = "backpack"
     BRUSH_OPTIONS = "brush_options"
     CONFIRM_BUTTON = "confirm_button"
+    FINISH_DRAWING = "finish_drawing"
     FORCE_COMPLETE = "force_complete"
     REFRESH_AFFIX = "refresh_affix"
 

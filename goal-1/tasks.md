@@ -35,15 +35,37 @@ Next step:
 
 ## Task 2 - Implement Safe Coordinate Marker Prototype
 
-Status: pending
+Status: completed
 
 Work performed:
+- Added `huahua_assistant/desktop_pet.py` with a small coordinate-marker presentation layer.
+- Implemented `DesktopPetMarkerLayer`, which manages multiple tiny `tk.Toplevel` marker windows instead of one broad full-window overlay.
+- Markers are topmost, transparent-background windows and attempt Windows click-through with `WS_EX_LAYERED`, `WS_EX_TRANSPARENT`, `WS_EX_NOACTIVATE`, `WS_EX_TOOLWINDOW`, and `WM_NCHITTEST -> HTTRANSPARENT`.
+- Added marker types for:
+  - recommended board cells, using detected tile rects plus `last_capture_window` offsets
+  - visible backpack slot for the first desired paint
+  - stage-1/stage-2 brush choice recommendations, using detected brush panel rects
+- Added capture safety for this prototype by hiding marker windows before full capture, quick capture, and auto-follow capture ticks.
+- Patched `HuahuaApp` at startup from `run_app.py` via `install_desktop_pet_markers(HuahuaApp)`, avoiding direct edits to the already large `app.py`.
+- Reused the existing “坐标提示” checkbox as the feature toggle.
 
 Validation evidence:
+- `python -B` AST parse succeeded for `run_app.py` and `huahua_assistant/desktop_pet.py`.
+- Import check succeeded:
+  - `patch_installed= True`
+  - `overlay_callable= True`
+- `python -m compileall huahua_assistant run_app.py` completed successfully.
+- `git diff` shows startup wiring in `run_app.py`; `desktop_pet.py` is isolated as a new module.
+- Marker coordinate construction uses `last_capture_window`, scene tile rects, backpack slot rects, and brush panel rects rather than hard-coded absolute screen pixels.
 
 Remaining risk:
+- Runtime click-through behavior still needs real Windows/game testing, because some games/window modes can ignore or reorder ordinary topmost windows.
+- `mss` window-rectangle capture can still include markers if capture happens before the hidden windows visually disappear; Task 8 will strengthen capture safety.
+- The prototype uses simple drawn circular markers rather than final pet art assets.
+- Brush option coordinates are approximate within the detected brush panel because `BrushOptionsObservation` currently does not expose per-card rects.
 
 Next step:
+- Run Major Checkpoint 1 to review requirements, click safety, capture contamination risk, build health, and whether the marker prototype should be refined before adding structured recommendation explanations.
 
 ## Task 3 - Major Checkpoint 1
 

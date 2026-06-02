@@ -223,6 +223,9 @@ class DesktopPetMarkerLayer:
 def install_desktop_pet_markers(app_cls: type) -> None:
     """Patch HuahuaApp to use small coordinate markers instead of a full overlay."""
 
+    if getattr(app_cls, "_desktop_pet_marker_patch_installed", False):
+        return
+
     original_toggle_overlay = app_cls.toggle_overlay
     original_destroy_overlay = app_cls._destroy_overlay_window
     original_capture_async = app_cls.capture_async

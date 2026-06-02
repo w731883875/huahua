@@ -69,15 +69,33 @@ Next step:
 
 ## Task 3 - Major Checkpoint 1
 
-Status: pending
+Status: completed
 
 Work performed:
+- Reviewed requirement drift after Tasks 1-2. The marker prototype still aligns with the confirmed plan: small coordinate-anchored markers, no broad overlay, no input control, and reuse of game-window-derived coordinates.
+- Reviewed UI/UX behavior. The existing “坐标提示” checkbox is reused as the safe toggle; markers are hidden when no valid scene/window/recommendation exists.
+- Reviewed click safety. Markers are small `Toplevel` windows and attempt click-through with Windows extended styles and `WM_NCHITTEST -> HTTRANSPARENT`; broad full-game overlay is not used.
+- Reviewed capture contamination risk. Full capture, quick capture, and auto-follow capture ticks hide marker windows before screenshot; remaining race risk is deferred to Task 8 for stronger capture safety.
+- Reviewed data consistency. Task 2 did not alter learning writes or simulation behavior.
+- Reviewed rollback needs. The feature is isolated in `desktop_pet.py` and startup wiring in `run_app.py`; disabling the checkbox or removing the install call rolls it back.
+- Found and fixed one implementation risk: `install_desktop_pet_markers()` now returns early if the class is already patched, preventing repeated imports/hot reload from wrapping methods multiple times.
 
 Validation evidence:
+- `python -m compileall huahua_assistant run_app.py` completed successfully.
+- Import/patch check confirmed:
+  - `installed= True`
+  - `same_after_repeat= True`
+  - `refresh_name= patched_refresh_overlay`
+- `git status --short` after cache cleanup showed only `huahua_assistant/desktop_pet.py` modified before task-record update.
+- No learning-log behavior was changed in this checkpoint.
 
 Remaining risk:
+- Real game runtime testing is still needed to prove click-through behavior under the user's exact Windows/game display mode.
+- `mss` can still capture topmost marker windows if Windows has not visually hidden them before the grab; Task 8 should add stronger marker-hide/settle handling or true window capture.
+- Brush marker placement remains approximate because per-card/per-affix rectangles are not yet exposed by `BrushOptionsObservation`.
 
 Next step:
+- Add structured recommendation explanations so the side panel and desktop-pet markers can show why a position/paint/affix is recommended, not just where to point.
 
 ## Task 4 - Add Structured Recommendation Explanation
 

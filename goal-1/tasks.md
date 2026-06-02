@@ -258,15 +258,34 @@ Next step:
 
 ## Task 8 - Add Recognition/Capture Safety For Marker Layer
 
-Status: pending
+Status: completed
 
 Work performed:
+- Added a capture-specific marker hiding path in `huahua_assistant/desktop_pet.py`.
+- Changed `DesktopPetMarkerLayer.hide()` to return the number of withdrawn marker windows.
+- Added `hide_for_capture()`, which withdraws active marker windows and waits for Tk/DWM compositor settling before a screenshot is started.
+- Added Tk idle flushing, `DwmFlush()`, and a short 80 ms settle window to reduce the chance that topmost desktop-pet marker windows remain visible in `mss` game-window rectangle captures.
+- Updated the patched full capture, quick capture, and auto-follow capture paths to call `hide_for_capture()` before delegating to the original app methods.
+- Cleaned generated Python cache files before committing so no `pyc` files were included.
 
 Validation evidence:
+- `python -m compileall huahua_assistant run_app.py` completed successfully.
+- `git diff --check -- huahua_assistant/desktop_pet.py` found no whitespace errors.
+- Smoke test confirmed `hide()` withdraws marker windows and returns the hidden count.
+- Smoke test confirmed `hide_for_capture(settle_ms=0)` withdraws marker windows and flushes Tk idle work.
+- Smoke test confirmed patched capture methods call marker hiding before the original methods:
+  - `hide,capture,hide,quick,hide,auto`
+- Smoke test confirmed `install_desktop_pet_markers()` remains idempotent.
+- `git status --short` showed only `huahua_assistant/desktop_pet.py` modified before the code commit.
+- Code change committed as `a72b42f Strengthen marker capture hiding`.
 
 Remaining risk:
+- Real game runtime testing is still needed because Windows compositor timing and game display mode can vary.
+- `mss` still captures a desktop rectangle; hiding and settling greatly reduces marker contamination risk, but a true window-capture path would be the stronger future solution if contamination still appears.
+- The 80 ms settle delay is intentionally small for responsiveness; it may need tuning if the user's machine or display mode still captures stale marker frames.
 
 Next step:
+- Run Major Checkpoint 3 to review requirement drift, build health, UI safety, data consistency, capture safety, and remaining packaging-readiness risks.
 
 ## Task 9 - Major Checkpoint 3
 

@@ -2821,6 +2821,8 @@ class HuahuaApp(tk.Tk):
                 f"{mark}{index}. {action} r{rec.row + 1} c{rec.col + 1} "
                 f"评分={rec.score:.1f} {rec.reason}\n",
             )
+            for line in _recommendation_explanation_lines(rec):
+                self.region_text.insert(tk.END, f"   {line}\n")
             if self.overlay_var.get():
                 screen = self._screen_point_for_board_cell(rec.row, rec.col)
                 if screen is not None:
@@ -3317,6 +3319,59 @@ def _compact_recommendation(rec: PlacementRecommendation) -> dict:
         "score": round(rec.score, 1),
         "complete": rec.completes_match,
     }
+
+
+def _recommendation_explanation_lines(rec: PlacementRecommendation) -> list[str]:
+    explanation = getattr(rec, "explanation", None)
+    if explanation is None:
+        return []
+
+    lines: list[str] = []
+    if explanation.short:
+        lines.append(f"解释：{explanation.short}")
+
+    parts: list[str] = []
+    for label, attr in (
+        ("即时", "immediate"),
+        ("价值", "value"),
+        ("地形", "terrain"),
+        ("风险", "risk"),
+        ("资源", "resource"),
+        ("期望", "expected"),
+    ):
+        value = float(getattr(explanation, attr, 0.0) or 0.0)
+        if abs(value) >= 0.5:
+            parts.append(f"{label}{value:+.0f}")
+    if parts:
+        lines.append("分层：" + " ".join(parts))
+
+    tags = tuple(getattr(explanation, "tags", ()) or ())
+    if tags:
+        labels = [_recommendation_tag_label(tag) for tag in tags[:6]]
+        lines.append("标签：" + "、".join(labels))
+    return lines
+
+
+def _recommendation_tag_label(tag: str) -> str:
+    return {
+        "anchor": "初始落点",
+        "can_complete": "可完成",
+        "complete_match": "完成匹配",
+        "treasure": "宝箱",
+        "placed_to_7": "本格到7",
+        "treasure_to_7": "宝箱到7",
+        "gameplay_to_7": "玩法到7",
+        "monster_to_7": "怪物到7",
+        "high_value_gain": "高价值",
+        "overwrite_risk": "覆盖风险",
+        "terrain_gain": "地形收益",
+        "terrain_loss": "地形损失",
+        "lookahead_gain": "后续更好",
+        "lookahead_risk": "后续风险",
+        "learned_prior": "历史偏好",
+        "special_tile": "特殊地块",
+        "scope_value_gain": "范围收益",
+    }.get(tag, tag)
 
 
 def _infer_real_capture_action(previous: dict | None, current: dict) -> dict:

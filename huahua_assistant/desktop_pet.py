@@ -29,6 +29,7 @@ class PetMarker:
     kind: str
     priority: int = 1
     size: int = 58
+    caption: str = ""
 
 
 class DesktopPetMarkerLayer:
@@ -136,12 +137,14 @@ class DesktopPetMarkerLayer:
             fill=colors[3],
             font=("Microsoft YaHei UI", max(10, int(size * 0.27)), "bold"),
         )
-        if marker.kind == "board":
-            canvas.create_text(size / 2, size - 10, text="cell", fill=colors[3], font=("Segoe UI", 7, "bold"))
-        elif marker.kind == "backpack":
-            canvas.create_text(size / 2, size - 10, text="bag", fill=colors[3], font=("Segoe UI", 7, "bold"))
-        elif marker.kind == "brush":
-            canvas.create_text(size / 2, size - 10, text="affix", fill=colors[3], font=("Segoe UI", 7, "bold"))
+        caption = marker.caption or _marker_kind_caption(marker.kind)
+        canvas.create_text(
+            size / 2,
+            size - 10,
+            text=_fit_marker_caption(caption),
+            fill=colors[3],
+            font=("Microsoft YaHei UI", 7, "bold"),
+        )
 
     def _make_clickthrough(self, window: tk.Toplevel, canvas: tk.Canvas) -> None:
         try:
@@ -344,6 +347,7 @@ def _board_markers(app, scene: SceneObservation) -> list[PetMarker]:
                 kind="board",
                 priority=index,
                 size=_cell_marker_size(scene.board.tile(rec.row, rec.col).rect),
+                caption=_recommendation_caption(rec),
             )
         )
     return markers
@@ -369,6 +373,7 @@ def _backpack_markers(app, _scene: SceneObservation) -> list[PetMarker]:
             kind="backpack",
             priority=1,
             size=50,
+            caption=_backpack_caption(app),
         )
     )
     return markers
@@ -392,7 +397,8 @@ def _brush_markers(app, scene: SceneObservation, state: PuzzleState) -> list[Pet
         if not options:
             return []
         recs = recommend_brush_types(state, options)
-        best = recs[0].brush_type if recs else options[0]
+        best_rec = recs[0] if recs else None
+        best = best_rec.brush_type if best_rec else options[0]
         index = _index_or_zero(options, best)
         point = _stage1_point(window.left, window.top, panel, index, len(options))
         return [
@@ -404,12 +410,14 @@ def _brush_markers(app, scene: SceneObservation, state: PuzzleState) -> list[Pet
                 kind="brush",
                 priority=1,
                 size=54,
+                caption=_short_caption(best_rec.reason if best_rec else "推荐大类"),
             )
         ]
     if selected_affix is None and scenario.stage2_options:
         affixes = tuple(scenario.stage2_options)
         recs = recommend_affixes(state, affixes)
-        best_affix = recs[0].affix if recs else affixes[0]
+        best_rec = recs[0] if recs else None
+        best_affix = best_rec.affix if best_rec else affixes[0]
         index = _index_or_zero(affixes, best_affix)
         point = _stage2_point(window.left, window.top, panel, index, len(affixes))
         return [
@@ -421,6 +429,7 @@ def _brush_markers(app, scene: SceneObservation, state: PuzzleState) -> list[Pet
                 kind="brush",
                 priority=1,
                 size=54,
+                caption=_short_caption(best_rec.reason if best_rec else "推荐词条"),
             )
         ]
     return []
@@ -434,6 +443,48 @@ def _desired_backpack_paint(app) -> Paint | None:
     if recommendations and recommendations[0].paint is not None:
         return recommendations[0].paint
     return None
+
+
+def _backpack_caption(app) -> str:
+    recommendations = list(getattr(app, "recommendations", []) or [])
+    if recommendations:
+        return _recommendation_caption(recommendations[0]) or "先点背包"
+    install_plan = getattr(app, "install_plan", None)
+    if install_plan is not None and install_plan.steps:
+        return "先点背包"
+    return "背包"
+
+
+def _recommendation_caption(rec) -> str:
+    explanation = getattr(rec, "explanation", None)
+    short = getattr(explanation, "short", "") if explanation is not None else ""
+    if short:
+        return str(short)
+    if getattr(rec, "completes_match", False):
+        return "完成匹配"
+    return "推荐"
+
+
+def _marker_kind_caption(kind: str) -> str:
+    if kind == "board":
+        return "地块"
+    if kind == "backpack":
+        return "背包"
+    if kind == "brush":
+        return "词条"
+    return "推荐"
+
+
+def _short_caption(text: str, max_chars: int = 5) -> str:
+    normalized = "".join(str(text or "").replace("，", ",").replace("；", ",").split())
+    if not normalized:
+        return "推荐"
+    first = normalized.split(",", 1)[0].split("。", 1)[0].split("|", 1)[0]
+    return first[:max_chars] or "推荐"
+
+
+def _fit_marker_caption(text: str) -> str:
+    return _short_caption(text, max_chars=5)
 
 
 def _stage1_point(window_left: int, window_top: int, panel: Rect, index: int, count: int) -> tuple[int, int]:

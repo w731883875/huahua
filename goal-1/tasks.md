@@ -142,15 +142,35 @@ Next step:
 
 ## Task 5 - Connect Explanation Output To UI And Marker Labels
 
-Status: pending
+Status: completed
 
 Work performed:
+- Connected `PlacementRecommendation.explanation` to the side-panel recommendation output in `huahua_assistant/app.py`.
+- Added readable explanation lines under each placement recommendation:
+  - compact conclusion from `explanation.short`
+  - layered score breakdown for immediate/value/terrain/risk/resource/expected
+  - translated tags for key recommendation reasons
+- Added marker captions to `huahua_assistant/desktop_pet.py` so desktop-pet markers can show short reasons instead of generic `cell`/`bag`/`affix` labels.
+- Board and backpack markers now use the best recommendation's `explanation.short` when available.
+- Brush markers now use a short caption derived from the best brush/affix recommendation reason.
 
 Validation evidence:
+- `python -m compileall huahua_assistant run_app.py` completed successfully.
+- `python -B` smoke test verified `_recommendation_explanation_lines()` emits:
+  - a short conclusion line
+  - a layered score line
+  - translated tag text
+- `python -B` smoke test verified desktop-pet helper functions preserve and fit the short marker caption.
+- `git diff --check -- huahua_assistant/app.py huahua_assistant/desktop_pet.py` found no whitespace errors.
+- Code change committed as `d53d675 Show recommendation explanations in UI markers`.
 
 Remaining risk:
+- Real UI/runtime testing is still needed to confirm the small marker captions remain legible at the user's exact game resolution and scaling.
+- Brush marker coordinates remain approximate because per-option rectangles are not yet exposed by the recognition model.
+- Some existing UI text still contains mojibake from older code; this task avoided broad text cleanup to reduce regression risk.
 
 Next step:
+- Run Major Checkpoint 2 to review requirement drift, build health, UI safety, data consistency, and whether the explanation/marker integration introduces any regression before strengthening real-only trajectory logging.
 
 ## Task 6 - Major Checkpoint 2
 

@@ -211,15 +211,50 @@ Next step:
 
 ## Task 7 - Strengthen Real-Only Trajectory And High-Value Logging
 
-Status: pending
+Status: completed
 
 Work performed:
+- Enhanced real trajectory capture payloads so compact placement recommendations now include structured explanation data:
+  - `short`
+  - `tags`
+  - numeric layer breakdown for immediate/value/terrain/risk/resource/expected
+- Moved full-capture high-value logging to run after recommendation calculation, so high-value observations can include the active top recommendation context.
+- Added top recommendation snapshots and internal score breakdown to `high_value_seen` observations.
+- Added recommendation semantic aggregation in `huahua_assistant/learning.py`:
+  - `recommendation_cells`
+  - `recommendation_shorts`
+  - `recommendation_tags`
+  - `high_value_recommendation_shorts`
+  - `high_value_recommendation_tags`
+- Kept recommendation semantic stats separate from `placement_cells` and `policy_prior_samples`, so recommended positions do not contaminate actual user-placement priors.
+- Added a visible learning-stats summary line for recommendation semantics in the side panel.
 
 Validation evidence:
+- `python -m compileall huahua_assistant run_app.py` completed successfully.
+- `python -B` smoke test confirmed `_compact_recommendation()` writes explanation data:
+  - `has_explanation= True`
+  - `short_ok= True`
+  - `tags_ok= True`
+  - `layers_value= 5000.0`
+- `python -B` smoke test confirmed learning stats aggregate only real-capture recommendation semantics and keep placement priors clean:
+  - `high_value_seen= 1`
+  - `treasure7= 1`
+  - `recommendation_cells= {'2,3': 2}`
+  - `recommendation_shorts= {'treasure7': 2}`
+  - `recommendation_tags= {'complete_match': 2, 'treasure_to_7': 2}`
+  - `high_value_tags= {'complete_match': 1, 'treasure_to_7': 1}`
+  - `policy_placements= 0`
+- A source-filter smoke test confirmed simulation high-value observations are still ignored and only `real_capture` contributes to stats.
+- `git diff --check -- huahua_assistant/app.py huahua_assistant/learning.py` found no whitespace errors.
+- Code change committed as `af63f06 Strengthen real trajectory recommendation logging`.
 
 Remaining risk:
+- The enriched recommendation context records what the tool recommended at the time, not necessarily what the user actually clicked. It is intentionally kept separate from user-placement priors until stronger click/action inference is available.
+- Real runtime data is still needed to verify whether recommendation semantic tags correlate with later high-value outcomes.
+- Existing mojibake strings remain in some UI text; this task only added the data fields and did not perform a broad text cleanup.
 
 Next step:
+- Add stronger recognition/capture safety for the marker layer, especially hiding and settling desktop-pet markers before screenshots so marker windows cannot contaminate game-window captures.
 
 ## Task 8 - Add Recognition/Capture Safety For Marker Layer
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import time
 import tkinter as tk
 from ctypes import wintypes
 from dataclasses import dataclass
@@ -18,6 +19,7 @@ from .models import Rect, SceneObservation
 
 
 TRANSPARENT_COLOR = "#010203"
+CAPTURE_HIDE_SETTLE_MS = 80
 
 
 @dataclass(frozen=True)
@@ -51,12 +53,20 @@ class DesktopPetMarkerLayer:
         for marker in marker_list:
             self._render_marker(marker)
 
-    def hide(self) -> None:
+    def hide(self) -> int:
+        hidden = 0
         for window in self.windows.values():
             try:
                 window.withdraw()
+                hidden += 1
             except tk.TclError:
                 pass
+        return hidden
+
+    def hide_for_capture(self, settle_ms: int = CAPTURE_HIDE_SETTLE_MS) -> None:
+        hidden = self.hide()
+        if hidden > 0:
+            _settle_tk_compositor(self.root, settle_ms)
 
     def destroy(self) -> None:
         for key in list(self.windows):
@@ -245,11 +255,7 @@ def install_desktop_pet_markers(app_cls: type) -> None:
     def hide_markers(self) -> None:
         existing = getattr(self, "_desktop_pet_layer", None)
         if existing is not None:
-            existing.hide()
-            try:
-                self.update_idletasks()
-            except tk.TclError:
-                pass
+            existing.hide_for_capture()
 
     def patched_toggle_overlay(self) -> None:
         if self.overlay_var.get():
@@ -329,6 +335,29 @@ def _build_markers(app) -> list[PetMarker]:
     markers.extend(_backpack_markers(app, scene))
     markers.extend(_brush_markers(app, scene, state))
     return markers[:5]
+
+
+def _settle_tk_compositor(root: tk.Misc, settle_ms: int) -> None:
+    _flush_tk(root)
+    _flush_dwm()
+    if settle_ms > 0:
+        time.sleep(settle_ms / 1000.0)
+    _flush_tk(root)
+    _flush_dwm()
+
+
+def _flush_tk(root: tk.Misc) -> None:
+    try:
+        root.update_idletasks()
+    except tk.TclError:
+        pass
+
+
+def _flush_dwm() -> None:
+    try:
+        ctypes.windll.dwmapi.DwmFlush()
+    except Exception:
+        pass
 
 
 def _board_markers(app, scene: SceneObservation) -> list[PetMarker]:

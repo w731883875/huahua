@@ -349,12 +349,62 @@ Next step:
 
 ## Task 10 - Final Integration Review And Packaging Readiness Notes
 
-Status: pending
+Status: completed
 
 Work performed:
+- Re-read the goal input, plan, task list, and current git state before starting the final review.
+- Performed a requirement-by-requirement completion audit against the active objective:
+  - Independent desktop-pet/hint layer is implemented in `huahua_assistant/desktop_pet.py` and installed from `run_app.py`.
+  - Markers are small coordinate-anchored windows, not a broad full-screen overlay.
+  - Marker coordinates come from detected board/backpack/brush panel geometry plus `last_capture_window` offsets.
+  - Marker windows attempt topmost display, transparent background, no-activate behavior, and Windows click-through styles.
+  - Full capture, quick capture, and auto-follow capture hide markers before screenshots.
+  - Structured recommendation explanations exist in `RecommendationExplanation`, placement recommendations, side-panel lines, compact learning payloads, and desktop-pet captions.
+  - Real learning records reject non-`real_capture` sources and keep recommendation semantics separate from actual placement priors.
+  - Export/merge support remains present for combining real learning bundles.
+- Reviewed compliance and interaction boundaries:
+  - No input injection, auto-clicking, memory reading, or device-control path was added.
+  - GUI capture paths use `activate=False`, so normal desktop-app capture does not intentionally steal focus.
+  - The coordinate hint checkbox remains the user-facing enable/disable switch for the marker layer.
+- Reviewed packaging readiness:
+  - `HuahuaAssistant.spec` points at `run_app.py`, which installs the desktop-pet marker patch before `main()`.
+  - `scripts/build_exe.ps1` still builds `HuahuaAssistant.exe` from `run_app.py`.
+  - No new third-party dependency was introduced by the desktop-pet marker layer.
+- Cleaned generated Python cache files after final validation so no `pyc` files were left dirty.
 
 Validation evidence:
+- `git status --short` was clean at the start of the final review.
+- Code scans confirmed:
+  - `run_app.py` imports and installs `install_desktop_pet_markers(HuahuaApp)`.
+  - `desktop_pet.py` defines `DesktopPetMarkerLayer`, `PetMarker`, click-through styles, marker building, and `hide_for_capture()`.
+  - `desktop_pet.py` wraps `capture_async`, `quick_capture_async`, and `_auto_follow_tick`.
+  - `game_model.py` defines `RecommendationExplanation` and attaches it to placement recommendations.
+  - `app.py` compacts explanation data, renders explanation lines, and records high-value recommendations.
+  - `learning.py` filters by `source == "real_capture"` and aggregates recommendation semantics separately.
+  - `HuahuaAssistant.spec` and `scripts/build_exe.ps1` build from `run_app.py`.
+- `python -B` final smoke test confirmed:
+  - startup patch is installed
+  - recommendation explanation compacts into short/tags/layers
+  - side-panel explanation lines are generated
+  - board and backpack desktop-pet markers are generated from scene/window-derived coordinates
+- `python -m compileall huahua_assistant run_app.py` completed successfully.
+- Isolated learning/export smoke test confirmed:
+  - simulation data is ignored
+  - real capture data is accepted
+  - recommendation semantic tags aggregate
+  - high-value recommendation semantic tags aggregate
+  - export bundle contains only the isolated real test records
+  - temporary test directory was deleted afterward
+- `git diff --check` completed successfully.
+- Final `git status --short` was clean before this task-record update.
 
 Remaining risk:
+- Real game runtime testing is still required to prove the marker windows are visible and click-through in the user's exact Windows display mode.
+- True exclusive fullscreen may still hide normal topmost desktop windows; borderless/windowed fullscreen is the supported first runtime target.
+- `mss` still captures desktop rectangles, so stale compositor frames remain theoretically possible even after marker hiding and DWM/Tk flushing.
+- Brush recommendation marker placement remains approximate until recognition exposes exact per-option/card rectangles.
+- Existing mojibake UI/documentation text remains a readability issue, but it is not a blocker for this goal's functional integration and should be handled in a focused cleanup task later.
+- Final exe packaging was reviewed for readiness but not executed in this goal, because the user's current workflow prefers script iteration until behavior is stable.
 
 Next step:
+- Goal complete. Next practical work outside this goal should be real game runtime testing of marker visibility/click-through and, if needed, a focused follow-up task for exact brush-option rectangles or true window capture.

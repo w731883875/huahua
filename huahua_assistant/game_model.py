@@ -125,6 +125,18 @@ class PuzzleState:
 
 
 @dataclass(frozen=True)
+class RecommendationExplanation:
+    immediate: float = 0.0
+    terrain: float = 0.0
+    risk: float = 0.0
+    resource: float = 0.0
+    expected: float = 0.0
+    value: float = 0.0
+    tags: tuple[str, ...] = ()
+    short: str = ""
+
+
+@dataclass(frozen=True)
 class PlacementRecommendation:
     row: int
     col: int
@@ -133,6 +145,7 @@ class PlacementRecommendation:
     completes_match: bool
     affected: tuple[tuple[int, int], ...]
     reason: str
+    explanation: RecommendationExplanation | None = None
 
 
 @dataclass(frozen=True)
@@ -521,6 +534,17 @@ def recommend_placements(
                     completes_match=outcome.completes_match,
                     affected=scoped_cells,
                     reason=_reason(rule, outcome, paint, lookahead_score, prior_score),
+                    explanation=_placement_explanation(
+                        state,
+                        rule,
+                        row,
+                        col,
+                        scoped_cells,
+                        outcome,
+                        paint,
+                        lookahead_score,
+                        prior_score,
+                    ),
                 )
             )
 
@@ -1856,6 +1880,19 @@ def _recommend_current_anchor_positions(
                     completes_match=possible_matches >= rule.match_required,
                     affected=scope,
                     reason=reason,
+                    explanation=_anchor_explanation(
+                        state,
+                        rule,
+                        row,
+                        col,
+                        scope,
+                        possible_matches,
+                        placeable,
+                        existing_matches,
+                        existing_value_gain,
+                        terrain_delta,
+                        tile,
+                    ),
                 )
             )
 
@@ -1996,6 +2033,171 @@ def _candidate_lookahead_score(
     if outcome.terrain_delta < 0:
         score += outcome.terrain_delta * float(config_value("placement.bad_terrain_extra_weight", 0.65))
     return score
+
+
+def _placement_explanation(
+    state: PuzzleState,
+    rule: CurrentPaintRule,
+    row: int,
+    col: int,
+    affected: tuple[tuple[int, int], ...],
+    outcome: PlacementOutcome,
+    placed_paint: Paint,
+    lookahead_score: float,
+    prior_score: float,
+) -> RecommendationExplanation:
+    missing = max(0, rule.match_required - outcome.match_count)
+    progress_ratio = outcome.match_count / max(1, rule.match_required)
+    immediate = progress_ratio * 120.0
+    immediate += 900.0 if outcome.completes_match else max(0, 4 - missing) * 45.0
+    immediate += outcome.affected_paints * (22.0 if outcome.completes_match else 6.0)
+
+    value = outcome.value_gain * 2.4
+    value += outcome.placed_value_gain * (0.9 if placed_paint.is_treasure else 0.35)
+    if placed_paint.is_treasure:
+        value += _paint_strategic_value(placed_paint) * 0.95
+    value += outcome.treasure_to_7 * TREASURE_LEVEL_VALUES[7] * 1.25
+    value += outcome.gameplay_to_7 * GAMEPLAY_7_VALUE * 0.95
+    value += outcome.monster_to_7 * MONSTER_7_VALUE * 0.95
+    if outcome.current_next_level >= 6 and not placed_paint.is_treasure:
+        value += _paint_strategic_value(replace(placed_paint, level=outcome.current_next_level)) * 0.18
+
+    terrain = outcome.terrain_delta * float(config_value("placement.terrain_delta_weight", 1.15))
+    resource = _future_space_value(state, row, col, affected)
+    risk = -outcome.overwrite_penalty
+    expected = lookahead_score + prior_score
+    tags = _placement_explanation_tags(outcome, placed_paint, lookahead_score, prior_score)
+    return RecommendationExplanation(
+        immediate=round(immediate, 3),
+        terrain=round(terrain, 3),
+        risk=round(risk, 3),
+        resource=round(resource, 3),
+        expected=round(expected, 3),
+        value=round(value, 3),
+        tags=tags,
+        short=_placement_explanation_short(tags, outcome),
+    )
+
+
+def _anchor_explanation(
+    state: PuzzleState,
+    rule: CurrentPaintRule,
+    row: int,
+    col: int,
+    scope: tuple[tuple[int, int], ...],
+    possible_matches: int,
+    placeable: int,
+    existing_matches: int,
+    existing_value_gain: float,
+    terrain_delta: float,
+    tile: Tile,
+) -> RecommendationExplanation:
+    progress_ratio = min(1.0, possible_matches / max(1, rule.match_required))
+    completes = possible_matches >= rule.match_required
+    immediate = progress_ratio * 600.0 + existing_matches * 60.0
+    if completes:
+        immediate += 500.0
+    terrain = terrain_delta * float(config_value("placement.terrain_delta_weight", 1.15))
+    value = existing_value_gain * 1.3
+    resource = placeable * 18.0 + _cell_priority((row, col)) * 4.0 + _special_anchor_tile_bonus(tile, state.active_affix)
+    risk = 0.0 if tile.state == TileState.BLANK else -35.0
+    tags = _anchor_explanation_tags(completes, tile, terrain_delta, existing_value_gain)
+    return RecommendationExplanation(
+        immediate=round(immediate, 3),
+        terrain=round(terrain, 3),
+        risk=round(risk, 3),
+        resource=round(resource, 3),
+        expected=0.0,
+        value=round(value, 3),
+        tags=tags,
+        short=_anchor_explanation_short(tags),
+    )
+
+
+def _placement_explanation_tags(
+    outcome: PlacementOutcome,
+    placed_paint: Paint,
+    lookahead_score: float,
+    prior_score: float,
+) -> tuple[str, ...]:
+    tags: list[str] = []
+    if outcome.completes_match:
+        tags.append("complete_match")
+    if placed_paint.is_treasure:
+        tags.append("treasure")
+    if outcome.current_next_level >= MAX_LEVEL:
+        tags.append("placed_to_7")
+    if outcome.treasure_to_7:
+        tags.append("treasure_to_7")
+    if outcome.gameplay_to_7:
+        tags.append("gameplay_to_7")
+    if outcome.monster_to_7:
+        tags.append("monster_to_7")
+    if outcome.value_gain + outcome.placed_value_gain >= 250:
+        tags.append("high_value_gain")
+    if outcome.overwrite_penalty >= 120:
+        tags.append("overwrite_risk")
+    if outcome.terrain_delta >= 30:
+        tags.append("terrain_gain")
+    elif outcome.terrain_delta <= -30:
+        tags.append("terrain_loss")
+    if lookahead_score >= 90:
+        tags.append("lookahead_gain")
+    elif lookahead_score <= -90:
+        tags.append("lookahead_risk")
+    if prior_score >= 25:
+        tags.append("learned_prior")
+    return tuple(dict.fromkeys(tags))
+
+
+def _anchor_explanation_tags(
+    completes: bool,
+    tile: Tile,
+    terrain_delta: float,
+    existing_value_gain: float,
+) -> tuple[str, ...]:
+    tags: list[str] = ["anchor"]
+    if completes:
+        tags.append("can_complete")
+    if tile.state != TileState.BLANK:
+        tags.append("special_tile")
+    if terrain_delta >= 30:
+        tags.append("terrain_gain")
+    elif terrain_delta <= -30:
+        tags.append("terrain_loss")
+    if existing_value_gain >= 250:
+        tags.append("scope_value_gain")
+    return tuple(dict.fromkeys(tags))
+
+
+def _placement_explanation_short(tags: tuple[str, ...], outcome: PlacementOutcome) -> str:
+    if "treasure_to_7" in tags:
+        return "宝箱到7"
+    if "complete_match" in tags and "treasure" in tags:
+        return "宝箱匹配"
+    if "complete_match" in tags:
+        return "完成匹配"
+    if "placed_to_7" in tags or "gameplay_to_7" in tags or "monster_to_7" in tags:
+        return "冲7级"
+    if "overwrite_risk" in tags:
+        return "有覆盖风险"
+    if "terrain_gain" in tags:
+        return "地形更好"
+    if outcome.match_count:
+        return f"推进{outcome.match_count}格"
+    return "保留后续"
+
+
+def _anchor_explanation_short(tags: tuple[str, ...]) -> str:
+    if "can_complete" in tags and "scope_value_gain" in tags:
+        return "范围收益高"
+    if "can_complete" in tags:
+        return "可完成地形"
+    if "terrain_gain" in tags:
+        return "地形更好"
+    if "special_tile" in tags:
+        return "特殊落点"
+    return "初始锚点"
 
 
 def _dedupe_placement_recommendations(

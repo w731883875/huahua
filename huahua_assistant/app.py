@@ -718,7 +718,6 @@ class HuahuaApp(tk.Tk):
             else []
         )
         self._record_scene_observation(scene, backpack, quality, self.last_rule_anomalies)
-        high_value_notice = self._record_high_value_seen(scene, self.current_state, backpack, quality, mode="完整识别")
         if scene.brush_options is not None and self.current_state.current_rule is not None:
             self.current_state = replace(
                 self.current_state,
@@ -729,6 +728,14 @@ class HuahuaApp(tk.Tk):
         self._apply_detected_brush_options(scene.brush_options)
         self.recommendations = recommend_placements(self.current_state, learning_stats=load_learning_stats())
         self.install_plan = recommend_install_plan(self.current_state)
+        high_value_notice = self._record_high_value_seen(
+            scene,
+            self.current_state,
+            backpack,
+            quality,
+            mode="完整识别",
+            recommendations=self.recommendations,
+        )
         auto_saved = self._auto_record_real_trajectory(scene, backpack)
         rect = board.rect
         self.board_var.set(f"棋盘：x={rect.x} y={rect.y} size={rect.w} 置信={board.score:.2f}")
@@ -848,6 +855,7 @@ class HuahuaApp(tk.Tk):
             self.current_state.backpack,
             quick_quality,
             mode=("自动跟随" if auto else "快速获取"),
+            recommendations=self.recommendations,
         )
         rect = scene.board.rect
         self.board_var.set(f"棋盘：x={rect.x} y={rect.y} size={rect.w} 置信={scene.board.score:.2f}")
@@ -1570,6 +1578,7 @@ class HuahuaApp(tk.Tk):
         quality: dict | None,
         *,
         mode: str,
+        recommendations: list[PlacementRecommendation] | None = None,
     ) -> str | None:
         quality = quality or _capture_quality_gate(scene, backpack)
         if not quality.get("ok"):
@@ -1590,6 +1599,11 @@ class HuahuaApp(tk.Tk):
             "known": combined_summary,
             "current": _compact_rule(state.current_rule) if state is not None else None,
             "score": _quality_proxy(combined_summary),
+            "score_breakdown": _internal_score_breakdown({"known": combined_summary}),
+            "recommendations": [
+                _compact_recommendation(rec)
+                for rec in (recommendations or [])[:3]
+            ],
         }
         event_key = _stable_payload_key(
             {
@@ -2907,14 +2921,23 @@ class HuahuaApp(tk.Tk):
         inferred_codes = stats.get("inferred_action_codes") or {}
         refresh_events = stats.get("refresh_events") or {}
         prior_samples = stats.get("policy_prior_samples") or {}
+        recommendation_shorts = stats.get("recommendation_shorts") or {}
+        recommendation_tags = stats.get("recommendation_tags") or {}
+        high_value_recommendation_tags = stats.get("high_value_recommendation_tags") or {}
         top_affixes = _top_affix_display_items(affix_seen, affix_code_seen, limit=3)
         top_corrections = sorted(correction_fields.items(), key=lambda item: item[1], reverse=True)[:3]
         top_actions = sorted(inferred_actions.items(), key=lambda item: item[1], reverse=True)[:3]
         top_codes = sorted(inferred_codes.items(), key=lambda item: item[1], reverse=True)[:5]
+        top_rec_shorts = sorted(recommendation_shorts.items(), key=lambda item: item[1], reverse=True)[:3]
+        top_rec_tags = sorted(recommendation_tags.items(), key=lambda item: item[1], reverse=True)[:4]
+        top_high_value_tags = sorted(high_value_recommendation_tags.items(), key=lambda item: item[1], reverse=True)[:4]
         affix_text = ", ".join(f"{name}x{count}" for name, count in top_affixes) if top_affixes else "-"
         correction_text = ", ".join(f"{_field_display_name(name)}x{count}" for name, count in top_corrections) if top_corrections else "-"
         action_text = ", ".join(f"{name}x{count}" for name, count in top_actions) if top_actions else "-"
         code_text = ", ".join(f"{name}x{count}" for name, count in top_codes) if top_codes else "-"
+        rec_short_text = ", ".join(f"{name}x{count}" for name, count in top_rec_shorts) if top_rec_shorts else "-"
+        rec_tag_text = ", ".join(f"{name}x{count}" for name, count in top_rec_tags) if top_rec_tags else "-"
+        high_value_tag_text = ", ".join(f"{name}x{count}" for name, count in top_high_value_tags) if top_high_value_tags else "-"
         best_score_text = f"{best_score:.0f}" if isinstance(best_score, (int, float)) else "-"
         quick_avg_text = f"{quick_avg:.2f}s" if isinstance(quick_avg, (int, float)) else "-"
         finished_best_text = f"{finished_best:.0f}" if isinstance(finished_best, (int, float)) else "-"
@@ -2931,6 +2954,7 @@ class HuahuaApp(tk.Tk):
             f"高价值轨迹={trajectories} 最佳={best_score_text}\n"
             f"推断动作={action_text}\n"
             f"动作短码={code_text} 强制={stats.get('forced_events', 0)} 刷新={refresh_events} 升级事件={stats.get('upgrade_events', 0)}\n"
+            f"推荐语义={rec_short_text} 标签={rec_tag_text} 高价值标签={high_value_tag_text}\n"
             f"经验样本：落点={prior_samples.get('placements', 0)} 大类={prior_samples.get('brushes', 0)} 词条={prior_samples.get('affixes', 0)}\n"
             f"宝箱占比={stats.get('treasure_ratio', 0.0):.3f}\n"
             "文件=runtime/observations.jsonl, runtime/corrected_observations.jsonl, runtime/high_score_trajectories.jsonl, runtime/stats.json\n\n",
@@ -3312,13 +3336,36 @@ def _compact_rule(rule: CurrentPaintRule | None) -> dict | None:
 
 
 def _compact_recommendation(rec: PlacementRecommendation) -> dict:
-    return {
+    payload = {
         "r": rec.row,
         "c": rec.col,
         "paint": _compact_paint(rec.paint) if rec.paint is not None else None,
         "score": round(rec.score, 1),
         "complete": rec.completes_match,
     }
+    explanation = _compact_recommendation_explanation(rec)
+    if explanation:
+        payload["explanation"] = explanation
+    return payload
+
+
+def _compact_recommendation_explanation(rec: PlacementRecommendation) -> dict:
+    explanation = getattr(rec, "explanation", None)
+    if explanation is None:
+        return {}
+    payload: dict = {}
+    if explanation.short:
+        payload["short"] = explanation.short
+    if explanation.tags:
+        payload["tags"] = list(explanation.tags)
+    layers = {}
+    for name in ("immediate", "value", "terrain", "risk", "resource", "expected"):
+        value = float(getattr(explanation, name, 0.0) or 0.0)
+        if abs(value) >= 0.5:
+            layers[name] = round(value, 1)
+    if layers:
+        payload["layers"] = layers
+    return payload
 
 
 def _recommendation_explanation_lines(rec: PlacementRecommendation) -> list[str]:

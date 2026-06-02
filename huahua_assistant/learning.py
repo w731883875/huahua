@@ -221,6 +221,11 @@ def _build_stats(
     inferred_action_details = Counter()
     placement_cells = Counter()
     placement_zones = Counter()
+    recommendation_cells = Counter()
+    recommendation_shorts = Counter()
+    recommendation_tags = Counter()
+    high_value_recommendation_shorts = Counter()
+    high_value_recommendation_tags = Counter()
     upgrade_events = 0
     forced_events = 0
     refresh_events = Counter()
@@ -282,6 +287,12 @@ def _build_stats(
             elapsed = (payload.get("quality") or {}).get("elapsed")
             if isinstance(elapsed, (int, float)):
                 quick_elapsed.append(float(elapsed))
+            _accumulate_recommendation_stats(
+                payload.get("top") or (),
+                cells=recommendation_cells,
+                shorts=recommendation_shorts,
+                tags=recommendation_tags,
+            )
         elif event_type == "run_session_finished":
             finished_runs += 1
             final_score = payload.get("internal_score", payload.get("final_score"))
@@ -299,6 +310,14 @@ def _build_stats(
                 high_value_best_score = max(high_value_best_score, float(score))
             for key in ("treasure7", "treasure6", "treasure5", "gameplay7", "monster7", "lv7"):
                 high_value_counts[key] += int(known.get(key, 0) or 0)
+            _accumulate_recommendation_stats(
+                payload.get("recommendations") or (),
+                cells=recommendation_cells,
+                shorts=recommendation_shorts,
+                tags=recommendation_tags,
+                high_value_shorts=high_value_recommendation_shorts,
+                high_value_tags=high_value_recommendation_tags,
+            )
 
     for event in corrections:
         payload = event.get("payload") or {}
@@ -360,6 +379,12 @@ def _build_stats(
                 trajectory_affixes[str(step.get("affix"))] += 1
             if step.get("affix_code"):
                 trajectory_affix_codes[str(step.get("affix_code"))] += 1
+            _accumulate_recommendation_stats(
+                step.get("top") or (),
+                cells=recommendation_cells,
+                shorts=recommendation_shorts,
+                tags=recommendation_tags,
+            )
 
     total_backpack = sum(backpack_levels.values())
     field_accuracy = {}
@@ -402,6 +427,11 @@ def _build_stats(
         "inferred_action_details": dict(inferred_action_details),
         "placement_cells": dict(placement_cells),
         "placement_zones": dict(placement_zones),
+        "recommendation_cells": dict(recommendation_cells),
+        "recommendation_shorts": dict(recommendation_shorts),
+        "recommendation_tags": dict(recommendation_tags),
+        "high_value_recommendation_shorts": dict(high_value_recommendation_shorts),
+        "high_value_recommendation_tags": dict(high_value_recommendation_tags),
         "upgrade_events": upgrade_events,
         "forced_events": forced_events,
         "refresh_events": dict(refresh_events),
@@ -459,6 +489,36 @@ def _placement_cells_from_inferred(inferred: dict[str, Any]) -> list[dict[str, A
         return []
     # Fallback for old trajectory payloads that did not include state transitions.
     return cells[:1]
+
+
+def _accumulate_recommendation_stats(
+    recommendations: Any,
+    *,
+    cells: Counter,
+    shorts: Counter,
+    tags: Counter,
+    high_value_shorts: Counter | None = None,
+    high_value_tags: Counter | None = None,
+) -> None:
+    if not isinstance(recommendations, (list, tuple)):
+        return
+    for rec in recommendations:
+        if not isinstance(rec, dict):
+            continue
+        row = rec.get("r")
+        col = rec.get("c")
+        if isinstance(row, int) and isinstance(col, int):
+            cells[f"{row},{col}"] += 1
+        explanation = rec.get("explanation") if isinstance(rec.get("explanation"), dict) else {}
+        short = explanation.get("short")
+        if short:
+            shorts[str(short)] += 1
+            if high_value_shorts is not None:
+                high_value_shorts[str(short)] += 1
+        for tag in explanation.get("tags") or ():
+            tags[str(tag)] += 1
+            if high_value_tags is not None:
+                high_value_tags[str(tag)] += 1
 
 
 def _cell_zone(row: int, col: int) -> str:

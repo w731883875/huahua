@@ -5,7 +5,7 @@ a = Analysis(
     ['run_app.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('huahua_assistant/assets', 'huahua_assistant/assets')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

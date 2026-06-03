@@ -67,6 +67,9 @@ DEFAULT_STRATEGY_CONFIG: dict[str, Any] = {
         "brush_max_bonus": 130.0,
         "affix_max_bonus": 150.0,
     },
+    "debug": {
+        "save_fast_captures": False,
+    },
 }
 
 _CACHE: dict[str, Any] | None = None

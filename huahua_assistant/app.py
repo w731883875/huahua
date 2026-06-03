@@ -145,6 +145,7 @@ class HuahuaApp(tk.Tk):
         self.auto_follow_generation = 0
         self.last_high_value_key: str | None = None
         self.last_finish_skip_reason: str | None = None
+        self.last_finish_diagnostic: dict | None = None
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -266,6 +267,7 @@ class HuahuaApp(tk.Tk):
             pady=7,
             font=("Microsoft YaHei UI", 10, "bold"),
             relief=tk.FLAT,
+            wraplength=1120,
         )
         self.notice_label.pack(fill=tk.X, padx=14, pady=(0, 6))
         self._set_notice("提示：完整识别建立地图；快速获取/自动跟随用于实战节奏。低置信度不会写入高分轨迹。", "info")
@@ -593,22 +595,34 @@ class HuahuaApp(tk.Tk):
     def _auto_follow_worker(self, generation: int) -> None:
         try:
             started_at = time.perf_counter()
+            capture_started_at = time.perf_counter()
             capture = capture_target(
                 DEFAULT_WINDOW_TITLE,
                 fallback_to_screen=True,
                 fallback_if_target_uncaptureable=False,
                 activate=False,
             )
+            capture_elapsed = time.perf_counter() - capture_started_at
             frame = capture.image
-            write_image("runtime/capture_auto.png", frame)
+            write_elapsed = 0.0
+            if bool(config_value("debug.save_fast_captures", False)):
+                write_started_at = time.perf_counter()
+                write_image("runtime/capture_auto.png", frame)
+                write_elapsed = time.perf_counter() - write_started_at
+            analysis_started_at = time.perf_counter()
             scene = self.tracker.analyze_quick(frame)
+            analysis_elapsed = time.perf_counter() - analysis_started_at
+            full_refresh_elapsed = 0.0
             if self._needs_stage2_brush_refresh():
+                full_started_at = time.perf_counter()
                 scene = self.tracker.analyze(frame)
+                full_refresh_elapsed = time.perf_counter() - full_started_at
             elapsed = time.perf_counter() - started_at
+            perf = _fast_capture_perf(capture_elapsed, analysis_elapsed, write_elapsed, full_refresh_elapsed)
         except Exception as exc:
             self.after(0, lambda: self._auto_follow_error(exc, generation))
             return
-        self.after(0, lambda: self._render_auto_follow_result(scene, capture.source, elapsed, capture.window, generation))
+        self.after(0, lambda: self._render_auto_follow_result(scene, capture.source, elapsed, capture.window, generation, perf))
 
     def _auto_follow_error(self, exc: Exception, generation: int) -> None:
         if generation != self.auto_follow_generation or not self.auto_follow_var.get():
@@ -622,7 +636,6 @@ class HuahuaApp(tk.Tk):
         self.status_var.set("正在快速获取棋盘状态...")
         self._set_notice("正在快速获取：跳过 OCR，优先给出 1 秒级局面建议。", "info")
         self.auto_follow_generation += 1
-        self.tracker.reset()
         self.withdraw()
         self.update_idletasks()
         thread = threading.Thread(target=self._quick_capture_worker, daemon=True)
@@ -652,23 +665,35 @@ class HuahuaApp(tk.Tk):
         try:
             time.sleep(0.18)
             started_at = time.perf_counter()
+            capture_started_at = time.perf_counter()
             capture = capture_target(
                 DEFAULT_WINDOW_TITLE,
                 fallback_to_screen=True,
                 fallback_if_target_uncaptureable=False,
                 activate=False,
             )
+            capture_elapsed = time.perf_counter() - capture_started_at
             frame = capture.image
-            write_image("runtime/capture_quick.png", frame)
+            write_elapsed = 0.0
+            if bool(config_value("debug.save_fast_captures", False)):
+                write_started_at = time.perf_counter()
+                write_image("runtime/capture_quick.png", frame)
+                write_elapsed = time.perf_counter() - write_started_at
+            analysis_started_at = time.perf_counter()
             scene = self.tracker.analyze_quick(frame)
+            analysis_elapsed = time.perf_counter() - analysis_started_at
+            full_refresh_elapsed = 0.0
             if self._needs_stage2_brush_refresh():
+                full_started_at = time.perf_counter()
                 scene = self.tracker.analyze(frame)
+                full_refresh_elapsed = time.perf_counter() - full_started_at
             elapsed = time.perf_counter() - started_at
+            perf = _fast_capture_perf(capture_elapsed, analysis_elapsed, write_elapsed, full_refresh_elapsed)
         except Exception as exc:
             self.after(0, lambda: self._show_error(exc))
             return
 
-        self.after(0, lambda: self._render_quick_result(scene, capture.source, elapsed, capture.window))
+        self.after(0, lambda: self._render_quick_result(scene, capture.source, elapsed, capture.window, perf))
 
     def _needs_stage2_brush_refresh(self) -> bool:
         return (
@@ -768,10 +793,11 @@ class HuahuaApp(tk.Tk):
         capture_source: str,
         elapsed: float,
         capture_window: WindowInfo | None,
+        capture_perf: dict | None = None,
     ) -> None:
         self._restore_app_window()
         self.last_capture_window = capture_window
-        self._render_fast_scene_result(scene, capture_source, elapsed, auto=False)
+        self._render_fast_scene_result(scene, capture_source, elapsed, auto=False, capture_perf=capture_perf)
 
     def _render_auto_follow_result(
         self,
@@ -780,13 +806,14 @@ class HuahuaApp(tk.Tk):
         elapsed: float,
         capture_window: WindowInfo | None,
         generation: int,
+        capture_perf: dict | None = None,
     ) -> None:
         if generation != self.auto_follow_generation or not self.auto_follow_var.get():
             self.auto_follow_busy = False
             return
         try:
             self.last_capture_window = capture_window
-            self._render_fast_scene_result(scene, capture_source, elapsed, auto=True)
+            self._render_fast_scene_result(scene, capture_source, elapsed, auto=True, capture_perf=capture_perf)
         finally:
             self.auto_follow_busy = False
             self._schedule_auto_follow()
@@ -798,10 +825,12 @@ class HuahuaApp(tk.Tk):
         elapsed: float,
         *,
         auto: bool,
+        capture_perf: dict | None = None,
     ) -> None:
         if scene is None:
             prefix = "自动跟随" if auto else "快速获取"
-            self.status_var.set(f"{prefix}：未找到棋盘。来源={capture_source}，耗时={elapsed:.2f}s。")
+            perf_text = _format_fast_capture_perf(capture_perf)
+            self.status_var.set(f"{prefix}：未找到棋盘。来源={capture_source}，耗时={elapsed:.2f}s。{perf_text}")
             return
 
         if self.real_session_finished and _looks_like_new_run(scene, self.last_real_capture_step):
@@ -846,9 +875,9 @@ class HuahuaApp(tk.Tk):
         self._merge_quick_brush_stage2(scene.brush_options)
         self.recommendations = recommend_placements(self.current_state, learning_stats=load_learning_stats())
         self.install_plan = recommend_install_plan(self.current_state)
-        quick_quality = _quick_capture_quality(scene, elapsed)
+        quick_quality = _quick_capture_quality(scene, elapsed, capture_perf)
         self.last_capture_quality = quick_quality
-        quick_saved = self._record_quick_capture_step(scene, self.current_state, elapsed)
+        quick_saved = self._record_quick_capture_step(scene, self.current_state, elapsed, capture_perf=capture_perf)
         high_value_notice = self._record_high_value_seen(
             scene,
             self.current_state,
@@ -864,6 +893,9 @@ class HuahuaApp(tk.Tk):
             f"{prefix}：{elapsed:.2f}s。"
             "棋盘快路径，已跳过 OCR。"
         )
+        perf_text = _format_fast_capture_perf(capture_perf)
+        if perf_text:
+            status += f" {perf_text}"
         if fast_current_changed:
             status += " 检测到新初始颜料图标变化，已暂停旧规则推荐，请点完整识别或完成笔触选择后快速获取。"
         if backpack_just_appeared and self.current_state is not None and not current_rule_is_pending(self.current_state):
@@ -985,6 +1017,7 @@ class HuahuaApp(tk.Tk):
         self.last_real_capture_step = None
         self.last_high_value_key = None
         self.last_finish_skip_reason = None
+        self.last_finish_diagnostic = None
         self.pending_tentative_step = None
         self.pending_tentative_signature = None
         self.quick_capture_record_count = 0
@@ -1009,10 +1042,35 @@ class HuahuaApp(tk.Tk):
 
     def finish_real_session(self) -> None:
         if not self.real_trajectory_steps:
-            self.status_var.set("本局还没有真实步骤记录，请先完整识别或重新快速获取。")
+            reason = "本局还没有真实步骤记录，请先完整识别或重新快速获取。"
+            self._set_finish_diagnostic(saved=False, score=0.0, terminal={}, reliable_steps=[], finish_seen=False, reason_text=reason)
+            self.status_var.set(reason)
+            self._set_notice(_format_finish_diagnostic(self.last_finish_diagnostic), "warning")
             return
         if self.current_state is None:
-            self.status_var.set("当前没有可评分的局面，请先识别一次终局画面。")
+            reason = "当前没有可评分的局面，请先识别一次终局画面。"
+            reliable_steps = [step for step in self.real_trajectory_steps if (step.get("quality") or {}).get("ok") is True]
+            self._set_finish_diagnostic(saved=False, score=0.0, terminal={}, reliable_steps=reliable_steps, finish_seen=False, reason_text=reason)
+            self.status_var.set(reason)
+            self._set_notice(_format_finish_diagnostic(self.last_finish_diagnostic), "warning")
+            return
+        if self.real_session_finished:
+            reliable_steps = [step for step in self.real_trajectory_steps if (step.get("quality") or {}).get("ok") is True]
+            finish_seen = self.current_scene is not None and _scene_has_finish_evidence(self.current_scene, self.current_state)
+            terminal = _best_available_terminal_summary(self.current_state, self.real_trajectory_steps)
+            score = _internal_run_score(terminal)
+            reason = "本局已经自动/手动结束处理过，不重复保存；要记录下一局请点“新开一局”。"
+            self.last_finish_skip_reason = reason
+            self._set_finish_diagnostic(
+                saved=False,
+                score=score,
+                terminal=terminal,
+                reliable_steps=reliable_steps,
+                finish_seen=finish_seen,
+                reason_text=reason,
+            )
+            self.status_var.set(f"本局已结束 {self.real_session_id}：不重复保存。")
+            self._set_notice(_format_finish_diagnostic(self.last_finish_diagnostic), "warning")
             return
         saved, score = self._finish_real_session_internal(reason="manual_finish")
         suffix = "已保存" if saved else (self.last_finish_skip_reason or "重复/未保存")
@@ -1020,30 +1078,66 @@ class HuahuaApp(tk.Tk):
             f"本局结束 {self.real_session_id}：内部评分={score:.0f}，步骤={len(self.real_trajectory_steps)}，{suffix}。"
         )
         self._set_notice(
-            f"本局结束：内部评分={score:.0f}，{suffix}。",
+            _format_finish_diagnostic(self.last_finish_diagnostic),
             "success" if saved else "warning",
         )
+
+    def _set_finish_diagnostic(
+        self,
+        *,
+        saved: bool,
+        score: float,
+        terminal: dict,
+        reliable_steps: list[dict],
+        finish_seen: bool,
+        reason_text: str,
+        quality: dict | None = None,
+    ) -> None:
+        self.last_finish_diagnostic = {
+            "saved": saved,
+            "score": score,
+            "reason": reason_text,
+            "steps": len(self.real_trajectory_steps),
+            "reliable_steps": len(reliable_steps),
+            "finish_seen": finish_seen,
+            "last_quality": quality if quality is not None else self.last_capture_quality,
+            "terminal": terminal,
+        }
 
     def _finish_real_session_internal(self, *, reason: str) -> tuple[bool, float]:
         self.last_finish_skip_reason = None
         if self.current_state is None:
             self.last_finish_skip_reason = "当前没有可评分局面"
+            self._set_finish_diagnostic(
+                saved=False,
+                score=0.0,
+                terminal={},
+                reliable_steps=[],
+                finish_seen=False,
+                reason_text=self.last_finish_skip_reason,
+            )
             return False, 0.0
         finish_seen = self.current_scene is not None and _scene_has_finish_evidence(self.current_scene, self.current_state)
-        terminal = (
-            _best_available_terminal_summary(self.current_state, self.real_trajectory_steps)
-            if finish_seen
-            else _trajectory_terminal_summary(self.current_state, self.current_state.backpack)
-        )
+        terminal = _best_available_terminal_summary(self.current_state, self.real_trajectory_steps)
         score = _internal_run_score(terminal)
         score_breakdown = _internal_score_breakdown(terminal)
         reliable_steps = [step for step in self.real_trajectory_steps if (step.get("quality") or {}).get("ok") is True]
-        if self.last_capture_quality is not None and not self.last_capture_quality.get("ok") and not finish_seen:
+        terminal_has_high_value = _summary_has_high_value(terminal.get("known") or {})
+        if self.last_capture_quality is not None and not self.last_capture_quality.get("ok") and not finish_seen and not terminal_has_high_value:
             self.last_finish_skip_reason = _finish_reliability_reason(
                 terminal,
                 reliable_steps,
                 finish_seen=finish_seen,
                 last_quality=self.last_capture_quality,
+            )
+            self._set_finish_diagnostic(
+                saved=False,
+                score=score,
+                terminal=terminal,
+                reliable_steps=reliable_steps,
+                finish_seen=finish_seen,
+                reason_text=self.last_finish_skip_reason,
+                quality=self.last_capture_quality,
             )
             record_observation(
                 "run_session_finish_skipped",
@@ -1064,6 +1158,14 @@ class HuahuaApp(tk.Tk):
         reliable, reason_text = _terminal_reliability_for_finish(terminal, reliable_steps, finish_seen=finish_seen)
         if not reliable:
             self.last_finish_skip_reason = reason_text
+            self._set_finish_diagnostic(
+                saved=False,
+                score=score,
+                terminal=terminal,
+                reliable_steps=reliable_steps,
+                finish_seen=finish_seen,
+                reason_text=self.last_finish_skip_reason,
+            )
             record_observation(
                 "run_session_finish_skipped",
                 {
@@ -1094,6 +1196,14 @@ class HuahuaApp(tk.Tk):
             "steps": reliable_steps[-240:],
         }
         saved = record_high_score_trajectory(payload, source="real_capture")
+        self._set_finish_diagnostic(
+            saved=saved,
+            score=score,
+            terminal=terminal,
+            reliable_steps=reliable_steps,
+            finish_seen=finish_seen,
+            reason_text=("结算轨迹已保存" if saved else "终局可信，但轨迹重复或已保存过，未重复写入"),
+        )
         record_observation(
             "run_session_finished",
             {
@@ -1112,8 +1222,15 @@ class HuahuaApp(tk.Tk):
         self.real_session_finished = True
         return saved, score
 
-    def _record_quick_capture_step(self, scene: SceneObservation, state: PuzzleState, elapsed: float) -> bool:
-        quality = _quick_capture_quality(scene, elapsed)
+    def _record_quick_capture_step(
+        self,
+        scene: SceneObservation,
+        state: PuzzleState,
+        elapsed: float,
+        *,
+        capture_perf: dict | None = None,
+    ) -> bool:
+        quality = _quick_capture_quality(scene, elapsed, capture_perf)
         step = _compact_real_capture_step(
             scene=scene,
             state=state,
@@ -3924,7 +4041,7 @@ def _capture_quality_gate(scene: SceneObservation, backpack: tuple[Paint, ...]) 
     }
 
 
-def _quick_capture_quality(scene: SceneObservation, elapsed: float) -> dict:
+def _quick_capture_quality(scene: SceneObservation, elapsed: float, capture_perf: dict | None = None) -> dict:
     board_score = round(float(scene.board.score), 3)
     unknown_tiles = sum(1 for tile in scene.board.tiles if tile.state == TileState.UNKNOWN)
     min_board = float(config_value("quality.quick_min_board", 0.66))
@@ -3941,6 +4058,7 @@ def _quick_capture_quality(scene: SceneObservation, elapsed: float) -> dict:
         "ocr": False,
         "elapsed": round(elapsed, 3),
         "unknown_tiles": unknown_tiles,
+        "perf": capture_perf or {},
     }
 
 
@@ -4257,6 +4375,71 @@ def _format_high_value_summary(summary: dict) -> str:
     return "，".join(parts)
 
 
+def _format_finish_diagnostic(diagnostic: dict | None) -> str:
+    if not diagnostic:
+        return "本局结束：暂无诊断信息。"
+    terminal = diagnostic.get("terminal") or {}
+    known = terminal.get("known") or {}
+    board_known = terminal.get("board_known") or {}
+    backpack = terminal.get("backpack") or {}
+    quality = diagnostic.get("last_quality") or {}
+    saved = bool(diagnostic.get("saved"))
+    score = float(diagnostic.get("score", 0.0) or 0.0)
+    reason = diagnostic.get("reason") or "-"
+    finish_text = "有" if diagnostic.get("finish_seen") else "无"
+    quality_text = _format_finish_quality(quality)
+    high_value = _format_high_value_summary(known) if _summary_has_high_value(known) else "无高价值终局"
+    board_total = int(board_known.get("total", 0) or 0)
+    backpack_total = int(backpack.get("total", 0) or 0)
+    result = "已保存结算轨迹" if saved else "未保存结算轨迹"
+    return (
+        f"结束诊断：{result}；原因：{reason}；内部评分={score:.0f}；"
+        f"可靠步骤={int(diagnostic.get('reliable_steps', 0) or 0)}/{int(diagnostic.get('steps', 0) or 0)}；"
+        f"结算证据={finish_text}；最后识别={quality_text}；"
+        f"终局价值={high_value}；棋盘已识别颜料={board_total}，背包={backpack_total}。"
+    )
+
+
+def _format_finish_quality(quality: dict) -> str:
+    if not quality:
+        return "无"
+    ok_text = "合格" if quality.get("ok") else "低置信"
+    score = quality.get("score")
+    score_text = f"{float(score):.2f}" if isinstance(score, (int, float)) else "-"
+    reason = quality.get("reason") or "-"
+    return f"{ok_text}({score_text}, {reason})"
+
+
+def _fast_capture_perf(
+    capture_elapsed: float,
+    analysis_elapsed: float,
+    write_elapsed: float = 0.0,
+    full_refresh_elapsed: float = 0.0,
+) -> dict:
+    return {
+        "capture": round(capture_elapsed, 3),
+        "analysis": round(analysis_elapsed, 3),
+        "write": round(write_elapsed, 3),
+        "full_refresh": round(full_refresh_elapsed, 3),
+    }
+
+
+def _format_fast_capture_perf(perf: dict | None) -> str:
+    if not perf:
+        return ""
+    parts = [
+        f"截图={float(perf.get('capture', 0.0) or 0.0):.2f}s",
+        f"分析={float(perf.get('analysis', 0.0) or 0.0):.2f}s",
+    ]
+    write_elapsed = float(perf.get("write", 0.0) or 0.0)
+    full_refresh = float(perf.get("full_refresh", 0.0) or 0.0)
+    if write_elapsed > 0.01:
+        parts.append(f"写图={write_elapsed:.2f}s")
+    if full_refresh > 0.01:
+        parts.append(f"完整补读={full_refresh:.2f}s")
+    return "耗时拆分：" + "，".join(parts) + "。"
+
+
 def _scene_has_finish_evidence(scene: SceneObservation | None, state: PuzzleState | None) -> bool:
     if scene is None:
         return False
@@ -4303,11 +4486,13 @@ def _terminal_reliability_for_finish(terminal: dict, steps: list[dict], *, finis
         return False, "终局没有识别到任何颜料/背包内容，已跳过高分轨迹保存"
     if _summary_has_high_value(known):
         return True, "高价值终局可保存"
-    if finish_seen and total_known > 0:
-        return True, "有完成绘制/无空白地块证据，可保存"
     # Low-value terminal runs are still useful only when the board paint
     # recognition has meaningful content. Avoid saving empty/garbled endings.
     min_board_paints = int(config_value("quality.finish_min_board_paints", 8))
+    if finish_seen and board_total < min_board_paints:
+        return False, f"已识别结算，但棋盘颜料等级识别少于{min_board_paints}个；为避免假成功，已跳过高分轨迹保存"
+    if finish_seen and total_known > 0:
+        return True, "有完成绘制/无空白地块证据，且棋盘颜料识别足够，可保存"
     if board_total >= min_board_paints:
         return True, "终局棋盘颜料数量足够，可保存"
     return False, f"终局价值较低且棋盘颜料识别少于{min_board_paints}个，已跳过高分轨迹保存"

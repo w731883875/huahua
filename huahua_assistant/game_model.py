@@ -61,6 +61,7 @@ class AffixEffect(str, Enum):
     ALLOW_PLACE_ON_BLOCKED = "allow_place_on_blocked"
     ALLOW_PLACE_ON_VOID_LOSE_SELF = "allow_place_on_void_lose_self"
     ALLOW_PLACE_ON_PAINT_LOSE_SELF = "allow_place_on_paint_lose_self"
+    ALLOW_PLACE_ON_FADED = "allow_place_on_faded"
 
 
 class SpecialAction(str, Enum):
@@ -296,13 +297,36 @@ def state_from_observation(
 
     tiles = []
     for tile in board.tiles:
-        paint = rule.paint if anchor == (tile.row, tile.col) and rule is not None else None
+        paint = _paint_from_tile_observation(tile)
+        if anchor == (tile.row, tile.col) and rule is not None:
+            paint = rule.paint
         tiles.append(Tile(state=tile.state, paint=paint))
     return PuzzleState(
         tiles=tuple(tiles),
         current_rule=rule,
         backpack=sort_backpack_for_rule(tuple(backpack), rule),
         current_anchor=anchor,
+    )
+
+
+def _paint_from_tile_observation(tile) -> Paint | None:
+    if tile.state != TileState.PAINT:
+        return None
+    category = getattr(tile, "paint_category", PaintCategory.UNKNOWN)
+    level = getattr(tile, "paint_level", None)
+    category_confidence = float(getattr(tile, "paint_category_confidence", 0.0) or 0.0)
+    level_confidence = float(getattr(tile, "paint_level_confidence", 0.0) or 0.0)
+    min_category = float(config_value("quality.board_paint_min_category_confidence", 0.46))
+    min_level = float(config_value("quality.board_paint_min_level_confidence", 0.36))
+    if category == PaintCategory.UNKNOWN or level is None:
+        return None
+    if category_confidence < min_category or level_confidence < min_level:
+        return None
+    return Paint(
+        category=category,
+        level=max(1, min(MAX_LEVEL, int(level))),
+        subtype=getattr(tile, "paint_subtype", None),
+        is_treasure=bool(getattr(tile, "paint_is_treasure", False)),
     )
 
 
@@ -981,6 +1005,7 @@ def apply_affix_to_state(state: PuzzleState, affix: AffixRule, seed: int | None 
         AffixEffect.ALLOW_PLACE_ON_BLOCKED,
         AffixEffect.ALLOW_PLACE_ON_VOID_LOSE_SELF,
         AffixEffect.ALLOW_PLACE_ON_PAINT_LOSE_SELF,
+        AffixEffect.ALLOW_PLACE_ON_FADED,
     }:
         return AffixApplyResult(
             state=replace(state, active_affix=affix),
@@ -1282,6 +1307,8 @@ def _score_affix(state: PuzzleState, affix: AffixRule) -> float:
         return _count_tiles(state, TileState.VOID) * 25.0 + 30.0
     if affix.effect == AffixEffect.ALLOW_PLACE_ON_PAINT_LOSE_SELF:
         return _count_tiles(state, TileState.PAINT) * 20.0 + 25.0
+    if affix.effect == AffixEffect.ALLOW_PLACE_ON_FADED:
+        return _count_tiles(state, TileState.FADED) * 34.0 + 35.0
     if affix.effect == AffixEffect.RANDOMIZE_CURRENT_LEVEL:
         return 45.0
     return 0.0
@@ -1374,6 +1401,7 @@ def _affix_reason(state: PuzzleState, affix: AffixRule, prior_score: float = 0.0
         AffixEffect.ALLOW_PLACE_ON_BLOCKED,
         AffixEffect.ALLOW_PLACE_ON_VOID_LOSE_SELF,
         AffixEffect.ALLOW_PLACE_ON_PAINT_LOSE_SELF,
+        AffixEffect.ALLOW_PLACE_ON_FADED,
     }:
         return "增加特殊落点，注意可能失去自身内容" + suffix
     if affix.effect == AffixEffect.UPGRADE_GLOBAL_CATEGORY:
@@ -1441,6 +1469,7 @@ def build_affix_catalog() -> tuple[AffixRule, ...]:
         AffixRule(BrushType.SPREAD, "当前颜料可放置在阻挡地块", AffixEffect.ALLOW_PLACE_ON_BLOCKED),
         AffixRule(BrushType.SPREAD, "当前颜料可放置在虚空地块但失去自身内容", AffixEffect.ALLOW_PLACE_ON_VOID_LOSE_SELF, persistent_until_match=True),
         AffixRule(BrushType.SPREAD, "当前颜料可放置在已放置颜料地块但失去自身内容", AffixEffect.ALLOW_PLACE_ON_PAINT_LOSE_SELF, persistent_until_match=True),
+        AffixRule(BrushType.SPREAD, "可放置于失色地块中", AffixEffect.ALLOW_PLACE_ON_FADED),
     )
 
 
@@ -1474,6 +1503,8 @@ def _is_placeable(tile: Tile, affix: AffixRule | None) -> bool:
         return True
     if tile.state == TileState.PAINT and affix.effect == AffixEffect.ALLOW_PLACE_ON_PAINT_LOSE_SELF:
         return True
+    if tile.state == TileState.FADED and affix.effect == AffixEffect.ALLOW_PLACE_ON_FADED:
+        return True
     return False
 
 
@@ -1488,6 +1519,8 @@ def _is_current_anchor_placeable(tile: Tile, affix: AffixRule | None) -> bool:
         return True
     if tile.state == TileState.PAINT and affix.effect == AffixEffect.ALLOW_PLACE_ON_PAINT_LOSE_SELF:
         return True
+    if tile.state == TileState.FADED and affix.effect == AffixEffect.ALLOW_PLACE_ON_FADED:
+        return True
     return False
 
 
@@ -1500,6 +1533,8 @@ def _tile_after_current_anchor_placement(tile: Tile, paint: Paint, affix: AffixR
         return Tile(state=TileState.FADED, paint=None, buff_applied_id=None, affix_applied_id=None)
     if tile.state == TileState.PAINT and affix.effect == AffixEffect.ALLOW_PLACE_ON_PAINT_LOSE_SELF:
         return tile
+    if tile.state == TileState.FADED and affix.effect == AffixEffect.ALLOW_PLACE_ON_FADED:
+        return Tile(state=TileState.PAINT, paint=paint, buff_applied_id=None, affix_applied_id=None)
     return Tile(state=TileState.PAINT, paint=paint, buff_applied_id=None, affix_applied_id=None)
 
 
@@ -1928,6 +1963,8 @@ def _special_anchor_tile_bonus(tile: Tile, affix: AffixRule | None) -> float:
         # anchor, so it is not the same risk profile as overwriting a backpack
         # paint onto an existing high-value piece.
         return 75.0
+    if tile.state == TileState.FADED and affix.effect == AffixEffect.ALLOW_PLACE_ON_FADED:
+        return 85.0
     return 0.0
 
 
@@ -2741,6 +2778,7 @@ def _resolve_anchor_affix(state: PuzzleState, affix: AffixRule | None) -> tuple[
         AffixEffect.ALLOW_PLACE_ON_BLOCKED,
         AffixEffect.ALLOW_PLACE_ON_VOID_LOSE_SELF,
         AffixEffect.ALLOW_PLACE_ON_PAINT_LOSE_SELF,
+        AffixEffect.ALLOW_PLACE_ON_FADED,
     }:
         return replace(state, active_affix=None), "特殊放置词条已消耗"
     return state, ""

@@ -73,6 +73,12 @@ class TileObservation:
     state: TileState
     confidence: float
     features: dict[str, float]
+    paint_category: PaintCategory = PaintCategory.UNKNOWN
+    paint_category_confidence: float = 0.0
+    paint_level: int | None = None
+    paint_level_confidence: float = 0.0
+    paint_subtype: str | None = None
+    paint_is_treasure: bool = False
 
 
 @dataclass(frozen=True)

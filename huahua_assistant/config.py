@@ -15,6 +15,10 @@ DEFAULT_STRATEGY_CONFIG: dict[str, Any] = {
         "min_current": 0.45,
         "min_backpack": 0.35,
         "min_brush": 0.35,
+        "max_unknown_tiles": 1,
+        "quick_max_unknown_tiles": 1,
+        "board_paint_min_category_confidence": 0.46,
+        "board_paint_min_level_confidence": 0.36,
     },
     "autosave": {
         "min_internal_score": 3000.0,

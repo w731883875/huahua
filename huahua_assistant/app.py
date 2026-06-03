@@ -51,7 +51,7 @@ from .learning import (
     record_high_score_trajectory,
     record_observation,
 )
-from .models import BoardObservation, BrushOptionsObservation, PaintCategory, PaintDirection, PaintObject, RegionKind, SceneObservation, TileState
+from .models import BoardObservation, BrushOptionsObservation, PaintCategory, PaintDirection, PaintObject, Rect, RegionKind, SceneObservation, TileState
 from .vision import VisionTracker, analyze_and_save_debug
 
 
@@ -120,6 +120,7 @@ class HuahuaApp(tk.Tk):
         self.overlay_phase = False
         self.overlay_wndprocs: dict[int, tuple[int, object]] = {}
         self.last_capture_window: WindowInfo | None = None
+        self.last_capture_size: tuple[int, int] | None = None
         self.tracker = VisionTracker()
         self.detected_backpack_cache: dict[str, tuple[Paint, float]] = {}
         self.backpack_session_key: str | None = None
@@ -505,6 +506,62 @@ class HuahuaApp(tk.Tk):
         self._draw_overlay_board_hints(canvas, scene, color)
         self._draw_overlay_backpack_hints(canvas, scene, state, color)
 
+    def _set_last_capture_context(
+        self,
+        window: WindowInfo | None,
+        capture_size: tuple[int, int] | None,
+    ) -> None:
+        self.last_capture_window = window
+        self.last_capture_size = capture_size if _valid_capture_size(capture_size) else None
+
+    def _screen_point_from_capture_point(self, x: float, y: float) -> tuple[int, int] | None:
+        local = self._window_local_point_from_capture_point(x, y)
+        if local is None:
+            return None
+        window = self.last_capture_window
+        if window is None:
+            return int(round(local[0])), int(round(local[1]))
+        return int(round(window.left + local[0])), int(round(window.top + local[1]))
+
+    def _screen_point_for_capture_rect(
+        self,
+        rect: Rect,
+        x_ratio: float = 0.5,
+        y_ratio: float = 0.5,
+    ) -> tuple[int, int] | None:
+        x = float(rect.x) + float(rect.w) * x_ratio
+        y = float(rect.y) + float(rect.h) * y_ratio
+        return self._screen_point_from_capture_point(x, y)
+
+    def _window_local_point_from_capture_point(self, x: float, y: float) -> tuple[float, float] | None:
+        window = self.last_capture_window
+        capture_size = self.last_capture_size
+        if window is not None and capture_size is not None and window.width > 0 and window.height > 0:
+            capture_w, capture_h = capture_size
+            return float(x) / capture_w * window.width, float(y) / capture_h * window.height
+        return float(x), float(y)
+
+    def _window_local_rect_from_capture_rect(self, rect: Rect, pad: float = 0.0) -> tuple[float, float, float, float]:
+        x1 = float(rect.x) + pad
+        y1 = float(rect.y) + pad
+        x2 = float(rect.right) - pad
+        y2 = float(rect.bottom) - pad
+        p1 = self._window_local_point_from_capture_point(x1, y1) or (x1, y1)
+        p2 = self._window_local_point_from_capture_point(x2, y2) or (x2, y2)
+        return p1[0], p1[1], p2[0], p2[1]
+
+    def _screen_rect_from_capture_rect(self, rect: Rect, pad: float = 0.0) -> tuple[int, int, int, int] | None:
+        x1, y1, x2, y2 = self._window_local_rect_from_capture_rect(rect, pad=pad)
+        window = self.last_capture_window
+        if window is None:
+            return int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2))
+        return (
+            int(round(window.left + x1)),
+            int(round(window.top + y1)),
+            int(round(window.left + x2)),
+            int(round(window.top + y2)),
+        )
+
     def _draw_overlay_board_hints(self, canvas: tk.Canvas, scene: SceneObservation, color: str) -> None:
         if not self.recommendations:
             return
@@ -513,17 +570,22 @@ class HuahuaApp(tk.Tk):
             tile = scene.board.tile(rec.row, rec.col)
             width = 7 if rec == best else 4
             outline = color if rec == best else "#9ff5ff"
+            x1, y1, x2, y2 = self._window_local_rect_from_capture_rect(tile.rect, pad=5)
             canvas.create_rectangle(
-                tile.rect.x + 5,
-                tile.rect.y + 5,
-                tile.rect.right - 5,
-                tile.rect.bottom - 5,
+                x1,
+                y1,
+                x2,
+                y2,
                 outline=outline,
                 width=width,
             )
-            canvas.create_text(
+            tx, ty = self._window_local_point_from_capture_point(tile.rect.x + 12, tile.rect.y + 14) or (
                 tile.rect.x + 12,
                 tile.rect.y + 14,
+            )
+            canvas.create_text(
+                tx,
+                ty,
                 text=f"{index}",
                 fill=outline,
                 font=("Microsoft YaHei UI", 16, "bold"),
@@ -549,17 +611,22 @@ class HuahuaApp(tk.Tk):
                 continue
             desired[paint] -= 1
             rect = observed.slot_rect
+            x1, y1, x2, y2 = self._window_local_rect_from_capture_rect(rect, pad=3)
             canvas.create_rectangle(
-                rect.x + 3,
-                rect.y + 3,
-                rect.right - 3,
-                rect.bottom - 3,
+                x1,
+                y1,
+                x2,
+                y2,
                 outline=color,
                 width=6,
             )
-            canvas.create_text(
+            tx, ty = self._window_local_point_from_capture_point((rect.x + rect.right) / 2, rect.y - 10) or (
                 (rect.x + rect.right) / 2,
                 rect.y - 10,
+            )
+            canvas.create_text(
+                tx,
+                ty,
                 text="先点",
                 fill=color,
                 font=("Microsoft YaHei UI", 13, "bold"),
@@ -622,7 +689,8 @@ class HuahuaApp(tk.Tk):
         except Exception as exc:
             self.after(0, lambda: self._auto_follow_error(exc, generation))
             return
-        self.after(0, lambda: self._render_auto_follow_result(scene, capture.source, elapsed, capture.window, generation, perf))
+        capture_size = _capture_image_size(frame)
+        self.after(0, lambda: self._render_auto_follow_result(scene, capture.source, elapsed, capture.window, capture_size, generation, perf))
 
     def _auto_follow_error(self, exc: Exception, generation: int) -> None:
         if generation != self.auto_follow_generation or not self.auto_follow_var.get():
@@ -659,7 +727,8 @@ class HuahuaApp(tk.Tk):
             self.after(0, lambda: self._show_error(exc))
             return
 
-        self.after(0, lambda: self._render_result(scene, debug_path, capture.source, elapsed, capture.window))
+        capture_size = _capture_image_size(frame)
+        self.after(0, lambda: self._render_result(scene, debug_path, capture.source, elapsed, capture.window, capture_size))
 
     def _quick_capture_worker(self) -> None:
         try:
@@ -693,7 +762,8 @@ class HuahuaApp(tk.Tk):
             self.after(0, lambda: self._show_error(exc))
             return
 
-        self.after(0, lambda: self._render_quick_result(scene, capture.source, elapsed, capture.window, perf))
+        capture_size = _capture_image_size(frame)
+        self.after(0, lambda: self._render_quick_result(scene, capture.source, elapsed, capture.window, capture_size, perf))
 
     def _needs_stage2_brush_refresh(self) -> bool:
         return (
@@ -716,9 +786,10 @@ class HuahuaApp(tk.Tk):
         capture_source: str,
         elapsed: float,
         capture_window: WindowInfo | None,
+        capture_size: tuple[int, int] | None,
     ) -> None:
         self._restore_app_window()
-        self.last_capture_window = capture_window
+        self._set_last_capture_context(capture_window, capture_size)
         self.current_scene = scene
         if scene is None:
             self.current_state = None
@@ -793,10 +864,11 @@ class HuahuaApp(tk.Tk):
         capture_source: str,
         elapsed: float,
         capture_window: WindowInfo | None,
+        capture_size: tuple[int, int] | None,
         capture_perf: dict | None = None,
     ) -> None:
         self._restore_app_window()
-        self.last_capture_window = capture_window
+        self._set_last_capture_context(capture_window, capture_size)
         self._render_fast_scene_result(scene, capture_source, elapsed, auto=False, capture_perf=capture_perf)
 
     def _render_auto_follow_result(
@@ -805,6 +877,7 @@ class HuahuaApp(tk.Tk):
         capture_source: str,
         elapsed: float,
         capture_window: WindowInfo | None,
+        capture_size: tuple[int, int] | None,
         generation: int,
         capture_perf: dict | None = None,
     ) -> None:
@@ -812,7 +885,7 @@ class HuahuaApp(tk.Tk):
             self.auto_follow_busy = False
             return
         try:
-            self.last_capture_window = capture_window
+            self._set_last_capture_context(capture_window, capture_size)
             self._render_fast_scene_result(scene, capture_source, elapsed, auto=True, capture_perf=capture_perf)
         finally:
             self.auto_follow_busy = False
@@ -1631,14 +1704,19 @@ class HuahuaApp(tk.Tk):
                 source="real_capture",
             )
             for name in brush.stage2_options:
-                if "进度要求减少1" in name or "所需数量-2" in name:
+                if (
+                    "进度要求减少1" in name
+                    or "进度要求减少2" in name
+                    or "所需数量-2" in name
+                    or ("调色目标" in name and "减少" in name)
+                ):
                     record_observation(
                         "rule_conflict",
                         {
                             "kind": "match_required_delta",
                             "affix_name": name,
                             "affix_code": affix_code(name),
-                            "note": "转锋减进度存在 -1/-2 版本，需继续用实战截图确认",
+                            "note": "已记录转锋减进度 -1/-2 实战文案，按识别词条 delta 保存",
                         },
                         source="real_capture",
                     )
@@ -2833,6 +2911,7 @@ class HuahuaApp(tk.Tk):
             f"w={scene.board.rect.w} h={scene.board.rect.h}\n"
             f"置信={scene.board.score:.2f}\n\n",
         )
+        self._write_coordinate_debug(scene)
         for region in scene.regions:
             name = region_names[region.kind]
             text = (
@@ -2906,6 +2985,59 @@ class HuahuaApp(tk.Tk):
         self._write_special_actions()
         self.region_text.configure(state=tk.DISABLED)
 
+    def _write_coordinate_debug(self, scene: SceneObservation) -> None:
+        window = self.last_capture_window
+        capture_size = self.last_capture_size
+        board_rect = scene.board.rect
+        board_screen_rect = self._screen_rect_from_capture_rect(board_rect)
+        board_center = self._screen_point_for_capture_rect(board_rect)
+
+        if window is None:
+            window_text = "无窗口信息"
+        else:
+            window_text = f"({window.left},{window.top}) {window.width}x{window.height}"
+        if capture_size is None:
+            capture_text = "未知"
+            scale_text = "未知"
+        else:
+            capture_w, capture_h = capture_size
+            capture_text = f"{capture_w}x{capture_h}"
+            if window is not None and capture_w > 0 and capture_h > 0:
+                scale_text = f"x={window.width / capture_w:.4f} y={window.height / capture_h:.4f}"
+            else:
+                scale_text = "无窗口，使用截图坐标"
+
+        self.region_text.insert(
+            tk.END,
+            "坐标调试\n"
+            f"窗口={window_text}\n"
+            f"截图={capture_text}\n"
+            f"缩放={scale_text}\n"
+            f"棋盘截图=x{board_rect.x} y{board_rect.y} w{board_rect.w} h{board_rect.h}\n",
+        )
+        if board_screen_rect is not None:
+            x1, y1, x2, y2 = board_screen_rect
+            self.region_text.insert(tk.END, f"棋盘屏幕=({x1},{y1})-({x2},{y2})\n")
+        if board_center is not None:
+            self.region_text.insert(tk.END, f"棋盘中心=({board_center[0]},{board_center[1]})\n")
+        for index, rec in enumerate(self.recommendations[:2], start=1):
+            point = self._screen_point_for_board_cell(rec.row, rec.col)
+            if point is None:
+                continue
+            self.region_text.insert(
+                tk.END,
+                f"推荐{index}=r{rec.row + 1}c{rec.col + 1} -> 屏幕({point[0]},{point[1]})\n",
+            )
+        if scene.backpack is not None and scene.backpack.paints:
+            slot_point = self._screen_point_for_backpack_slot(0)
+            if slot_point is not None:
+                self.region_text.insert(tk.END, f"背包#1=屏幕({slot_point[0]},{slot_point[1]})\n")
+        if scene.brush_options is not None:
+            brush_point = self._screen_point_for_capture_rect(scene.brush_options.panel_rect)
+            if brush_point is not None:
+                self.region_text.insert(tk.END, f"词条面板中心=屏幕({brush_point[0]},{brush_point[1]})\n")
+        self.region_text.insert(tk.END, "\n")
+
     def _write_simulation(self) -> None:
         self.region_text.configure(state=tk.NORMAL)
         self.region_text.delete("1.0", tk.END)
@@ -2967,15 +3099,10 @@ class HuahuaApp(tk.Tk):
 
     def _screen_point_for_board_cell(self, row: int, col: int) -> tuple[int, int] | None:
         scene = self.current_scene
-        window = self.last_capture_window
         if scene is None:
             return None
         tile = scene.board.tile(row, col)
-        x = tile.rect.x + tile.rect.w // 2
-        y = tile.rect.y + tile.rect.h // 2
-        if window is not None:
-            return window.left + x, window.top + y
-        return x, y
+        return self._screen_point_for_capture_rect(tile.rect)
 
     def _visible_backpack_index_for_paint(self, paint: Paint | None) -> int | None:
         scene = self.current_scene
@@ -2994,15 +3121,10 @@ class HuahuaApp(tk.Tk):
 
     def _screen_point_for_backpack_slot(self, index: int) -> tuple[int, int] | None:
         scene = self.current_scene
-        window = self.last_capture_window
         if scene is None or scene.backpack is None or not 0 <= index < len(scene.backpack.paints):
             return None
         rect = scene.backpack.paints[index].slot_rect
-        x = rect.x + rect.w // 2
-        y = rect.y + rect.h // 2
-        if window is not None:
-            return window.left + x, window.top + y
-        return x, y
+        return self._screen_point_for_capture_rect(rect)
 
     def _write_backpack(self) -> None:
         self.region_text.insert(tk.END, "背包（已按当前目标优先排序；滚动背包后再次完整识别可累计）\n")
@@ -4000,6 +4122,7 @@ def _capture_quality_gate(scene: SceneObservation, backpack: tuple[Paint, ...]) 
     min_backpack = float(config_value("quality.min_backpack", 0.35))
     min_brush = float(config_value("quality.min_brush", 0.35))
     min_overall = float(config_value("quality.min_overall", 0.58))
+    max_unknown_tiles = int(config_value("quality.max_unknown_tiles", 1))
     board_score = float(scene.board.score)
     current_score = _current_paint_quality(scene.current_paint)
     backpack_score = float(scene.backpack.confidence) if scene.backpack is not None else (0.72 if backpack else 0.30)
@@ -4023,7 +4146,7 @@ def _capture_quality_gate(scene: SceneObservation, backpack: tuple[Paint, ...]) 
         reasons.append(f"backpack={backpack_score:.2f}")
     if brush_score < min_brush:
         reasons.append(f"brush={brush_score:.2f}")
-    if unknown_tiles:
+    if unknown_tiles > max_unknown_tiles:
         reasons.append(f"unknown_tiles={unknown_tiles}")
     if score < min_overall:
         reasons.append(f"overall={score:.2f}")
@@ -4045,15 +4168,19 @@ def _quick_capture_quality(scene: SceneObservation, elapsed: float, capture_perf
     board_score = round(float(scene.board.score), 3)
     unknown_tiles = sum(1 for tile in scene.board.tiles if tile.state == TileState.UNKNOWN)
     min_board = float(config_value("quality.quick_min_board", 0.66))
+    max_unknown_tiles = int(config_value("quality.quick_max_unknown_tiles", 1))
     reasons: list[str] = []
     if board_score < min_board:
         reasons.append(f"board={board_score:.2f}")
-    if unknown_tiles:
+    if unknown_tiles > max_unknown_tiles:
         reasons.append(f"unknown_tiles={unknown_tiles}")
+    reason = "quick_board_reuse"
+    if not reasons and unknown_tiles:
+        reason = f"quick_board_reuse_with_{unknown_tiles}_unknown"
     return {
         "ok": not reasons,
         "score": board_score,
-        "reason": "quick_board_reuse" if not reasons else ", ".join(reasons),
+        "reason": reason if not reasons else ", ".join(reasons),
         "mode": "quick_capture",
         "ocr": False,
         "elapsed": round(elapsed, 3),
@@ -4410,6 +4537,23 @@ def _format_finish_quality(quality: dict) -> str:
     return f"{ok_text}({score_text}, {reason})"
 
 
+def _capture_image_size(image) -> tuple[int, int] | None:
+    shape = getattr(image, "shape", None)
+    if shape is None or len(shape) < 2:
+        return None
+    height, width = int(shape[0]), int(shape[1])
+    if width <= 0 or height <= 0:
+        return None
+    return width, height
+
+
+def _valid_capture_size(size: tuple[int, int] | None) -> bool:
+    if size is None:
+        return False
+    width, height = size
+    return width > 0 and height > 0
+
+
 def _fast_capture_perf(
     capture_elapsed: float,
     analysis_elapsed: float,
@@ -4535,6 +4679,12 @@ def _empirical_upgrade_is_allowed(level: int, upgrade_amount: int) -> bool:
 def _tile_display_label(state: TileState, paint: Paint | None) -> str:
     if paint is None:
         return STATE_LABELS[state]
+    if paint.is_treasure:
+        return f"T{paint.level}"
+    if paint.category == PaintCategory.MONSTER or paint.category.value == "monster":
+        return f"M{paint.level}"
+    if paint.category == PaintCategory.GAMEPLAY or paint.category.value == "gameplay":
+        return f"G{paint.level}"
     if paint.is_treasure:
         return "箱"
     if paint.category.value == "monster":

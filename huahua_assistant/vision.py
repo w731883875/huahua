@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import cv2
@@ -64,13 +65,12 @@ def analyze_scene(image: np.ndarray, previous_board_rect: Rect | None = None) ->
         # A wrong-but-grid-like candidate can score well if it lands on the
         # backpack/debug grid. Only reuse the tracked board when it is still a
         # strong match; otherwise do a full search and recover.
-        if scene is not None and scene.board.score >= 0.62:
+        if scene is not None and scene.board.score >= 0.76:
             return scene
 
-    layout = _estimated_board_layout_candidate(image)
-    if layout is not None:
-        refined_layout = _refine_board_rect(image, layout)
-        layout_score = _score_board_rect(image, refined_layout)
+    layout_best = _best_estimated_board_layout(image)
+    if layout_best is not None:
+        refined_layout, layout_score = layout_best
         if layout_score >= 0.72:
             return _analyze_scene_from_board_rect(image, refined_layout, fast=False)
 
@@ -91,11 +91,10 @@ def analyze_scene(image: np.ndarray, previous_board_rect: Rect | None = None) ->
 def _choose_board_rect(image: np.ndarray, best_rect: Rect, best_score: float) -> Rect:
     refined_best = _refine_board_rect(image, best_rect)
     refined_best_score = _score_board_rect(image, refined_best)
-    layout = _estimated_board_layout_candidate(image)
-    if layout is None:
+    layout_best = _best_estimated_board_layout(image)
+    if layout_best is None:
         return refined_best
-    refined_layout = _refine_board_rect(image, layout)
-    layout_score = _score_board_rect(image, refined_layout)
+    refined_layout, layout_score = layout_best
     if layout_score >= max(best_score, refined_best_score) * 0.94:
         return refined_layout
     return refined_best
@@ -109,7 +108,10 @@ def analyze_scene_quick(
     rect = previous_scene.board.rect if previous_scene is not None else previous_board_rect
     if rect is None:
         return analyze_scene(image)
-    return _analyze_scene_from_board_rect(image, rect, fast=True, quick=True, previous_scene=previous_scene)
+    scene = _analyze_scene_from_board_rect(image, rect, fast=True, quick=True, previous_scene=previous_scene)
+    if scene is not None and scene.board.score >= 0.72:
+        return scene
+    return analyze_scene(image)
 
 
 def _analyze_scene_from_board_rect(
@@ -132,6 +134,7 @@ def _analyze_scene_from_board_rect(
     if quick:
         current_paint = _analyze_current_paint_fast(image, regions, previous_scene.current_paint if previous_scene is not None else None)
         current_paint = _correct_current_paint_from_board_anchor(image, current_paint, tiles)
+        board = _sync_single_anchor_tile_from_current_paint(board, current_paint)
         backpack = _analyze_backpack_fast(image, regions, previous_scene.backpack if previous_scene is not None else None)
         return SceneObservation(
             board=board,
@@ -142,6 +145,7 @@ def _analyze_scene_from_board_rect(
         )
     current_paint = _analyze_current_paint(image, regions)
     current_paint = _correct_current_paint_from_board_anchor(image, current_paint, tiles)
+    board = _sync_single_anchor_tile_from_current_paint(board, current_paint)
     brush_options = _analyze_brush_options(image, regions)
     backpack = _analyze_backpack(image, regions)
     return SceneObservation(
@@ -186,6 +190,37 @@ def _correct_current_paint_from_board_anchor(
         keyword_scores=current_paint.keyword_scores,
         raw_text_hint=current_paint.raw_text_hint,
     )
+
+
+def _sync_single_anchor_tile_from_current_paint(
+    board: BoardObservation,
+    current_paint: CurrentPaintObservation | None,
+) -> BoardObservation:
+    if current_paint is None:
+        return board
+    if current_paint.category == PaintCategory.UNKNOWN or current_paint.level is None:
+        return board
+    if current_paint.category_confidence < 0.55 or current_paint.level_confidence < 0.55:
+        return board
+
+    paint_indices = [index for index, tile in enumerate(board.tiles) if tile.state == TileState.PAINT]
+    if len(paint_indices) != 1:
+        return board
+
+    index = paint_indices[0]
+    tile = board.tiles[index]
+    synced = replace(
+        tile,
+        paint_category=current_paint.category,
+        paint_category_confidence=max(tile.paint_category_confidence, current_paint.category_confidence),
+        paint_level=current_paint.level,
+        paint_level_confidence=max(tile.paint_level_confidence, current_paint.level_confidence),
+        paint_subtype=current_paint.subtype,
+        paint_is_treasure=current_paint.is_treasure,
+    )
+    tiles = list(board.tiles)
+    tiles[index] = synced
+    return BoardObservation(rect=board.rect, score=board.score, tiles=tuple(tiles))
 
 
 def make_debug_image(image: np.ndarray, scene: SceneObservation | BoardObservation | None) -> np.ndarray:
@@ -1814,11 +1849,15 @@ def _affix_tokens(name: str) -> tuple[str, ...]:
     if "当前颜料等级随机改变" in name:
         tokens.extend(["当前颜料", "等级随机"])
     if "完成条件所需数量-2" in name:
-        tokens.extend(["完成条件", "所需数量", "-2"])
+        tokens.extend(["完成条件", "所需数量", "-2", "调色目标", "进度要求", "减少2"])
+    if "调色目标的进度要求减少1" in name:
+        tokens.extend(["调色目标", "进度要求", "减少1"])
     if "重新获得" in name:
         tokens.extend(["重新获得", "初始颜料"])
     if "同等级的随机怪物颜料" in name:
         tokens.extend(["转变为", "同等级", "随机怪物颜料"])
+    if "可放置于失色地块中" in name:
+        tokens.extend(["可放置于", "可放置", "失色地块", "失色地块中"])
     return tuple(dict.fromkeys(tokens))
 
 
@@ -1845,12 +1884,15 @@ def _brush_affix_token_keywords() -> tuple[str, ...]:
         "全图",
         "全图随机",
         "另一类型",
+        "转变自身",
+        "调色目标",
         "完成条件",
         "所需数量",
         "-2",
         "-1",
         "进度要求",
         "减少1",
+        "减少2",
         "当前颜料",
         "等级随机",
         "内容不变",
@@ -1893,7 +1935,9 @@ def _brush_affix_token_keywords() -> tuple[str, ...]:
         "1块",
         "1或2块",
         "可放置",
+        "可放置于",
         "已放置颜料",
+        "失色地块中",
         "失去自身内容",
         "变为空白地块",
         "变成",
@@ -2320,29 +2364,57 @@ def _candidate_board_rects(image: np.ndarray) -> list[Rect]:
             continue
         candidates.append(expanded)
 
-    layout = _estimated_board_layout_candidate(image)
-    if layout is not None:
-        candidates.append(layout)
+    candidates.extend(_estimated_board_layout_candidates(image))
 
     candidates.extend(_grid_scan_candidates(image))
     return _dedupe_rects(_preselect_board_candidates(image, candidates), image=image)
 
 
 def _estimated_board_layout_candidate(image: np.ndarray) -> Rect | None:
+    candidates = _estimated_board_layout_candidates(image)
+    return candidates[0] if candidates else None
+
+
+def _estimated_board_layout_candidates(image: np.ndarray) -> list[Rect]:
     height, width = image.shape[:2]
-    side = int(round(min(width, height) * 0.475))
-    x = int(round(width * 0.245))
-    y = int(round(height * 0.300))
-    rect = Rect(x, y, side, side)
-    if not _is_rect_inside_image(image.shape, rect):
+    short = min(width, height)
+    presets = (
+        # Common centered-window layout.
+        (0.600, 0.303, 0.373),
+        (0.585, 0.295, 0.360),
+        # Older narrow estimate kept as a fallback for previously working captures.
+        (0.475, 0.245, 0.300),
+        # More left/top layouts seen in direct game-window screenshots.
+        (0.700, 0.170, 0.185),
+        (0.750, 0.135, 0.145),
+        (0.620, 0.215, 0.245),
+    )
+    candidates: list[Rect] = []
+    for side_ratio, x_ratio, y_ratio in presets:
+        side = int(round(short * side_ratio))
+        rect = Rect(int(round(width * x_ratio)), int(round(height * y_ratio)), side, side)
+        if _is_rect_inside_image(image.shape, rect) and _is_plausible_board_candidate(image.shape, rect):
+            candidates.append(rect)
+    return _dedupe_rects(candidates)
+
+
+def _best_estimated_board_layout(image: np.ndarray) -> tuple[Rect, float] | None:
+    candidates = _estimated_board_layout_candidates(image)
+    if not candidates:
         return None
-    return rect
+    best: tuple[Rect, float] | None = None
+    for rect in candidates:
+        refined = _refine_board_rect(image, rect)
+        score = _score_board_rect(image, refined)
+        if best is None or score > best[1]:
+            best = (refined, score)
+    return best
 
 
 def _preselect_board_candidates(image: np.ndarray, rects: list[Rect], limit: int = 60) -> list[Rect]:
     if len(rects) <= limit:
         return rects
-    layout = _estimated_board_layout_candidate(image)
+    layout_candidates = _estimated_board_layout_candidates(image)
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(gray, 40, 110)
     scored = []
@@ -2353,8 +2425,9 @@ def _preselect_board_candidates(image: np.ndarray, rects: list[Rect], limit: int
         scored.append((grid * (0.55 + position * 0.35 + size * 0.10), rect))
     scored.sort(reverse=True, key=lambda item: item[0])
     selected = [rect for _, rect in scored[:limit]]
-    if layout is not None and all(_iou(layout, rect) < 0.90 for rect in selected):
-        selected.append(layout)
+    for layout in layout_candidates:
+        if all(_iou(layout, rect) < 0.90 for rect in selected):
+            selected.append(layout)
     return selected
 
 
@@ -2495,7 +2568,7 @@ def _is_plausible_board_candidate(shape: tuple[int, ...], rect: Rect) -> bool:
     # The paint/backpack panel starts just to the right of the 6x6 board. A
     # shifted candidate can align with the board's internal lines while crossing
     # into that right panel, which makes the bottom rows become background.
-    if rect.right > width * 0.56 and side_ratio >= 0.38:
+    if rect.right > width * 0.56 and side_ratio >= 0.38 and center_x_ratio > 0.52:
         return False
     if rect.right > width * 0.84 and side_ratio < 0.54:
         return False
@@ -2513,14 +2586,14 @@ def _board_size_score(shape: tuple[int, ...], rect: Rect) -> float:
     # candidates alive, but make them lose to the full board unless their other
     # evidence is overwhelming.
     if side_ratio < 0.44:
-        return float(np.interp(side_ratio, [0.32, 0.44], [0.04, 0.52]))
+        return float(np.interp(side_ratio, [0.32, 0.44], [0.04, 0.65]))
     if side_ratio < 0.50:
-        return float(np.interp(side_ratio, [0.44, 0.50], [0.52, 1.0]))
-    if side_ratio < 0.56:
-        return float(np.interp(side_ratio, [0.50, 0.56], [1.0, 0.72]))
-    if side_ratio < 0.68:
-        return float(np.interp(side_ratio, [0.56, 0.68], [0.72, 0.35]))
-    return float(np.interp(side_ratio, [0.68, 0.92], [0.35, 0.08]))
+        return float(np.interp(side_ratio, [0.44, 0.50], [0.65, 1.0]))
+    if side_ratio < 0.64:
+        return 1.0
+    if side_ratio < 0.74:
+        return float(np.interp(side_ratio, [0.64, 0.74], [0.95, 0.50]))
+    return float(np.interp(side_ratio, [0.74, 0.92], [0.50, 0.08]))
 
 
 def _board_position_score(shape: tuple[int, ...], rect: Rect) -> float:
@@ -2548,7 +2621,7 @@ def _board_position_score(shape: tuple[int, ...], rect: Rect) -> float:
         score *= 0.35
     if right_ratio > 0.84 and side_ratio < 0.54:
         score *= 0.25
-    if right_ratio > 0.56 and side_ratio >= 0.38:
+    if right_ratio > 0.56 and side_ratio >= 0.38 and center_x_ratio > 0.52:
         score *= 0.08
     return float(np.clip(score, 0.0, 1.0))
 
@@ -2724,7 +2797,42 @@ def _classify_tiles(image: np.ndarray, board_rect: Rect) -> list[TileObservation
             x2 = round(board_rect.x + (col + 1) * cell_w)
             y2 = round(board_rect.y + (row + 1) * cell_h)
             rect = Rect(x1, y1, max(1, x2 - x1), max(1, y2 - y1))
-            state, confidence, features = classify_tile(image[y1:y2, x1:x2])
+            crop = image[y1:y2, x1:x2]
+            state, confidence, features = classify_tile(crop)
+            (
+                paint_category,
+                paint_category_confidence,
+                paint_level,
+                paint_level_confidence,
+                paint_subtype,
+                paint_is_treasure,
+            ) = _analyze_board_paint_tile(crop)
+            paint_detail_score = _board_paint_detail_score(
+                paint_category,
+                paint_category_confidence,
+                paint_level,
+                paint_level_confidence,
+            )
+            features["paint_detail_score"] = paint_detail_score
+            features["paint_category_confidence"] = paint_category_confidence
+            features["paint_level_confidence"] = paint_level_confidence
+            if _paint_detail_can_override_tile_state(
+                state,
+                features,
+                paint_detail_score,
+                paint_category_confidence,
+                paint_level_confidence,
+                paint_is_treasure,
+            ):
+                state = TileState.PAINT
+                confidence = max(confidence, min(0.90, paint_detail_score))
+            if state != TileState.PAINT:
+                paint_category = PaintCategory.UNKNOWN
+                paint_category_confidence = 0.0
+                paint_level = None
+                paint_level_confidence = 0.0
+                paint_subtype = None
+                paint_is_treasure = False
             tiles.append(
                 TileObservation(
                     row=row,
@@ -2733,9 +2841,130 @@ def _classify_tiles(image: np.ndarray, board_rect: Rect) -> list[TileObservation
                     state=state,
                     confidence=confidence,
                     features=features,
+                    paint_category=paint_category,
+                    paint_category_confidence=paint_category_confidence,
+                    paint_level=paint_level,
+                    paint_level_confidence=paint_level_confidence,
+                    paint_subtype=paint_subtype,
+                    paint_is_treasure=paint_is_treasure,
                 )
             )
     return tiles
+
+
+def _analyze_board_paint_tile(
+    tile_bgr: np.ndarray,
+) -> tuple[PaintCategory, float, int | None, float, str | None, bool]:
+    if tile_bgr.size == 0:
+        return PaintCategory.UNKNOWN, 0.0, None, 0.0, None, False
+
+    category, category_confidence = _classify_tile_paint_frame(tile_bgr)
+    level, level_confidence = _detect_board_tile_level(tile_bgr)
+    is_treasure, treasure_confidence = _detect_treasure_icon(tile_bgr)
+    subtype = "宝箱" if is_treasure else None
+    if is_treasure:
+        category = PaintCategory.GAMEPLAY
+        category_confidence = max(category_confidence, treasure_confidence)
+    return category, category_confidence, level, level_confidence, subtype, is_treasure
+
+
+def _detect_board_tile_level(tile_bgr: np.ndarray) -> tuple[int | None, float]:
+    if tile_bgr.size == 0:
+        return None, 0.0
+    h, w = tile_bgr.shape[:2]
+    label_crops = (
+        tile_bgr[int(h * 0.50) :, :],
+        tile_bgr[int(h * 0.54) :, : int(w * 0.55)],
+        tile_bgr[int(h * 0.54) :, int(w * 0.45) :],
+    )
+    for label in label_crops:
+        digit = _detect_level_digit_from_label(label)
+        if digit is not None:
+            return digit, 0.76
+    level, confidence = _detect_backpack_level_fast(tile_bgr)
+    if level is not None:
+        return level, confidence
+    return None, 0.0
+
+
+def _board_paint_detail_score(
+    category: PaintCategory,
+    category_confidence: float,
+    level: int | None,
+    level_confidence: float,
+) -> float:
+    if category == PaintCategory.UNKNOWN:
+        return 0.0
+    if level is None:
+        return category_confidence * 0.72
+    return float(np.clip(category_confidence * 0.58 + level_confidence * 0.42, 0.0, 1.0))
+
+
+def _features_look_like_blank_tile(features: dict[str, float]) -> bool:
+    return (
+        float(features.get("bright_ratio", 0.0)) > 0.45
+        and float(features.get("low_sat_ratio", 0.0)) > 0.44
+        and float(features.get("saturated_bright_ratio", 0.0)) < 0.12
+    ) or (
+        float(features.get("white_ratio", 0.0)) > 0.52
+        and float(features.get("mean_s", 0.0)) < 0.24
+        and float(features.get("non_blue_saturated_bright_ratio", 0.0)) < 0.08
+    )
+
+
+def _features_look_like_void_tile(features: dict[str, float]) -> bool:
+    return (
+        float(features.get("very_dark_ratio", 0.0)) > 0.34
+        and float(features.get("mean_v", 0.0)) < 0.33
+    ) or (
+        float(features.get("dark_ratio", 0.0)) > 0.62
+        and float(features.get("mean_v", 0.0)) < 0.38
+    ) or (
+        float(features.get("center_dark", 0.0)) > 0.88
+        and float(features.get("mean_v", 0.0)) < 0.30
+    )
+
+
+def _paint_detail_can_override_tile_state(
+    state: TileState,
+    features: dict[str, float],
+    paint_detail_score: float,
+    category_confidence: float,
+    level_confidence: float,
+    is_treasure: bool,
+) -> bool:
+    if state == TileState.PAINT:
+        return False
+    if paint_detail_score < 0.56:
+        return False
+
+    blank_like = _features_look_like_blank_tile(features)
+    void_like = _features_look_like_void_tile(features)
+    ice_like = bool(features.get("blocked_ice_like", 0.0) >= 0.5)
+    if state in {TileState.BLANK, TileState.VOID, TileState.BLOCKED, TileState.FADED} and (blank_like or void_like or ice_like):
+        return False
+    if state == TileState.UNKNOWN:
+        return category_confidence >= 0.60 and paint_detail_score >= 0.60
+    if is_treasure and category_confidence >= 0.70:
+        return True
+
+    frame_score = float(features.get("paint_frame_score", 0.0))
+    saturated = float(features.get("saturated_bright_ratio", 0.0))
+    non_blue = float(features.get("non_blue_saturated_bright_ratio", 0.0))
+    purple = float(features.get("purple_ratio", 0.0))
+    gold = float(features.get("gold_ratio", 0.0))
+    return (
+        category_confidence >= 0.64
+        and level_confidence >= 0.68
+        and paint_detail_score >= 0.66
+        and (
+            frame_score >= 0.66
+            or saturated >= 0.28
+            or non_blue >= 0.10
+            or purple >= 0.06
+            or gold >= 0.04
+        )
+    )
 
 
 def classify_tile(tile_bgr: np.ndarray) -> tuple[TileState, float, dict[str, float]]:
@@ -2825,13 +3054,14 @@ def classify_tile(tile_bgr: np.ndarray) -> tuple[TileState, float, dict[str, flo
     if bright_ratio > 0.45 and low_sat_ratio > 0.44:
         return TileState.BLANK, _conf(bright_ratio + low_sat_ratio, 0.90, 1.65), features
 
-    # Board paints can be blue/green and look close to ice by color alone. The
-    # explicit paint frame/icon must be checked before the broad ice rule.
-    if frame_category != PaintCategory.UNKNOWN and frame_confidence >= 0.58 and not blocked_ice_like:
-        return TileState.PAINT, max(0.60, min(0.92, frame_confidence)), features
-
     if blocked_ice_like:
         return TileState.BLOCKED, _conf(cyan_ratio + center_blue + mean_s, 1.65, 2.55), features
+
+    # Board paints can be blue/green and look close to ice by color alone, but
+    # blank shovel highlights also create weak diamond-like lines. Only trust
+    # frame evidence after strong terrain checks have had the first say.
+    if frame_category != PaintCategory.UNKNOWN and frame_confidence >= 0.62:
+        return TileState.PAINT, max(0.60, min(0.92, frame_confidence)), features
 
     if center_dark > 0.18 and (cyan_ratio > 0.06 or mean_s > 0.26):
         return TileState.PAINT, _conf(center_dark + mean_s, 0.42, 0.95), features

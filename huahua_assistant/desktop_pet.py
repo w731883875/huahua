@@ -873,7 +873,9 @@ def _brush_markers(app, scene: SceneObservation, state: PuzzleState) -> list[Pet
         best_rec = recs[0] if recs else None
         best = best_rec.brush_type if best_rec else options[0]
         index = _index_or_zero(options, best)
-        point = _stage1_point(window.left, window.top, panel, index, len(options))
+        point = _stage1_point(app, panel, index, len(options))
+        if point is None:
+            return []
         return [
             PetMarker(
                 key="brush-stage1",
@@ -892,7 +894,9 @@ def _brush_markers(app, scene: SceneObservation, state: PuzzleState) -> list[Pet
         best_rec = recs[0] if recs else None
         best_affix = best_rec.affix if best_rec else affixes[0]
         index = _index_or_zero(affixes, best_affix)
-        point = _stage2_point(window.left, window.top, panel, index, len(affixes))
+        point = _stage2_point(app, panel, index, len(affixes))
+        if point is None:
+            return []
         return [
             PetMarker(
                 key="brush-stage2",
@@ -960,20 +964,20 @@ def _fit_marker_caption(text: str) -> str:
     return _short_caption(text, max_chars=5)
 
 
-def _stage1_point(window_left: int, window_top: int, panel: Rect, index: int, count: int) -> tuple[int, int]:
+def _stage1_point(app, panel: Rect, index: int, count: int) -> tuple[int, int] | None:
     if count <= 1:
         x_ratio = 0.50
     else:
         x_ratio = (index + 0.5) / count
-    return int(window_left + panel.x + panel.w * x_ratio), int(window_top + panel.y + panel.h * 0.34)
+    return app._screen_point_for_capture_rect(panel, x_ratio, 0.34)
 
 
-def _stage2_point(window_left: int, window_top: int, panel: Rect, index: int, count: int) -> tuple[int, int]:
+def _stage2_point(app, panel: Rect, index: int, count: int) -> tuple[int, int] | None:
     if count <= 1:
         y_ratio = 0.45
     else:
         y_ratio = 0.35 + min(index, count - 1) * 0.25
-    return int(window_left + panel.x + panel.w * 0.58), int(window_top + panel.y + panel.h * y_ratio)
+    return app._screen_point_for_capture_rect(panel, 0.58, y_ratio)
 
 
 def _index_or_zero(items: tuple, target) -> int:

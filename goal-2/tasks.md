@@ -41,12 +41,12 @@
 - Next step: Task 6 should run the second major check/debug cycle to verify the realtime pump plus FastVision snapshot do not break old complete/quick paths, then Task 7 can build event detection on top of snapshot signature changes.
 
 ## Task 6 - Major Check 2
-- Status: pending
+- Status: completed
 - Goal: Check realtime loop, fast-vision data structure, and old-path compatibility; run compile/basic regression.
-- Work performed:
-- Validation evidence:
-- Remaining risk:
-- Next step:
+- Work performed: Performed the second major check/debug cycle over the realtime frame pump and FastVision snapshot work. Verified full capture and manual quick capture still use their existing worker paths, while auto-follow uses `_start_auto_follow_pump` and `_poll_auto_follow_pump`. Verified `last_fast_snapshot` is only held in app memory and not written into learning records or trajectories. Reviewed learning gates to confirm `record_observation`, `record_correction`, and `record_high_score_trajectory` still reject non-`real_capture` sources, and quick low-confidence frames still go to `quick_capture_ignored`.
+- Validation evidence: Ran `python -m compileall huahua_assistant run_app.py` successfully. Ran `git diff --check` successfully. Ran a pure in-memory `FramePump` start/stop test that produced `True 36 0.1`, proving the pump can emit a latest result with a `FastVisionSnapshot` and stop cleanly. `rg` checks confirmed expected auto-follow/quick/full capture call sites, `last_fast_snapshot` locations, and real-capture learning gates. `git diff --stat` showed only runtime/pycache changes before this task-record update.
+- Remaining risk: No live game-window timing test was performed, so the actual 0.5-second target remains unproven on the user's machine. The fast snapshot still wraps existing quick recognition, not a fully independent ROI-only CV path. Desktop-pet state and event detection are still missing.
+- Next step: Task 7 should implement an event detector over consecutive `FastVisionSnapshot` objects for board changes, backpack appearance/disappearance, current paint changes, brush-stage changes, and finish-drawing candidates.
 
 ## Task 7 - Event Detector
 - Status: pending

@@ -33,12 +33,12 @@
 - Next step: Task 5 should aggregate real-data-only stage1 brush and stage2 affix appearance counts into percentages so cumulative词条概率 can be shown and later used as recommendation priors.
 
 ## Task 5 - Affix Appearance Percentages
-- Status: pending
+- Status: completed
 - Goal: Aggregate stage1 brush and stage2 affix appearance counts, code counts, and percentages from real observations.
-- Work performed:
-- Validation evidence:
-- Remaining risk:
-- Next step:
+- Work performed: Added real-observation percentage aggregation in `huahua_assistant/learning.py` without changing the existing raw count fields. `_build_stats()` now returns `stage1_seen_total`, `stage1_code_seen_total`, `stage1_seen_pct`, `stage1_code_seen_pct`, `affix_seen_total`, `affix_code_seen_total`, `affix_seen_pct`, and `affix_code_seen_pct`. Added a structured `affix_appearance_rates` block with sorted distributions for `stage1`, `stage1_codes`, `stage2`, and `stage2_codes`; each item includes key, count, rate, and percent. Added defensive helper functions for empty counters so users with no brush samples get empty stats instead of errors. The aggregation remains based on `source="real_capture"` events only, because `_build_stats()` filters events before counting.
+- Validation evidence: Ran `python -m compileall huahua_assistant run_app.py` successfully. Ran `git diff --check` successfully with only CRLF normalization warnings. Smoke-tested `_build_stats()` with two real `brush_options` events and one simulated event: stage1 total was 4, stage1 percentages were transform 25.0%, stack 50.0%, spread 25.0%, stage2 affix percentages were A 25.0% and B 75.0%, stage2 code distribution sorted `2-1` at 75.0% and `1-1` at 25.0%, and simulated `SIM` / `9-9` entries were ignored. Smoke-tested `load_learning_stats()` against existing runtime logs; new total and distribution keys loaded without errors. Code commit: `cdeb2a9 Add affix appearance percentages`.
+- Remaining risk: Task 5 computes percentages for known recognized strings/codes, but does not yet separately classify unknown/new affixes; that is intentionally deferred to Task 7. UI display of these percentage fields is also deferred to Task 8, so the data is available in stats now but not yet prominently shown to the user.
+- Next step: Task 6 should perform the second major check to verify v2 trajectory metadata and affix percentage stats remain real-data-only, compact, export/merge-safe, and backward-compatible.
 
 ## Task 6 - Major Check 2
 - Status: pending

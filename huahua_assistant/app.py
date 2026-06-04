@@ -1435,12 +1435,12 @@ class HuahuaApp(tk.Tk):
             )
             return False, score
         payload = {
-            "version": 1,
+            "version": 2,
             "kind": "internal_scored_run",
             "session": self.real_session_id,
             "reason": reason,
             "started_at": self.real_session_started_at,
-            "finished_at": time.time(),
+            "finished_at": _trajectory_finished_at(self.real_session_started_at, reliable_steps),
             "internal_score": score,
             "score_model": "huahua-v2-treasure-equivalence",
             "score_breakdown": score_breakdown,
@@ -1449,6 +1449,7 @@ class HuahuaApp(tk.Tk):
             "finish_seen": finish_seen,
             "steps": reliable_steps[-240:],
         }
+        payload = _with_state_action_result_metadata(payload)
         saved = record_high_score_trajectory(payload, source="real_capture")
         self._set_finish_diagnostic(
             saved=saved,
@@ -1736,16 +1737,25 @@ class HuahuaApp(tk.Tk):
         should_save, reason = high_score_gate["passed"], high_score_gate["primary_reason"]
         if not should_save:
             return False
+        score = _internal_run_score(terminal)
+        score_breakdown = _internal_score_breakdown(terminal)
         payload = {
-            "version": 1,
+            "version": 2,
             "kind": "auto_capture_trajectory",
-            "session": self.backpack_session_key,
+            "session": self.real_session_id,
+            "capture_session": self.backpack_session_key,
             "reason": reason,
+            "started_at": self.real_session_started_at,
+            "finished_at": _trajectory_finished_at(self.real_session_started_at, reliable_steps),
+            "internal_score": score,
+            "score_model": "huahua-v2-treasure-equivalence",
+            "score_breakdown": score_breakdown,
             "terminal": terminal,
             "high_score_gate": high_score_gate,
             "finish_seen": finish_seen,
             "steps": reliable_steps[-40:],
         }
+        payload = _with_state_action_result_metadata(payload)
         payload_key = _stable_payload_key(payload)
         if payload_key == self.last_auto_trajectory_key:
             return False
@@ -3752,6 +3762,7 @@ def _compact_real_capture_step(
         "pending": current_rule_is_pending(state),
         "backpack": _paint_collection_summary(backpack),
         "brush": brush_payload,
+        "active_affix": _compact_affix(state.active_affix),
         "resources": {
             "force_used": resources.force_used,
             "force_remaining": resources.force_remaining,
@@ -3800,6 +3811,32 @@ def _compact_rule(rule: CurrentPaintRule | None) -> dict | None:
     if rule is None:
         return None
     return compact_rule_with_code(rule)
+
+
+def _compact_affix(affix: AffixRule | None) -> dict | None:
+    if affix is None:
+        return None
+    payload = {
+        "name": affix.name,
+        "code": affix_code(affix),
+        "brush": affix.brush_type.value,
+        "brush_code": brush_code(affix.brush_type),
+        "effect": affix.effect.value,
+        "persistent": bool(affix.persistent_until_match),
+    }
+    if affix.direction is not None:
+        payload["direction"] = affix.direction.value
+    if affix.target_object is not None:
+        payload["target"] = affix.target_object.value
+    if affix.delta:
+        payload["delta"] = affix.delta
+    if affix.amount:
+        payload["amount"] = affix.amount
+    if affix.count is not None:
+        payload["count"] = affix.count
+    if affix.nearest:
+        payload["nearest"] = True
+    return payload
 
 
 def _compact_recommendation(rec: PlacementRecommendation) -> dict:
@@ -4166,6 +4203,237 @@ def _changed_capture_cells(previous: dict, current: dict) -> list[dict]:
             }
         )
     return changed[:12]
+
+
+def _with_state_action_result_metadata(payload: dict) -> dict:
+    enriched = dict(payload)
+    steps = [dict(step) for step in enriched.get("steps") or [] if isinstance(step, dict)]
+    terminal = enriched.get("terminal") if isinstance(enriched.get("terminal"), dict) else {}
+    score = enriched.get("internal_score")
+    if not isinstance(score, (int, float)):
+        score = _internal_run_score(terminal) if terminal else 0.0
+    score_breakdown = enriched.get("score_breakdown")
+    if not isinstance(score_breakdown, dict):
+        score_breakdown = _internal_score_breakdown(terminal) if terminal else {}
+
+    steps = _attach_transition_metadata(steps, terminal=terminal, final_score=float(score or 0.0))
+    enriched["steps"] = steps
+    enriched["transition_schema"] = "huahua-state-action-result-v1"
+    enriched["trajectory_summary"] = _trajectory_learning_summary(
+        steps,
+        terminal=terminal,
+        score=float(score or 0.0),
+        score_breakdown=score_breakdown,
+    )
+    return enriched
+
+
+def _trajectory_finished_at(started_at: float, steps: list[dict]) -> float:
+    if steps:
+        last_t = steps[-1].get("t")
+        if isinstance(last_t, (int, float)):
+            return round(float(started_at) + float(last_t), 3)
+    return round(float(started_at), 3)
+
+
+def _attach_transition_metadata(steps: list[dict], *, terminal: dict, final_score: float) -> list[dict]:
+    enriched: list[dict] = []
+    previous: dict | None = None
+    for index, step in enumerate(steps):
+        item = dict(step)
+        item["transition_index"] = index
+        if previous is not None:
+            action = item.get("inferred_action") if isinstance(item.get("inferred_action"), dict) else {}
+            item["decision_context"] = _decision_context_from_steps(previous, item)
+            item["outcome"] = _transition_outcome(previous, item, terminal=terminal, final_score=final_score, action=action)
+            item["chosen_recommendation"] = _matched_previous_recommendation(previous, action)
+        else:
+            item.setdefault("inferred_action", {"type": "session_start", "code": "S", "confidence": 0.5})
+            item["decision_context"] = _decision_context_from_steps(None, item)
+            item["outcome"] = _session_start_outcome(item, terminal=terminal, final_score=final_score)
+            item["chosen_recommendation"] = None
+        enriched.append(item)
+        previous = item
+    return enriched
+
+
+def _decision_context_from_steps(previous: dict | None, current: dict) -> dict:
+    source = previous or current
+    current_rule = source.get("current") if isinstance(source.get("current"), dict) else None
+    brush = source.get("brush") if isinstance(source.get("brush"), dict) else {}
+    action = current.get("inferred_action") if isinstance(current.get("inferred_action"), dict) else {}
+    return {
+        "source_step_index": source.get("step_index"),
+        "t": source.get("t"),
+        "board": _learning_board_snapshot(source),
+        "current_code": current_rule.get("code") if current_rule else None,
+        "current": current_rule,
+        "anchor": source.get("anchor"),
+        "pending": bool(source.get("pending")),
+        "active_affix": source.get("active_affix"),
+        "brush": {
+            "stage1_codes": brush.get("stage1_codes") or [],
+            "chosen_code": brush.get("chosen_code"),
+            "stage2_codes": brush.get("stage2_codes") or [],
+            "chosen": brush.get("chosen"),
+        },
+        "resources": source.get("resources") or {},
+        "backpack": source.get("backpack") or {},
+        "top": (source.get("top") or [])[:3],
+        "action_type": action.get("type"),
+        "action_code": action.get("code"),
+    }
+
+
+def _transition_outcome(
+    previous: dict,
+    current: dict,
+    *,
+    terminal: dict,
+    final_score: float,
+    action: dict,
+) -> dict:
+    before_terminal = _terminal_summary_from_step(previous)
+    after_terminal = _terminal_summary_from_step(current)
+    before_score = _internal_run_score(before_terminal)
+    after_score = _internal_run_score(after_terminal)
+    summary = action.get("summary") if isinstance(action.get("summary"), dict) else {}
+    return {
+        "before": _learning_terminal_snapshot(before_terminal),
+        "after": _learning_terminal_snapshot(after_terminal),
+        "score_delta": round(after_score - before_score, 3),
+        "score_to_final": round(final_score - after_score, 3),
+        "changed_cells": (action.get("changed_cells") or [])[:12],
+        "summary": summary,
+        "terminal": _learning_terminal_snapshot(terminal),
+    }
+
+
+def _session_start_outcome(step: dict, *, terminal: dict, final_score: float) -> dict:
+    current_terminal = _terminal_summary_from_step(step)
+    current_score = _internal_run_score(current_terminal)
+    return {
+        "before": None,
+        "after": _learning_terminal_snapshot(current_terminal),
+        "score_delta": 0.0,
+        "score_to_final": round(final_score - current_score, 3),
+        "changed_cells": [],
+        "summary": {"action": "session_start"},
+        "terminal": _learning_terminal_snapshot(terminal),
+    }
+
+
+def _matched_previous_recommendation(previous: dict, action: dict) -> dict | None:
+    cells = _placement_cells_from_action(action)
+    if not cells:
+        return None
+    top = [rec for rec in (previous.get("top") or []) if isinstance(rec, dict)]
+    if not top:
+        return {"matched": False, "cells": cells[:3]}
+    for cell in cells:
+        row = cell.get("r")
+        col = cell.get("c")
+        for rank, rec in enumerate(top, start=1):
+            if rec.get("r") == row and rec.get("c") == col:
+                return {
+                    "matched": True,
+                    "rank": rank,
+                    "cell": [row, col],
+                    "score": rec.get("score"),
+                    "complete": rec.get("complete"),
+                    "recommendation": rec,
+                }
+    return {"matched": False, "cells": cells[:3], "top_cells": [[rec.get("r"), rec.get("c")] for rec in top[:3]]}
+
+
+def _placement_cells_from_action(action: dict) -> list[dict]:
+    summary = action.get("summary") if isinstance(action.get("summary"), dict) else {}
+    refs = summary.get("placed_cells") or []
+    cells: list[dict] = []
+    for ref in refs:
+        if isinstance(ref, (list, tuple)) and len(ref) >= 2 and isinstance(ref[0], int) and isinstance(ref[1], int):
+            cells.append({"r": ref[0], "c": ref[1]})
+    if cells:
+        return cells[:3]
+    changed = [cell for cell in action.get("changed_cells") or [] if isinstance(cell, dict)]
+    for cell in changed:
+        if cell.get("to_state") == "P" and (cell.get("from_state") != "P" or cell.get("from_paint") is None):
+            row = cell.get("r")
+            col = cell.get("c")
+            if isinstance(row, int) and isinstance(col, int):
+                cells.append({"r": row, "c": col})
+    return cells[:3]
+
+
+def _learning_board_snapshot(step: dict) -> dict:
+    board = step.get("board") if isinstance(step.get("board"), dict) else {}
+    return {
+        "states": board.get("states"),
+        "blank": int(board.get("blank", 0) or 0),
+        "blocked": int(board.get("blocked", 0) or 0),
+        "void": int(board.get("void", 0) or 0),
+        "faded": int(board.get("faded", 0) or 0),
+        "paint": int(board.get("paint", 0) or 0),
+        "score": board.get("score"),
+    }
+
+
+def _learning_terminal_snapshot(terminal: dict) -> dict:
+    known = terminal.get("known") if isinstance(terminal.get("known"), dict) else {}
+    return {
+        "score": _internal_run_score(terminal) if terminal else 0.0,
+        "known": {
+            "total": int(known.get("total", 0) or 0),
+            "lv7": int(known.get("lv7", 0) or 0),
+            "gameplay7": int(known.get("gameplay7", 0) or 0),
+            "monster7": int(known.get("monster7", 0) or 0),
+            "treasure5": int(known.get("treasure5", 0) or 0),
+            "treasure6": int(known.get("treasure6", 0) or 0),
+            "treasure7": int(known.get("treasure7", 0) or 0),
+            "max_treasure": int(known.get("max_treasure", 0) or 0),
+            "levels": dict(known.get("levels") or {}),
+        },
+    }
+
+
+def _trajectory_learning_summary(steps: list[dict], *, terminal: dict, score: float, score_breakdown: dict) -> dict:
+    action_counts = Counter()
+    recommendation_hits = Counter()
+    brush_codes = Counter()
+    affix_codes = Counter()
+    reliable_steps = 0
+    for step in steps:
+        quality = step.get("quality") if isinstance(step.get("quality"), dict) else {}
+        if quality.get("ok") is True:
+            reliable_steps += 1
+        inferred = step.get("inferred_action") if isinstance(step.get("inferred_action"), dict) else {}
+        action_counts[str(inferred.get("type", "unknown"))] += 1
+        chosen_rec = step.get("chosen_recommendation") if isinstance(step.get("chosen_recommendation"), dict) else {}
+        if chosen_rec.get("matched") is True:
+            recommendation_hits["top_hit"] += 1
+            if chosen_rec.get("rank") is not None:
+                recommendation_hits[f"rank_{chosen_rec.get('rank')}"] += 1
+        elif chosen_rec:
+            recommendation_hits["miss"] += 1
+        brush = step.get("brush") if isinstance(step.get("brush"), dict) else {}
+        if brush.get("chosen_code"):
+            brush_codes[str(brush.get("chosen_code"))] += 1
+        for code in brush.get("stage2_codes") or []:
+            affix_codes[str(code)] += 1
+        active_affix = step.get("active_affix") if isinstance(step.get("active_affix"), dict) else {}
+        if active_affix.get("code"):
+            affix_codes[str(active_affix.get("code"))] += 1
+    return {
+        "step_count": len(steps),
+        "trusted_step_count": reliable_steps,
+        "action_counts": dict(action_counts),
+        "recommendation_hits": dict(recommendation_hits),
+        "brush_codes": dict(brush_codes),
+        "affix_codes": dict(affix_codes),
+        "terminal": _learning_terminal_snapshot(terminal),
+        "score": round(float(score or 0.0), 3),
+        "score_breakdown": score_breakdown,
+    }
 
 
 def _trajectory_terminal_summary(state: PuzzleState, backpack: tuple[Paint, ...]) -> dict:

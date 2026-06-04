@@ -49,6 +49,8 @@ def record_correction(payload: dict[str, Any], *, source: str) -> None:
 def record_high_score_trajectory(payload: dict[str, Any], *, source: str) -> bool:
     if source != "real_capture":
         return False
+    if not _trajectory_payload_is_trusted(payload):
+        return False
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     payload_hash = _payload_hash(payload)
     existing_hashes = {_payload_hash(event.get("payload") or {}) for event in _load_trajectories()}
@@ -64,6 +66,19 @@ def record_high_score_trajectory(payload: dict[str, Any], *, source: str) -> boo
     with TRAJECTORY_LOG.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
     _write_stats(_load_events(), _load_corrections(), _load_trajectories())
+    return True
+
+
+def _trajectory_payload_is_trusted(payload: dict[str, Any]) -> bool:
+    steps = payload.get("steps") or []
+    if not isinstance(steps, list) or not steps:
+        return False
+    for step in steps:
+        if not isinstance(step, dict):
+            return False
+        quality = step.get("quality") or {}
+        if quality.get("ok") is not True:
+            return False
     return True
 
 
@@ -145,6 +160,8 @@ def _dedupe_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for event in events:
         if event.get("source") != "real_capture":
             continue
+        if event.get("event") == "high_score_trajectory" and not _trajectory_payload_is_trusted(event.get("payload") or {}):
+            continue
         key = event.get("payload_hash") or _payload_hash(event.get("payload") or {})
         if key in seen:
             continue
@@ -166,6 +183,8 @@ def _append_unique_events(path: Path, incoming: list[dict[str, Any]], *, event_n
             if event.get("source") != "real_capture":
                 continue
             payload = event.get("payload") or {}
+            if event_name == "high_score_trajectory" and not _trajectory_payload_is_trusted(payload):
+                continue
             payload_hash = event.get("payload_hash") or _payload_hash(payload)
             if payload_hash in existing_hashes:
                 continue
@@ -200,7 +219,11 @@ def _build_stats(
 ) -> dict[str, Any]:
     events = [event for event in events if event.get("source") == "real_capture"]
     corrections = [event for event in (corrections or []) if event.get("source") == "real_capture"]
-    trajectories = [event for event in (trajectories or []) if event.get("source") == "real_capture"]
+    trajectories = [
+        event
+        for event in (trajectories or [])
+        if event.get("source") == "real_capture" and _trajectory_payload_is_trusted(event.get("payload") or {})
+    ]
     event_counts = Counter(event.get("event", "unknown") for event in events)
     affix_seen = Counter()
     affix_code_seen = Counter()
@@ -241,6 +264,7 @@ def _build_stats(
     finished_runs = 0
     finished_scores: list[float] = []
     ignored_quick_steps = 0
+    ignored_trajectory_steps = 0
     skipped_finished_runs = 0
     high_value_seen = 0
     high_value_best_score = 0.0
@@ -300,6 +324,8 @@ def _build_stats(
                 finished_scores.append(float(final_score))
         elif event_type == "quick_capture_ignored":
             ignored_quick_steps += 1
+        elif event_type in {"capture_step_ignored", "trajectory_step_ignored"}:
+            ignored_trajectory_steps += 1
         elif event_type == "run_session_finish_skipped":
             skipped_finished_runs += 1
         elif event_type == "high_value_seen":
@@ -449,6 +475,7 @@ def _build_stats(
         "treasure_ratio": treasure_count / total_backpack if total_backpack else 0.0,
         "quick_capture_steps": quick_steps,
         "quick_capture_ignored": ignored_quick_steps,
+        "trajectory_step_ignored": ignored_trajectory_steps,
         "quick_capture_actions": dict(quick_actions),
         "quick_capture_avg_elapsed": (sum(quick_elapsed) / len(quick_elapsed)) if quick_elapsed else None,
         "finished_runs": finished_runs,

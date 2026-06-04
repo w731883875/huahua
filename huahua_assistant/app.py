@@ -1262,15 +1262,19 @@ class HuahuaApp(tk.Tk):
             return
         if self.current_state is None:
             reason = "当前没有可评分的局面，请先识别一次终局画面。"
-            reliable_steps = [step for step in self.real_trajectory_steps if (step.get("quality") or {}).get("ok") is True]
+            reliable_steps = _trusted_trajectory_steps(self.real_trajectory_steps)
             self._set_finish_diagnostic(saved=False, score=0.0, terminal={}, reliable_steps=reliable_steps, finish_seen=False, reason_text=reason)
             self.status_var.set(reason)
             self._set_notice(_format_finish_diagnostic(self.last_finish_diagnostic), "warning")
             return
         if self.real_session_finished:
-            reliable_steps = [step for step in self.real_trajectory_steps if (step.get("quality") or {}).get("ok") is True]
+            reliable_steps = _trusted_trajectory_steps(self.real_trajectory_steps)
             finish_seen = self.current_scene is not None and _scene_has_finish_evidence(self.current_scene, self.current_state)
-            terminal = _best_available_terminal_summary(self.current_state, self.real_trajectory_steps)
+            terminal = _best_trusted_terminal_summary(
+                self.current_state,
+                self.real_trajectory_steps,
+                current_quality=self.last_capture_quality,
+            )
             score = _internal_run_score(terminal)
             reason = "本局已经自动/手动结束处理过，不重复保存；要记录下一局请点“新开一局”。"
             self.last_finish_skip_reason = reason
@@ -1330,13 +1334,19 @@ class HuahuaApp(tk.Tk):
                 reason_text=self.last_finish_skip_reason,
             )
             return False, 0.0
-        finish_seen = self.current_scene is not None and _scene_has_finish_evidence(self.current_scene, self.current_state)
-        terminal = _best_available_terminal_summary(self.current_state, self.real_trajectory_steps)
+        raw_finish_seen = self.current_scene is not None and _scene_has_finish_evidence(self.current_scene, self.current_state)
+        current_trusted = _quality_is_trusted_for_trajectory(self.last_capture_quality)
+        finish_seen = raw_finish_seen and current_trusted
+        reliable_steps = _trusted_trajectory_steps(self.real_trajectory_steps)
+        terminal = _best_trusted_terminal_summary(
+            self.current_state,
+            reliable_steps,
+            current_quality=self.last_capture_quality,
+        )
         score = _internal_run_score(terminal)
         score_breakdown = _internal_score_breakdown(terminal)
-        reliable_steps = [step for step in self.real_trajectory_steps if (step.get("quality") or {}).get("ok") is True]
         terminal_has_high_value = _summary_has_high_value(terminal.get("known") or {})
-        if self.last_capture_quality is not None and not self.last_capture_quality.get("ok") and not finish_seen and not terminal_has_high_value:
+        if self.last_capture_quality is not None and not current_trusted and not finish_seen and not terminal_has_high_value:
             self.last_finish_skip_reason = _finish_reliability_reason(
                 terminal,
                 reliable_steps,
@@ -1363,6 +1373,7 @@ class HuahuaApp(tk.Tk):
                     "score_breakdown": score_breakdown,
                     "steps": len(self.real_trajectory_steps),
                     "reliable_steps": len(reliable_steps),
+                    "raw_finish_seen": raw_finish_seen,
                     "terminal": terminal,
                 },
                 source="real_capture",
@@ -1389,6 +1400,7 @@ class HuahuaApp(tk.Tk):
                     "score_breakdown": score_breakdown,
                     "steps": len(self.real_trajectory_steps),
                     "reliable_steps": len(reliable_steps),
+                    "raw_finish_seen": raw_finish_seen,
                     "terminal": terminal,
                 },
                 source="real_capture",
@@ -1428,6 +1440,7 @@ class HuahuaApp(tk.Tk):
                 "steps": len(self.real_trajectory_steps),
                 "saved": saved,
                 "terminal": terminal,
+                "raw_finish_seen": raw_finish_seen,
                 "finish_seen": finish_seen,
             },
             source="real_capture",
@@ -1458,7 +1471,7 @@ class HuahuaApp(tk.Tk):
         step["mode"] = "quick_capture"
         step["ocr"] = False
         step["inferred_action"] = _infer_real_capture_action(self.last_real_capture_step, step)
-        if not quality["ok"]:
+        if not _quality_is_trusted_for_trajectory(quality):
             record_observation(
                 "quick_capture_ignored",
                 {
@@ -1518,14 +1531,31 @@ class HuahuaApp(tk.Tk):
         return stamped
 
     def _handle_tentative_step(self, step: dict, *, observation_kind: str) -> bool | None:
+        if not _quality_is_trusted_for_trajectory(step.get("quality")):
+            record_observation(
+                "trajectory_step_ignored",
+                {
+                    "session": self.real_session_id,
+                    "kind": "untrusted_tentative_or_confirm_step",
+                    "quality": step.get("quality"),
+                    "action": step.get("inferred_action"),
+                    "note": "Untrusted capture kept as observation only; not added to trajectory.",
+                },
+                source="real_capture",
+            )
+            return False
         action = step.get("inferred_action") or {}
         if _is_tentative_place_current_action(action, step):
             signature = _tentative_place_signature(step)
             if _backpack_visible_in_step(step):
+                pending_trusted = _quality_is_trusted_for_trajectory(
+                    (self.pending_tentative_step or {}).get("quality")
+                )
                 confirmed_from_pending = (
                     signature
                     and signature == self.pending_tentative_signature
                     and self.pending_tentative_step is not None
+                    and pending_trusted
                 )
                 confirmed = dict(self.pending_tentative_step) if confirmed_from_pending else dict(step)
                 confirmed["tentative"] = False
@@ -1626,7 +1656,19 @@ class HuahuaApp(tk.Tk):
             return False
         quality = self.last_capture_quality or _capture_quality_gate(scene, backpack)
         finish_seen = _scene_has_finish_evidence(scene, self.current_state)
-        if not quality["ok"] and not finish_seen:
+        if not _quality_is_trusted_for_trajectory(quality):
+            record_observation(
+                "capture_step_ignored",
+                {
+                    "session": self.real_session_id,
+                    "quality": quality,
+                    "finish_seen": finish_seen,
+                    "reason": "untrusted_capture",
+                    "board": _compact_board_summary(scene),
+                    "note": "Untrusted full/auto capture was not appended to the real trajectory.",
+                },
+                source="real_capture",
+            )
             return False
         if any(item.get("severity") == "block" for item in self.last_rule_anomalies):
             return False
@@ -1651,12 +1693,13 @@ class HuahuaApp(tk.Tk):
             self.real_trajectory_steps = self.real_trajectory_steps[-60:]
             self.last_real_step_key = step_key
 
+        reliable_steps = _trusted_trajectory_steps(self.real_trajectory_steps)
         terminal = (
-            _best_available_terminal_summary(self.current_state, self.real_trajectory_steps)
+            _best_trusted_terminal_summary(self.current_state, reliable_steps, current_quality=quality)
             if finish_seen
             else _trajectory_terminal_summary(self.current_state, backpack)
         )
-        reliable, _reason_text = _terminal_reliability_for_finish(terminal, self.real_trajectory_steps, finish_seen=finish_seen)
+        reliable, _reason_text = _terminal_reliability_for_finish(terminal, reliable_steps, finish_seen=finish_seen)
         if not reliable:
             return False
         should_save, reason = _should_save_auto_trajectory(terminal)
@@ -1669,7 +1712,7 @@ class HuahuaApp(tk.Tk):
             "reason": reason,
             "terminal": terminal,
             "finish_seen": finish_seen,
-            "steps": self.real_trajectory_steps[-40:],
+            "steps": reliable_steps[-40:],
         }
         payload_key = _stable_payload_key(payload)
         if payload_key == self.last_auto_trajectory_key:
@@ -3300,6 +3343,7 @@ class HuahuaApp(tk.Tk):
         best_score = stats.get("trajectory_best_score")
         quick_steps = stats.get("quick_capture_steps", 0)
         ignored_quick = stats.get("quick_capture_ignored", 0)
+        ignored_trajectory = stats.get("trajectory_step_ignored", 0)
         quick_avg = stats.get("quick_capture_avg_elapsed")
         finished_runs = stats.get("finished_runs", 0)
         finished_skipped = stats.get("finished_skipped", 0)
@@ -3335,7 +3379,7 @@ class HuahuaApp(tk.Tk):
             "学习记录\n"
             f"事件={stats.get('total_events', 0)} 纠错={stats.get('corrections', 0)} 词条冲突={conflicts} 规则异常={mismatches}\n"
             f"异常校验={anomalies} 严重度={anomaly_severity}\n"
-            f"快速获取={quick_steps} 平均={quick_avg_text} 忽略低质={ignored_quick} 已结束局数={finished_runs} 跳过结算={finished_skipped} 最佳内部评分={finished_best_text}\n"
+            f"快速获取={quick_steps} 平均={quick_avg_text} 忽略低质={ignored_quick} 信任拦截={ignored_trajectory} 已结束局数={finished_runs} 跳过结算={finished_skipped} 最佳内部评分={finished_best_text}\n"
             f"高价值识别={high_value_seen} 明细={high_value_counts}\n"
             f"{_risk_hint_text(stats)}\n"
             f"高频词条={affix_text}\n"
@@ -3473,6 +3517,7 @@ def _format_correction_stats(stats: dict) -> str:
     corrections = stats.get("corrections", 0)
     quick_steps = stats.get("quick_capture_steps", 0)
     ignored_quick = stats.get("quick_capture_ignored", 0)
+    ignored_trajectory = stats.get("trajectory_step_ignored", 0)
     quick_avg = stats.get("quick_capture_avg_elapsed")
     quick_avg_text = f"{quick_avg:.2f}s" if isinstance(quick_avg, (int, float)) else "-"
     finished_best = stats.get("finished_best_score")
@@ -3480,7 +3525,7 @@ def _format_correction_stats(stats: dict) -> str:
     lines = [
         f"真实纠错样本：{corrections}",
         _risk_hint_text(stats),
-        f"快速获取样本：{quick_steps} 平均耗时={quick_avg_text} 低质忽略={ignored_quick}",
+        f"快速获取样本：{quick_steps} 平均耗时={quick_avg_text} 低质忽略={ignored_quick} 信任拦截={ignored_trajectory}",
         f"已结束局数：{stats.get('finished_runs', 0)} 跳过结算={stats.get('finished_skipped', 0)} 最佳内部评分={finished_best_text}",
         f"高价值识别：{stats.get('high_value_seen', 0)} 明细={stats.get('high_value_counts', {})}",
         "",
@@ -4103,6 +4148,60 @@ def _trajectory_terminal_summary(state: PuzzleState, backpack: tuple[Paint, ...]
         "backpack": _paint_collection_summary(backpack),
         "quality": _quality_proxy(known),
     }
+
+
+def _quality_is_trusted_for_trajectory(quality: dict | None) -> bool:
+    return isinstance(quality, dict) and quality.get("ok") is True
+
+
+def _trusted_trajectory_steps(steps: list[dict]) -> list[dict]:
+    return [step for step in steps if _quality_is_trusted_for_trajectory(step.get("quality"))]
+
+
+def _empty_terminal_summary() -> dict:
+    empty = {
+        "total": 0,
+        "levels": {},
+        "lv7": 0,
+        "gameplay7": 0,
+        "monster7": 0,
+        "treasure": 0,
+        "treasure5": 0,
+        "treasure6": 0,
+        "treasure7": 0,
+        "max_treasure": 0,
+    }
+    return {
+        "known": dict(empty),
+        "board_known": dict(empty),
+        "backpack": dict(empty),
+        "quality": 0.0,
+    }
+
+
+def _best_trusted_terminal_summary(
+    state: PuzzleState,
+    steps: list[dict],
+    *,
+    current_quality: dict | None = None,
+) -> dict:
+    reliable_steps = _trusted_trajectory_steps(steps)
+    if _quality_is_trusted_for_trajectory(current_quality):
+        best = _trajectory_terminal_summary(state, state.backpack)
+        best_score = _internal_run_score(best)
+    elif reliable_steps:
+        best = _terminal_summary_from_step(reliable_steps[0])
+        best_score = _internal_run_score(best)
+    else:
+        return _empty_terminal_summary()
+
+    for step in reliable_steps:
+        step_terminal = _terminal_summary_from_step(step)
+        step_score = _internal_run_score(step_terminal)
+        if step_score > best_score:
+            best = step_terminal
+            best_score = step_score
+    return best
 
 
 def _best_available_terminal_summary(state: PuzzleState, steps: list[dict]) -> dict:

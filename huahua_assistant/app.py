@@ -1406,6 +1406,34 @@ class HuahuaApp(tk.Tk):
                 source="real_capture",
             )
             return False, score
+        high_score_gate = _high_score_gate(terminal)
+        if not high_score_gate["passed"]:
+            self.last_finish_skip_reason = high_score_gate["summary"]
+            self._set_finish_diagnostic(
+                saved=False,
+                score=score,
+                terminal=terminal,
+                reliable_steps=reliable_steps,
+                finish_seen=finish_seen,
+                reason_text=self.last_finish_skip_reason,
+            )
+            record_observation(
+                "run_session_finish_skipped",
+                {
+                    "session": self.real_session_id,
+                    "reason": reason,
+                    "skip_reason": self.last_finish_skip_reason,
+                    "internal_score": score,
+                    "score_breakdown": score_breakdown,
+                    "steps": len(self.real_trajectory_steps),
+                    "reliable_steps": len(reliable_steps),
+                    "raw_finish_seen": raw_finish_seen,
+                    "terminal": terminal,
+                    "high_score_gate": high_score_gate,
+                },
+                source="real_capture",
+            )
+            return False, score
         payload = {
             "version": 1,
             "kind": "internal_scored_run",
@@ -1417,6 +1445,7 @@ class HuahuaApp(tk.Tk):
             "score_model": "huahua-v2-treasure-equivalence",
             "score_breakdown": score_breakdown,
             "terminal": terminal,
+            "high_score_gate": high_score_gate,
             "finish_seen": finish_seen,
             "steps": reliable_steps[-240:],
         }
@@ -1440,6 +1469,7 @@ class HuahuaApp(tk.Tk):
                 "steps": len(self.real_trajectory_steps),
                 "saved": saved,
                 "terminal": terminal,
+                "high_score_gate": high_score_gate,
                 "raw_finish_seen": raw_finish_seen,
                 "finish_seen": finish_seen,
             },
@@ -1702,7 +1732,8 @@ class HuahuaApp(tk.Tk):
         reliable, _reason_text = _terminal_reliability_for_finish(terminal, reliable_steps, finish_seen=finish_seen)
         if not reliable:
             return False
-        should_save, reason = _should_save_auto_trajectory(terminal)
+        high_score_gate = _high_score_gate(terminal)
+        should_save, reason = high_score_gate["passed"], high_score_gate["primary_reason"]
         if not should_save:
             return False
         payload = {
@@ -1711,6 +1742,7 @@ class HuahuaApp(tk.Tk):
             "session": self.backpack_session_key,
             "reason": reason,
             "terminal": terminal,
+            "high_score_gate": high_score_gate,
             "finish_seen": finish_seen,
             "steps": reliable_steps[-40:],
         }
@@ -4713,27 +4745,68 @@ def _quality_proxy(summary: dict) -> float:
 
 
 def _should_save_auto_trajectory(terminal: dict) -> tuple[bool, str]:
+    gate = _high_score_gate(terminal)
+    return bool(gate["passed"]), str(gate["primary_reason"])
+
+
+def _high_score_gate(terminal: dict) -> dict:
     known = terminal.get("known") or {}
     score = _internal_run_score(terminal)
-    if score >= float(config_value("autosave.min_internal_score", 3000.0)):
-        return True, f"score_{score:.0f}"
-    if known.get("treasure7", 0) >= int(config_value("autosave.min_treasure7", 1)):
-        return True, "treasure7"
-    if known.get("treasure6", 0) >= int(config_value("autosave.min_treasure6", 1)):
-        return True, "treasure6_plus"
-    if known.get("lv7", 0) >= int(config_value("autosave.min_lv7", 3)):
-        return True, "many_level7"
+    treasure7 = int(known.get("treasure7", 0) or 0)
+    treasure6_plus = int(known.get("treasure6", 0) or 0)
+    treasure5_plus = int(known.get("treasure5", 0) or 0)
+    lv7 = int(known.get("lv7", 0) or 0)
+    gameplay7 = int(known.get("gameplay7", 0) or 0)
+    monster7 = int(known.get("monster7", 0) or 0)
+    thresholds = {
+        "min_internal_score": float(config_value("autosave.min_internal_score", 3000.0)),
+        "min_treasure7": int(config_value("autosave.min_treasure7", 1)),
+        "min_treasure6": int(config_value("autosave.min_high_score_treasure6", config_value("autosave.min_treasure6", 1))),
+        "min_lv7": int(config_value("autosave.min_high_score_lv7", 1)),
+        "min_many_lv7": int(config_value("autosave.min_lv7", 3)),
+        "min_gameplay7_mixed": int(config_value("autosave.min_gameplay7_mixed", 2)),
+        "min_monster7_mixed": int(config_value("autosave.min_monster7_mixed", 1)),
+        "min_treasure5_with_lv7": int(config_value("autosave.min_treasure5_with_lv7", 1)),
+        "min_lv7_with_treasure5": int(config_value("autosave.min_lv7_with_treasure5", 2)),
+    }
+    reasons: list[str] = []
+    if treasure7 >= thresholds["min_treasure7"]:
+        reasons.append("treasure7_plus")
+    if treasure6_plus >= thresholds["min_treasure6"]:
+        reasons.append("treasure6_plus")
+    if lv7 >= thresholds["min_lv7"]:
+        reasons.append("level7_paint")
+    if score >= thresholds["min_internal_score"]:
+        reasons.append(f"score_{score:.0f}")
+    if lv7 >= thresholds["min_many_lv7"]:
+        reasons.append("many_level7")
     if (
-        known.get("gameplay7", 0) >= int(config_value("autosave.min_gameplay7_mixed", 2))
-        and known.get("monster7", 0) >= int(config_value("autosave.min_monster7_mixed", 1))
+        gameplay7 >= thresholds["min_gameplay7_mixed"]
+        and monster7 >= thresholds["min_monster7_mixed"]
     ):
-        return True, "mixed_level7"
+        reasons.append("mixed_level7")
     if (
-        known.get("treasure5", 0) >= int(config_value("autosave.min_treasure5_with_lv7", 1))
-        and known.get("lv7", 0) >= int(config_value("autosave.min_lv7_with_treasure5", 2))
+        treasure5_plus >= thresholds["min_treasure5_with_lv7"]
+        and lv7 >= thresholds["min_lv7_with_treasure5"]
     ):
-        return True, "treasure5_with_level7"
-    return False, "low_value"
+        reasons.append("treasure5_with_level7")
+    primary = reasons[0] if reasons else "below_high_score_gate"
+    return {
+        "passed": bool(reasons),
+        "primary_reason": primary,
+        "reasons": reasons,
+        "summary": "高分轨迹门槛通过" if reasons else "未达到高分轨迹门槛：需要6级以上箱子或7级颜料",
+        "score": score,
+        "thresholds": thresholds,
+        "counts": {
+            "treasure7_plus": treasure7,
+            "treasure6_plus": treasure6_plus,
+            "treasure5_plus": treasure5_plus,
+            "lv7": lv7,
+            "gameplay7": gameplay7,
+            "monster7": monster7,
+        },
+    }
 
 
 def _summary_has_high_value(summary: dict) -> bool:

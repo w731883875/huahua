@@ -24,6 +24,8 @@ DEFAULT_STRATEGY_CONFIG: dict[str, Any] = {
         "min_internal_score": 3000.0,
         "min_treasure7": 1,
         "min_treasure6": 1,
+        "min_high_score_treasure6": 1,
+        "min_high_score_lv7": 1,
         "min_lv7": 3,
         "min_gameplay7_mixed": 2,
         "min_monster7_mixed": 1,

@@ -70,6 +70,9 @@ def record_high_score_trajectory(payload: dict[str, Any], *, source: str) -> boo
 
 
 def _trajectory_payload_is_trusted(payload: dict[str, Any]) -> bool:
+    gate = payload.get("high_score_gate")
+    if isinstance(gate, dict) and gate.get("passed") is not True:
+        return False
     steps = payload.get("steps") or []
     if not isinstance(steps, list) or not steps:
         return False
@@ -256,6 +259,8 @@ def _build_stats(
     trajectory_brush_codes = Counter()
     trajectory_affixes = Counter()
     trajectory_affix_codes = Counter()
+    high_score_gate_reasons = Counter()
+    high_score_gate_primary = Counter()
     trajectory_scores: list[float] = []
     treasure_count = 0
     quick_steps = 0
@@ -358,6 +363,12 @@ def _build_stats(
 
     for event in trajectories:
         payload = event.get("payload") or {}
+        gate = payload.get("high_score_gate") if isinstance(payload.get("high_score_gate"), dict) else {}
+        primary_reason = gate.get("primary_reason") or payload.get("reason")
+        if primary_reason:
+            high_score_gate_primary[str(primary_reason)] += 1
+        for reason in gate.get("reasons") or ():
+            high_score_gate_reasons[str(reason)] += 1
         final_score = payload.get("internal_score", payload.get("final_score"))
         if isinstance(final_score, (int, float)):
             trajectory_scores.append(float(final_score))
@@ -465,6 +476,8 @@ def _build_stats(
         "trajectory_brush_codes": dict(trajectory_brush_codes),
         "trajectory_affixes": dict(trajectory_affixes),
         "trajectory_affix_codes": dict(trajectory_affix_codes),
+        "high_score_gate_primary": dict(high_score_gate_primary),
+        "high_score_gate_reasons": dict(high_score_gate_reasons),
         "policy_prior_samples": {
             "placements": sum(placement_cells.values()),
             "brushes": max(sum(trajectory_brushes.values()), sum(trajectory_brush_codes.values())),

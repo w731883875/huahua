@@ -9,12 +9,12 @@
 - Next step: Task 2 should implement an explicit high-score gate model with structured gate reasons for Lv6+ treasure/box and Lv7+ paints, add configurable thresholds, and prepare stats fields for later threshold escalation.
 
 ## Task 2 - High-Score Gate Model
-- Status: pending
+- Status: completed
 - Goal: Implement explicit high-score gate reasons for Lv6+ treasure/box, Lv7+ paint, and configurable future threshold escalation.
-- Work performed:
-- Validation evidence:
-- Remaining risk:
-- Next step:
+- Work performed: Added explicit high-score gate configuration in `huahua_assistant/config.py` with `autosave.min_high_score_treasure6` and `autosave.min_high_score_lv7`. Added `_high_score_gate()` in `huahua_assistant/app.py`, returning structured metadata: `passed`, `primary_reason`, all `reasons`, human summary, score, thresholds, and terminal counts. The gate treats Lv6+ treasure/box and any Lv7+ paint as initial high-score gates, while preserving score, treasure7, many-level7, mixed-level7, and treasure5+level7 reasons for escalation/analysis. Updated manual finish to skip high-score trajectory storage when a reliable terminal does not pass the high-score gate, recording `run_session_finish_skipped` with gate diagnostics instead. Updated auto trajectory saving to use the same gate and include `high_score_gate` in saved payloads. Added storage-level defense in `learning._trajectory_payload_is_trusted()` so a payload explicitly marked `high_score_gate.passed=False` cannot be written even if all steps are trusted. Added `high_score_gate_primary` and `high_score_gate_reasons` aggregation in learning stats.
+- Validation evidence: Ran `python -m compileall huahua_assistant run_app.py` successfully. Ran `git diff --check` successfully with only CRLF normalization warnings. Smoke-tested `_high_score_gate()` returning `False/below_high_score_gate` for low-value terminals, `True/treasure6_plus` with reasons `['treasure6_plus', 'score_3006']` for a Lv6 treasure terminal, and `True/level7_paint` for a Lv7 paint terminal. Smoke-tested `_should_save_auto_trajectory()` returning `(True, 'treasure6_plus')` for Lv6 treasure, preserving old call compatibility. Smoke-tested learning stats aggregating `{'treasure6_plus': 1}` primary gate and both `treasure6_plus` / `score_3006` reasons. Smoke-tested `record_high_score_trajectory()` rejecting a real-capture payload with `high_score_gate.passed=False` and accepting one with `passed=True` plus trusted steps.
+- Remaining risk: Older saved trajectories without `high_score_gate` remain accepted for backward compatibility and are counted using their legacy `reason`; future tasks should display both legacy and new gate stats clearly. Manual reliable but low-value endings now no longer enter high-score trajectories, which matches the new mission but may reduce early sample volume until real high-value captures accumulate.
+- Next step: Task 3 should perform the first major check to verify the new gate model does not break trust boundaries, old trajectory compatibility, compile, stats loading, or UI assumptions.
 
 ## Task 3 - Major Check 1
 - Status: pending

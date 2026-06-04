@@ -57,12 +57,12 @@
 - Next step: Task 8 should add the desktop-pet state machine that consumes current recommendations plus `last_fast_events` to output observing, recommend-backpack, recommend-board-cell, recommend-brush, wait-for-drop, and finish-hint states.
 
 ## Task 8 - Pet Brain State Machine
-- Status: pending
+- Status: completed
 - Goal: Add desktop-pet state machine that outputs observing, recommend backpack, recommend board cell, recommend brush, wait for drop, and finish hint states.
-- Work performed:
-- Validation evidence:
-- Remaining risk:
-- Next step:
+- Work performed: Added `huahua_assistant/pet_brain.py` with `PetBrainState` and `evaluate_pet_state(app)`. The state machine consumes `last_fast_events`, current brush pending state, current recommendations, and install plan to produce observing, recommend-backpack, recommend-board-cell, recommend-brush, wait-for-drop, and finish-hint modes with short Chinese messages. Integrated pet-state refresh into full recognition, quick recognition, fast snapshot updates, and new real-session reset in `huahua_assistant/app.py`. Updated `DesktopPetActor` to render a small status bubble above the pet, color it by state, avoid redundant geometry/lift updates where possible, and keep drag/click-through behavior unchanged. Desktop pet display now recalculates state on render while capture hooks still hide pet/markers before screenshots.
+- Validation evidence: Ran `python -m compileall huahua_assistant run_app.py` successfully. Ran `git diff --check` successfully with only existing CRLF normalization warnings. Ran a direct smoke test for `evaluate_pet_state` covering `finish_candidate`, empty scene observing, and `selection_state_changed`, producing `finish_hint/可结算`, `observing/等待识别`, and `wait_for_drop/等落笔`. `rg "last_pet_state|evaluate_pet_state|PetBrainState|pet_state|bubble_label|_pet_state_" -n huahua_assistant` shows expected app, state-machine, and desktop-pet integration points.
+- Remaining risk: This task validates code paths but not live in-game overlay behavior; real flicker, z-order, and 0.5s responsiveness still require runtime observation on the user's machine. The pet brain currently uses existing recommendation objects and fast events; it does not yet add the performance/debug panel or stronger trust gates planned for later tasks.
+- Next step: Task 9 should perform the third major check/debug cycle, focused on event/state consistency, real-recording boundaries, mouse passthrough, capture pollution, and desktop-pet flicker risk.
 
 ## Task 9 - Major Check 3
 - Status: pending

@@ -55,6 +55,7 @@ from .learning import (
     record_observation,
 )
 from .models import BoardObservation, BrushOptionsObservation, PaintCategory, PaintDirection, PaintObject, Rect, RegionKind, SceneObservation, TileState
+from .pet_brain import PetBrainState, evaluate_pet_state
 from .vision import VisionTracker, analyze_and_save_debug
 
 
@@ -127,6 +128,7 @@ class HuahuaApp(tk.Tk):
         self.last_fast_snapshot: FastVisionSnapshot | None = None
         self.previous_fast_snapshot: FastVisionSnapshot | None = None
         self.last_fast_events: tuple[FastVisionEvent, ...] = ()
+        self.last_pet_state: PetBrainState | None = None
         self.tracker = VisionTracker()
         self.detected_backpack_cache: dict[str, tuple[Paint, float]] = {}
         self.backpack_session_key: str | None = None
@@ -531,11 +533,13 @@ class HuahuaApp(tk.Tk):
             self.previous_fast_snapshot = self.last_fast_snapshot
             self.last_fast_snapshot = None
             self.last_fast_events = ()
+            self.last_pet_state = PetBrainState(mode="observing", message="等待识别", confidence=0.2)
             return
         previous = self.last_fast_snapshot
         self.previous_fast_snapshot = previous
         self.last_fast_snapshot = snapshot
         self.last_fast_events = detect_fast_events(previous, snapshot)
+        self.last_pet_state = evaluate_pet_state(self)
 
     def _screen_point_from_capture_point(self, x: float, y: float) -> tuple[int, int] | None:
         local = self._window_local_point_from_capture_point(x, y)
@@ -838,6 +842,7 @@ class HuahuaApp(tk.Tk):
             self.current_state = None
             self.recommendations = []
             self.install_plan = None
+            self._update_fast_snapshot(None)
             self._clear_brush_choice()
             self.board_var.set("局面：未识别到棋盘")
             self.status_var.set(f"来源：{capture_source}。未找到棋盘。{elapsed:.2f}s。调试图：{debug_path}")
@@ -867,6 +872,7 @@ class HuahuaApp(tk.Tk):
         self._apply_detected_brush_options(scene.brush_options)
         self.recommendations = recommend_placements(self.current_state, learning_stats=load_learning_stats())
         self.install_plan = recommend_install_plan(self.current_state)
+        self._update_fast_snapshot(snapshot_from_scene(scene))
         high_value_notice = self._record_high_value_seen(
             scene,
             self.current_state,
@@ -993,6 +999,7 @@ class HuahuaApp(tk.Tk):
         self._merge_quick_brush_stage2(scene.brush_options)
         self.recommendations = recommend_placements(self.current_state, learning_stats=load_learning_stats())
         self.install_plan = recommend_install_plan(self.current_state)
+        self.last_pet_state = evaluate_pet_state(self)
         quick_quality = _quick_capture_quality(scene, elapsed, capture_perf)
         self.last_capture_quality = quick_quality
         quick_saved = self._record_quick_capture_step(scene, self.current_state, elapsed, capture_perf=capture_perf)
@@ -1146,6 +1153,7 @@ class HuahuaApp(tk.Tk):
         self.previous_fast_snapshot = None
         self.last_fast_snapshot = None
         self.last_fast_events = ()
+        self.last_pet_state = None
         self.recommendations = []
         self.install_plan = None
         self.selected_backpack_index = None

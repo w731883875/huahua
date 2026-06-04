@@ -21,6 +21,7 @@ from .game_model import (
     recommend_brush_types,
 )
 from .models import Rect, SceneObservation
+from .pet_brain import evaluate_pet_state
 
 
 TRANSPARENT_COLOR = "#010203"
@@ -181,6 +182,7 @@ class DesktopPetActor:
         self.root = root
         self.window: tk.Toplevel | None = None
         self.label: tk.Label | None = None
+        self.bubble_label: tk.Label | None = None
         self.photo: ImageTk.PhotoImage | None = None
         self.photo_asset_name: str | None = None
         self.wndprocs: dict[int, tuple[int, object]] = {}
@@ -189,20 +191,44 @@ class DesktopPetActor:
         self.draggable = True
         self.manual_position: tuple[int, int] | None = _load_pet_position()
         self.drag_offset: tuple[int, int] | None = None
+        self.last_render_key: tuple | None = None
 
-    def show(self, *, active: bool = False, window_info=None) -> None:
+    def show(self, *, active: bool = False, window_info=None, pet_state=None) -> None:
         self.active = active
         if not self._ensure_window():
             return
         self._load_image(active)
-        if self.window is None or self.label is None or self.photo is None:
+        if self.window is None or self.label is None or self.bubble_label is None or self.photo is None:
             return
-        width = int(self.photo.width())
-        height = int(self.photo.height())
+        message = _pet_state_message(pet_state, active)
+        bubble_bg, bubble_fg = _pet_state_palette(pet_state)
+        self.bubble_label.configure(text=message, bg=bubble_bg, fg=bubble_fg)
+        self.bubble_label.update_idletasks()
+        image_width = int(self.photo.width())
+        image_height = int(self.photo.height())
+        bubble_width = max(84, int(self.bubble_label.winfo_reqwidth()))
+        bubble_height = int(self.bubble_label.winfo_reqheight())
+        width = max(image_width, bubble_width)
+        height = image_height + bubble_height + 4
         if self.manual_position is None:
             left, top = _pet_position(self.root, width, height, window_info)
         else:
             left, top = _clamp_pet_position(self.root, self.manual_position[0], self.manual_position[1], width, height)
+        render_key = (
+            bool(active),
+            message,
+            bubble_bg,
+            bubble_fg,
+            self.photo_asset_name,
+            left,
+            top,
+            width,
+            height,
+            bool(self.visible),
+        )
+        if self.last_render_key == render_key:
+            self._apply_input_mode()
+            return
         try:
             self.label.configure(image=self.photo)
             self.window.geometry(f"{width}x{height}+{left}+{top}")
@@ -210,6 +236,7 @@ class DesktopPetActor:
             self.window.lift()
             self.window.attributes("-topmost", True)
             self.visible = True
+            self.last_render_key = render_key
         except tk.TclError:
             return
         self._apply_input_mode()
@@ -225,6 +252,7 @@ class DesktopPetActor:
             if self.window.state() != "withdrawn":
                 self.window.withdraw()
                 self.visible = False
+                self.last_render_key = None
                 return 1
         except tk.TclError:
             pass
@@ -244,9 +272,11 @@ class DesktopPetActor:
                 pass
         self.window = None
         self.label = None
+        self.bubble_label = None
         self.photo = None
         self.photo_asset_name = None
         self.drag_offset = None
+        self.last_render_key = None
         self.visible = False
 
     def _ensure_window(self) -> bool:
@@ -262,14 +292,26 @@ class DesktopPetActor:
                 window.attributes("-transparentcolor", TRANSPARENT_COLOR)
             except tk.TclError:
                 pass
+            bubble_label = tk.Label(
+                window,
+                bg="#10202a",
+                fg="#f8fdff",
+                bd=0,
+                highlightthickness=0,
+                padx=10,
+                pady=4,
+                font=("Microsoft YaHei UI", 10, "bold"),
+            )
             label = tk.Label(window, bg=TRANSPARENT_COLOR, bd=0, highlightthickness=0)
-            label.pack(fill=tk.BOTH, expand=True)
-            for widget in (window, label):
+            bubble_label.pack(side=tk.TOP, anchor=tk.CENTER, pady=(0, 2))
+            label.pack(side=tk.TOP, anchor=tk.CENTER)
+            for widget in (window, bubble_label, label):
                 widget.bind("<ButtonPress-1>", self._start_drag, add="+")
                 widget.bind("<B1-Motion>", self._drag_to, add="+")
                 widget.bind("<ButtonRelease-1>", self._finish_drag, add="+")
             self.window = window
             self.label = label
+            self.bubble_label = bubble_label
             return True
         except tk.TclError:
             return False
@@ -1011,6 +1053,33 @@ def _marker_colors(kind: str, priority: int) -> tuple[str, str, str, str]:
     return "#162f43", "#64e6ff", "#214e68", "#e8fbff"
 
 
+def _pet_state_is_active(pet_state) -> bool:
+    mode = getattr(pet_state, "mode", "observing") if pet_state is not None else "observing"
+    return mode not in {"observing"}
+
+
+def _pet_state_message(pet_state, active: bool) -> str:
+    message = str(getattr(pet_state, "message", "") or "").strip()
+    if message:
+        return message[:12]
+    return "推荐中" if active else "观察中"
+
+
+def _pet_state_palette(pet_state) -> tuple[str, str]:
+    mode = getattr(pet_state, "mode", "observing") if pet_state is not None else "observing"
+    if mode == "recommend_backpack":
+        return "#10353a", "#dffcff"
+    if mode == "recommend_board_cell":
+        return "#44330f", "#fff4c5"
+    if mode == "recommend_brush":
+        return "#3a1745", "#fff0ff"
+    if mode == "wait_for_drop":
+        return "#123047", "#e6f6ff"
+    if mode == "finish_hint":
+        return "#143817", "#e7ffe4"
+    return "#101820", "#eef7ff"
+
+
 def install_desktop_pet_markers(app_cls: type) -> None:
     """Install the persistent desktop pet plus optional coordinate markers."""
 
@@ -1044,10 +1113,12 @@ def install_desktop_pet_markers(app_cls: type) -> None:
 
     def show_actor(self) -> None:
         try:
-            active = bool(getattr(self, "recommendations", None) or getattr(self, "install_plan", None))
+            pet_state = evaluate_pet_state(self)
+            setattr(self, "last_pet_state", pet_state)
+            active = _pet_state_is_active(pet_state) or bool(getattr(self, "recommendations", None) or getattr(self, "install_plan", None))
             if hasattr(self, "desktop_pet_drag_var"):
                 actor(self).set_draggable(bool(self.desktop_pet_drag_var.get()))
-            actor(self).show(active=active, window_info=getattr(self, "last_capture_window", None))
+            actor(self).show(active=active, window_info=getattr(self, "last_capture_window", None), pet_state=pet_state)
         except tk.TclError:
             return
 

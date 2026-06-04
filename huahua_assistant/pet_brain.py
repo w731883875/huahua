@@ -22,6 +22,10 @@ def evaluate_pet_state(app) -> PetBrainState:
         if isinstance(waiting_state, PetBrainState) and waiting_state.mode == "observing":
             return waiting_state
 
+    unstable_state = _unstable_capture_state(app)
+    if unstable_state is not None:
+        return unstable_state
+
     finish_event = _first_event(events, "finish_candidate")
     if finish_event is not None:
         return PetBrainState(
@@ -105,6 +109,21 @@ def _has_backpack_target(app) -> bool:
 
 def _latest_snapshot_is_missing(app) -> bool:
     return getattr(app, "last_fast_snapshot", None) is None and not tuple(getattr(app, "last_fast_events", ()) or ())
+
+
+def _unstable_capture_state(app) -> PetBrainState | None:
+    quality = getattr(app, "last_capture_quality", None)
+    if not isinstance(quality, dict) or quality.get("ok", True):
+        return None
+    reason = str(quality.get("reason") or "")
+    if "capture_source_composited" in reason:
+        return PetBrainState(
+            mode="observing",
+            message="截图不稳",
+            confidence=0.2,
+            event_kind="capture_source_composited",
+        )
+    return None
 
 
 def _first_event(events: tuple[FastVisionEvent, ...], kind: str) -> FastVisionEvent | None:

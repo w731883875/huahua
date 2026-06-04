@@ -490,12 +490,21 @@ def _build_markers(app) -> list[PetMarker]:
     window = getattr(app, "last_capture_window", None)
     if scene is None or state is None or window is None:
         return []
+    if _coordinate_markers_are_unsafe(app):
+        return []
 
     markers: list[PetMarker] = []
     markers.extend(_board_markers(app, scene))
     markers.extend(_backpack_markers(app, scene))
     markers.extend(_brush_markers(app, scene, state))
     return markers[:5]
+
+
+def _coordinate_markers_are_unsafe(app) -> bool:
+    quality = getattr(app, "last_capture_quality", None)
+    if not isinstance(quality, dict) or quality.get("ok", True):
+        return False
+    return "capture_source_composited" in str(quality.get("reason") or "")
 
 
 def _settle_tk_compositor(root: tk.Misc, settle_ms: int) -> None:

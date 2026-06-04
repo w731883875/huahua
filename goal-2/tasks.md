@@ -65,12 +65,12 @@
 - Next step: Task 9 should perform the third major check/debug cycle, focused on event/state consistency, real-recording boundaries, mouse passthrough, capture pollution, and desktop-pet flicker risk.
 
 ## Task 9 - Major Check 3
-- Status: pending
+- Status: completed
 - Goal: Check event/state machine consistency with real recording, safety boundary, mouse passthrough, and desktop pet flicker risks.
-- Work performed:
-- Validation evidence:
-- Remaining risk:
-- Next step:
+- Work performed: Performed the third major check over fast events, the pet brain, desktop-pet click-through/drag behavior, capture hiding, and real learning gates. Found one important screenshot-pollution risk: auto-follow now uses a background `FramePump`, so hiding the pet once before starting the pump is not enough if capture falls back to composed desktop sources such as `window-screen` or `screen:fallback`. Added a source-sensitive quick-quality gate: `window-content` remains trusted, while `window-screen` and `screen:fallback` are marked `capture_source_composited`. Such frames are treated as low-confidence quick captures, do not enter quick trajectory steps or high-value records, and make the pet show `截图不稳`. Added a marker safety gate so coordinate markers hide when the latest quality reason contains `capture_source_composited`. Rechecked learning record boundaries: fast snapshots/events remain in memory, and learning writes still go through `source="real_capture"` quality-gated paths.
+- Validation evidence: Ran `python -m compileall huahua_assistant run_app.py` successfully. Ran `git diff --check` successfully with only CRLF normalization warnings. Smoke-tested capture-source classification: `window-content` returns safe, while `window-screen` and `screen:fallback` return unsafe. Smoke-tested `_quick_capture_quality(..., capture_source="window-screen:test")` and got `ok=False` with `reason=capture_source_composited`. Smoke-tested `evaluate_pet_state` with that quality and got `PetBrainState(mode='observing', message='截图不稳', event_kind='capture_source_composited')`. Smoke-tested `_coordinate_markers_are_unsafe` returning `True` for `capture_source_composited` and `False` for normal quality. Reviewed relevant `rg` output for `FramePump`, `hide_marker_surfaces`, mouse passthrough constants, `last_fast_events`, `last_pet_state`, and learning write paths.
+- Remaining risk: This check still did not prove live z-order/flicker behavior inside the user's running game; it proves the code prevents polluted composed-desktop quick frames from being trusted or shown as coordinate recommendations. The 0.5s goal remains unproven because there is no visible performance panel yet and the current quick path still depends on `VisionTracker.analyze_quick` speed on the user's machine.
+- Next step: Task 10 should add a performance panel showing capture, fast CV, recommendation, desktop-pet update timing, latest pet state, and source/quality reason so the 0.5s target can be measured directly in real use.
 
 ## Task 10 - Performance Panel
 - Status: pending

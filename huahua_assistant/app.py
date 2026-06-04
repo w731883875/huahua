@@ -999,10 +999,16 @@ class HuahuaApp(tk.Tk):
         self._merge_quick_brush_stage2(scene.brush_options)
         self.recommendations = recommend_placements(self.current_state, learning_stats=load_learning_stats())
         self.install_plan = recommend_install_plan(self.current_state)
-        self.last_pet_state = evaluate_pet_state(self)
-        quick_quality = _quick_capture_quality(scene, elapsed, capture_perf)
+        quick_quality = _quick_capture_quality(scene, elapsed, capture_perf, capture_source=capture_source)
         self.last_capture_quality = quick_quality
-        quick_saved = self._record_quick_capture_step(scene, self.current_state, elapsed, capture_perf=capture_perf)
+        self.last_pet_state = evaluate_pet_state(self)
+        quick_saved = self._record_quick_capture_step(
+            scene,
+            self.current_state,
+            elapsed,
+            capture_perf=capture_perf,
+            capture_source=capture_source,
+        )
         high_value_notice = self._record_high_value_seen(
             scene,
             self.current_state,
@@ -1358,8 +1364,9 @@ class HuahuaApp(tk.Tk):
         elapsed: float,
         *,
         capture_perf: dict | None = None,
+        capture_source: str | None = None,
     ) -> bool:
-        quality = _quick_capture_quality(scene, elapsed, capture_perf)
+        quality = _quick_capture_quality(scene, elapsed, capture_perf, capture_source=capture_source)
         step = _compact_real_capture_step(
             scene=scene,
             state=state,
@@ -4221,12 +4228,21 @@ def _capture_quality_gate(scene: SceneObservation, backpack: tuple[Paint, ...]) 
     }
 
 
-def _quick_capture_quality(scene: SceneObservation, elapsed: float, capture_perf: dict | None = None) -> dict:
+def _quick_capture_quality(
+    scene: SceneObservation,
+    elapsed: float,
+    capture_perf: dict | None = None,
+    *,
+    capture_source: str | None = None,
+) -> dict:
     board_score = round(float(scene.board.score), 3)
     unknown_tiles = sum(1 for tile in scene.board.tiles if tile.state == TileState.UNKNOWN)
     min_board = float(config_value("quality.quick_min_board", 0.66))
     max_unknown_tiles = int(config_value("quality.quick_max_unknown_tiles", 1))
     reasons: list[str] = []
+    source = capture_source or "unknown"
+    if _capture_source_can_include_overlays(source):
+        reasons.append("capture_source_composited")
     if board_score < min_board:
         reasons.append(f"board={board_score:.2f}")
     if unknown_tiles > max_unknown_tiles:
@@ -4243,7 +4259,13 @@ def _quick_capture_quality(scene: SceneObservation, elapsed: float, capture_perf
         "elapsed": round(elapsed, 3),
         "unknown_tiles": unknown_tiles,
         "perf": capture_perf or {},
+        "capture_source": source,
     }
+
+
+def _capture_source_can_include_overlays(source: str) -> bool:
+    normalized = str(source or "").casefold()
+    return normalized.startswith("screen:fallback") or normalized.startswith("window-screen")
 
 
 def _current_paint_quality(paint) -> float:

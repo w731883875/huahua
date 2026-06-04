@@ -443,8 +443,22 @@ def _build_stats(
         "event_counts": dict(event_counts),
         "stage1_seen": dict(stage1_seen),
         "stage1_code_seen": dict(stage1_code_seen),
+        "stage1_seen_total": sum(stage1_seen.values()),
+        "stage1_code_seen_total": sum(stage1_code_seen.values()),
+        "stage1_seen_pct": _counter_percentages(stage1_seen),
+        "stage1_code_seen_pct": _counter_percentages(stage1_code_seen),
         "affix_seen": dict(affix_seen),
         "affix_code_seen": dict(affix_code_seen),
+        "affix_seen_total": sum(affix_seen.values()),
+        "affix_code_seen_total": sum(affix_code_seen.values()),
+        "affix_seen_pct": _counter_percentages(affix_seen),
+        "affix_code_seen_pct": _counter_percentages(affix_code_seen),
+        "affix_appearance_rates": {
+            "stage1": _counter_distribution(stage1_seen),
+            "stage1_codes": _counter_distribution(stage1_code_seen),
+            "stage2": _counter_distribution(affix_seen),
+            "stage2_codes": _counter_distribution(affix_code_seen),
+        },
         "current_paint_seen": dict(current_seen),
         "current_paint_code_seen": dict(current_code_seen),
         "rule_mismatches": dict(mismatch_seen),
@@ -513,6 +527,35 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
     return value
+
+
+def _counter_percentages(counter: Counter) -> dict[str, float]:
+    total = sum(counter.values())
+    if total <= 0:
+        return {}
+    return {
+        str(key): round(float(count) * 100.0 / float(total), 3)
+        for key, count in counter.items()
+    }
+
+
+def _counter_distribution(counter: Counter) -> dict[str, Any]:
+    total = sum(counter.values())
+    items = []
+    for key, count in sorted(counter.items(), key=lambda item: (-item[1], str(item[0]))):
+        rate = float(count) / float(total) if total else 0.0
+        items.append(
+            {
+                "key": str(key),
+                "count": int(count),
+                "rate": round(rate, 6),
+                "pct": round(rate * 100.0, 3),
+            }
+        )
+    return {
+        "total": int(total),
+        "items": items,
+    }
 
 
 def _placement_cells_from_inferred(inferred: dict[str, Any]) -> list[dict[str, Any]]:

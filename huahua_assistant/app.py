@@ -118,7 +118,7 @@ class HuahuaApp(tk.Tk):
         self.force_used_var = tk.IntVar(value=0)
         self.refresh_used_var = tk.IntVar(value=0)
         self.auto_follow_var = tk.BooleanVar(value=False)
-        self.auto_follow_interval_var = tk.IntVar(value=1000)
+        self.auto_follow_interval_var = tk.IntVar(value=500)
         self.overlay_var = tk.BooleanVar(value=False)
         self.overlay_window: tk.Toplevel | None = None
         self.overlay_canvas: tk.Canvas | None = None

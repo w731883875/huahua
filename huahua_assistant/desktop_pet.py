@@ -502,9 +502,7 @@ def _build_markers(app) -> list[PetMarker]:
 
 def _coordinate_markers_are_unsafe(app) -> bool:
     quality = getattr(app, "last_capture_quality", None)
-    if not isinstance(quality, dict) or quality.get("ok", True):
-        return False
-    return "capture_source_composited" in str(quality.get("reason") or "")
+    return isinstance(quality, dict) and quality.get("ok") is False
 
 
 def _settle_tk_compositor(root: tk.Misc, settle_ms: int) -> None:

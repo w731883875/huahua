@@ -123,7 +123,12 @@ def _unstable_capture_state(app) -> PetBrainState | None:
             confidence=0.2,
             event_kind="capture_source_composited",
         )
-    return None
+    return PetBrainState(
+        mode="observing",
+        message="识别不稳",
+        confidence=0.25,
+        event_kind="quality_low",
+    )
 
 
 def _first_event(events: tuple[FastVisionEvent, ...], kind: str) -> FastVisionEvent | None:

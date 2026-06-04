@@ -109,9 +109,9 @@ def analyze_scene_quick(
     if rect is None:
         return analyze_scene(image)
     scene = _analyze_scene_from_board_rect(image, rect, fast=True, quick=True, previous_scene=previous_scene)
-    if scene is not None and scene.board.score >= 0.72:
+    if scene is not None:
         return scene
-    return analyze_scene(image)
+    return None
 
 
 def _analyze_scene_from_board_rect(
@@ -130,7 +130,7 @@ def _analyze_scene_from_board_rect(
         return None
     tiles = tuple(_classify_tiles(image, rect))
     board = BoardObservation(rect=rect, score=score, tiles=tiles)
-    regions = tuple(_estimate_regions(image, board))
+    regions = tuple(_estimate_regions_fast(image, board) if quick else _estimate_regions(image, board))
     if quick:
         current_paint = _analyze_current_paint_fast(image, regions, previous_scene.current_paint if previous_scene is not None else None)
         current_paint = _correct_current_paint_from_board_anchor(image, current_paint, tiles)
@@ -2091,6 +2091,48 @@ def _estimate_regions(image: np.ndarray, board: BoardObservation) -> list[Region
             ]
         )
     return regions
+
+
+def _estimate_regions_fast(image: np.ndarray, board: BoardObservation) -> list[RegionObservation]:
+    height, width = image.shape[:2]
+    b = board.rect
+    x0 = _clamp_int(b.right + b.w * 0.10, 0, width - 1)
+    content_x0 = _clamp_int(b.right - b.w * 0.06, 0, width - 1)
+    right = _clamp_int(max(x0 + 1, width - b.w * 0.06), 1, width)
+    panel_w = max(1, right - x0)
+    content_panel_w = max(1, right - content_x0)
+    return [
+        RegionObservation(
+            kind=RegionKind.CURRENT_PAINT,
+            rect=_bounded_rect(x0, b.y - b.h * 0.02, panel_w, b.h * 0.24, width, height),
+            confidence=board.score,
+            label="current paint fast",
+        ),
+        RegionObservation(
+            kind=RegionKind.BACKPACK,
+            rect=_bounded_rect(content_x0, b.y + b.h * 0.29, content_panel_w, b.h * 0.50, width, height),
+            confidence=board.score * 0.85,
+            label="backpack fast",
+        ),
+        RegionObservation(
+            kind=RegionKind.FORCE_COMPLETE,
+            rect=_bounded_rect(x0 + panel_w * 0.50, b.y + b.h * 0.80, panel_w * 0.42, b.h * 0.11, width, height),
+            confidence=board.score * 0.75,
+            label="force complete fast",
+        ),
+        RegionObservation(
+            kind=RegionKind.REFRESH_AFFIX,
+            rect=_bounded_rect(x0, b.y + b.h * 0.80, panel_w * 0.42, b.h * 0.11, width, height),
+            confidence=board.score * 0.55,
+            label="refresh affix fast",
+        ),
+        RegionObservation(
+            kind=RegionKind.CONFIRM_BUTTON,
+            rect=_bounded_rect(x0 + panel_w * 0.35, b.y + b.h * 0.88, panel_w * 0.38, b.h * 0.10, width, height),
+            confidence=board.score * 0.62,
+            label="confirm button fast",
+        ),
+    ]
 
 
 def _find_finish_drawing_signal(image: np.ndarray) -> tuple[float, Rect, str] | None:

@@ -15,6 +15,7 @@ from tkinter import filedialog, messagebox
 from .capture import DEFAULT_WINDOW_TITLE, WindowInfo, capture_target, find_window, write_image
 from .config import config_value
 from .codes import affix_code, affix_display_from_code, brush_code, brush_payload_codes, compact_paint_with_code, compact_rule_with_code
+from .frame_pump import FramePump, default_auto_capture
 from .game_model import (
     AffixRule,
     BrushChoiceScenario,
@@ -144,6 +145,8 @@ class HuahuaApp(tk.Tk):
         self.auto_follow_busy = False
         self.auto_follow_overlap_paused = False
         self.auto_follow_generation = 0
+        self.auto_follow_pump: FramePump | None = None
+        self.auto_follow_last_sequence = 0
         self.last_high_value_key: str | None = None
         self.last_finish_skip_reason: str | None = None
         self.last_finish_diagnostic: dict | None = None
@@ -315,6 +318,7 @@ class HuahuaApp(tk.Tk):
         self.status_var.set("正在完整识别游戏窗口...")
         self._set_notice("正在完整识别：会短暂隐藏工具窗口，避免识别到工具自身。", "info")
         self.auto_follow_generation += 1
+        self._stop_auto_follow_pump(wait=True)
         self.tracker.reset()
         self.withdraw()
         self.update_idletasks()
@@ -324,6 +328,8 @@ class HuahuaApp(tk.Tk):
     def toggle_auto_follow(self) -> None:
         if self.auto_follow_var.get():
             self.auto_follow_generation += 1
+            self.auto_follow_last_sequence = 0
+            self.auto_follow_busy = False
             self.status_var.set("自动跟随已开启：请把工具窗口移到游戏窗口外，避免识别到工具自身。")
             self._set_notice("自动跟随已开启：工具窗口如果盖住游戏，会暂停识别，不会遮挡你的点击。", "success")
             self._schedule_auto_follow(delay_ms=50)
@@ -332,6 +338,7 @@ class HuahuaApp(tk.Tk):
             if self.auto_follow_after_id is not None:
                 self.after_cancel(self.auto_follow_after_id)
                 self.auto_follow_after_id = None
+            self._stop_auto_follow_pump()
             self.auto_follow_busy = False
             self.auto_follow_overlap_paused = False
             self.status_var.set("自动跟随已关闭。")
@@ -640,6 +647,31 @@ class HuahuaApp(tk.Tk):
         interval = delay_ms if delay_ms is not None else max(300, int(self.auto_follow_interval_var.get() or 1000))
         self.auto_follow_after_id = self.after(interval, self._auto_follow_tick)
 
+    def _start_auto_follow_pump(self) -> None:
+        if self.auto_follow_pump is None:
+            self.auto_follow_pump = FramePump(
+                capture_func=default_auto_capture,
+                analyze_func=self.tracker.analyze_quick,
+                needs_full_refresh=self._needs_stage2_brush_refresh,
+                full_analyze_func=self.tracker.analyze,
+                maybe_save_frame=self._maybe_save_auto_frame,
+            )
+        interval_ms = max(200, int(self.auto_follow_interval_var.get() or 500))
+        self.auto_follow_pump.start(interval=interval_ms / 1000.0)
+
+    def _stop_auto_follow_pump(self, *, wait: bool = False) -> None:
+        if self.auto_follow_pump is not None:
+            self.auto_follow_pump.stop(wait=wait)
+        self.auto_follow_pump = None
+        self.auto_follow_last_sequence = 0
+
+    def _maybe_save_auto_frame(self, frame) -> float:
+        if not bool(config_value("debug.save_fast_captures", False)):
+            return 0.0
+        write_started_at = time.perf_counter()
+        write_image("runtime/capture_auto.png", frame)
+        return time.perf_counter() - write_started_at
+
     def _auto_follow_tick(self) -> None:
         self.auto_follow_after_id = None
         if not self.auto_follow_var.get():
@@ -648,49 +680,42 @@ class HuahuaApp(tk.Tk):
             self._schedule_auto_follow()
             return
         if self._app_overlaps_game_window():
+            self._stop_auto_follow_pump()
             self.auto_follow_overlap_paused = True
             self.status_var.set("自动跟随暂停：工具窗口覆盖了游戏画面，请把工具移到游戏窗口外后会自动继续。")
             self._set_notice("自动跟随暂停：工具窗口覆盖了游戏画面。把工具移到游戏窗口外后会自动继续。", "warning")
             self._schedule_auto_follow(delay_ms=1000)
             return
         self.auto_follow_overlap_paused = False
-        self.auto_follow_busy = True
-        generation = self.auto_follow_generation
-        thread = threading.Thread(target=lambda: self._auto_follow_worker(generation), daemon=True)
-        thread.start()
+        if self.auto_follow_pump is None:
+            self._start_auto_follow_pump()
+        self._poll_auto_follow_pump(self.auto_follow_generation)
 
-    def _auto_follow_worker(self, generation: int) -> None:
-        try:
-            started_at = time.perf_counter()
-            capture_started_at = time.perf_counter()
-            capture = capture_target(
-                DEFAULT_WINDOW_TITLE,
-                fallback_to_screen=True,
-                fallback_if_target_uncaptureable=False,
-                activate=False,
-            )
-            capture_elapsed = time.perf_counter() - capture_started_at
-            frame = capture.image
-            write_elapsed = 0.0
-            if bool(config_value("debug.save_fast_captures", False)):
-                write_started_at = time.perf_counter()
-                write_image("runtime/capture_auto.png", frame)
-                write_elapsed = time.perf_counter() - write_started_at
-            analysis_started_at = time.perf_counter()
-            scene = self.tracker.analyze_quick(frame)
-            analysis_elapsed = time.perf_counter() - analysis_started_at
-            full_refresh_elapsed = 0.0
-            if self._needs_stage2_brush_refresh():
-                full_started_at = time.perf_counter()
-                scene = self.tracker.analyze(frame)
-                full_refresh_elapsed = time.perf_counter() - full_started_at
-            elapsed = time.perf_counter() - started_at
-            perf = _fast_capture_perf(capture_elapsed, analysis_elapsed, write_elapsed, full_refresh_elapsed)
-        except Exception as exc:
-            self.after(0, lambda: self._auto_follow_error(exc, generation))
+    def _poll_auto_follow_pump(self, generation: int) -> None:
+        if not self.auto_follow_var.get() or generation != self.auto_follow_generation:
             return
-        capture_size = _capture_image_size(frame)
-        self.after(0, lambda: self._render_auto_follow_result(scene, capture.source, elapsed, capture.window, capture_size, generation, perf))
+        pump = self.auto_follow_pump
+        if pump is None:
+            self._schedule_auto_follow(delay_ms=500)
+            return
+        result = pump.pop_latest(self.auto_follow_last_sequence)
+        if result is None:
+            self._schedule_auto_follow(delay_ms=80)
+            return
+        self.auto_follow_last_sequence = result.sequence
+        if result.error:
+            self._auto_follow_error(RuntimeError(result.error), generation)
+            return
+        capture_size = _capture_shape_size(result.frame_shape)
+        self._render_auto_follow_result(
+            result.scene,
+            result.capture.source,
+            result.elapsed,
+            result.capture.window,
+            capture_size,
+            generation,
+            result.perf,
+        )
 
     def _auto_follow_error(self, exc: Exception, generation: int) -> None:
         if generation != self.auto_follow_generation or not self.auto_follow_var.get():
@@ -704,6 +729,7 @@ class HuahuaApp(tk.Tk):
         self.status_var.set("正在快速获取棋盘状态...")
         self._set_notice("正在快速获取：跳过 OCR，优先给出 1 秒级局面建议。", "info")
         self.auto_follow_generation += 1
+        self._stop_auto_follow_pump(wait=True)
         self.withdraw()
         self.update_idletasks()
         thread = threading.Thread(target=self._quick_capture_worker, daemon=True)
@@ -3292,6 +3318,7 @@ class HuahuaApp(tk.Tk):
         if self.auto_follow_after_id is not None:
             self.after_cancel(self.auto_follow_after_id)
             self.auto_follow_after_id = None
+        self._stop_auto_follow_pump()
         self.destroy()
 
 
@@ -4539,6 +4566,15 @@ def _format_finish_quality(quality: dict) -> str:
 
 def _capture_image_size(image) -> tuple[int, int] | None:
     shape = getattr(image, "shape", None)
+    if shape is None or len(shape) < 2:
+        return None
+    height, width = int(shape[0]), int(shape[1])
+    if width <= 0 or height <= 0:
+        return None
+    return width, height
+
+
+def _capture_shape_size(shape: tuple[int, ...] | None) -> tuple[int, int] | None:
     if shape is None or len(shape) < 2:
         return None
     height, width = int(shape[0]), int(shape[1])

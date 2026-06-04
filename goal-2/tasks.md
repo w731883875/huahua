@@ -25,12 +25,12 @@
 - Next step: Task 4 should add a realtime frame-pump prototype that keeps only the newest frame, records capture timing, and gives the later fast-vision/event/state-machine layers a stable 0.5-second observation loop.
 
 ## Task 4 - Frame Pump Prototype
-- Status: pending
+- Status: completed
 - Goal: Add realtime observation loop prototype that keeps only the latest frame, avoids frame queue buildup, and records capture timing.
-- Work performed:
-- Validation evidence:
-- Remaining risk:
-- Next step:
+- Work performed: Added `huahua_assistant/frame_pump.py` with a background `FramePump` loop that captures, runs quick analysis, optionally performs the existing stage-2 full refresh, records capture/analysis/write/full-refresh/pump interval timing, and stores only the latest `FramePumpResult`. Integrated auto-follow in `HuahuaApp` so UI ticks now consume the newest pump result instead of launching a new worker thread per tick. Auto-follow starts the pump only after the tool window overlap check passes, stops it when overlap pause occurs, stops it on manual full/quick capture, and stops it on app close. Removed the old auto-follow worker path to avoid two competing realtime routes.
+- Validation evidence: Ran `python -m compileall huahua_assistant run_app.py` successfully. Ran `git diff --check` successfully with only CRLF normalization warnings for `app.py`. Confirmed `rg "_auto_follow_worker|threading.Thread\(target=lambda: self._auto_follow_worker" -n huahua_assistant\app.py huahua_assistant\frame_pump.py` no longer finds old auto-follow worker usage, while `FramePumpResult` remains in the pump module. Reviewed the diff to confirm runtime/debug/pycache files are not part of the intended source changes.
+- Remaining risk: This is still a prototype loop. It reuses current `VisionTracker.analyze_quick`, so real 0.5-second feedback depends on capture and quick-analysis cost on the user's machine. Desktop-pet marker hiding before every individual pump frame is not yet coordinated; the pump starts only after overlap checks, but future pet-state work must keep overlays/pets from polluting composed capture modes. Live in-game timing was not measured in this task.
+- Next step: Task 5 should define a lightweight fast-vision result model so later event detection and pet state can consume stable, OCR-light board/backpack/brush summaries instead of the full scene object.
 
 ## Task 5 - FastVision Result Model
 - Status: pending

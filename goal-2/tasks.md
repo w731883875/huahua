@@ -33,12 +33,12 @@
 - Next step: Task 5 should define a lightweight fast-vision result model so later event detection and pet state can consume stable, OCR-light board/backpack/brush summaries instead of the full scene object.
 
 ## Task 5 - FastVision Result Model
-- Status: pending
+- Status: completed
 - Goal: Build lightweight fast-vision result structure that reuses board/backpack/brush ROI and skips OCR.
-- Work performed:
-- Validation evidence:
-- Remaining risk:
-- Next step:
+- Work performed: Added `huahua_assistant/fast_vision.py` with lightweight immutable models: `FastVisionSnapshot`, `FastTile`, `FastBackpackPaint`, `FastCurrentPaint`, and `FastBrush`. Added `snapshot_from_scene()` to compress a `SceneObservation` into board/paint/backpack signatures, terrain counts, compact ROI rectangles, current-paint summary, brush-stage summary, and reliability reasons. Integrated snapshots into `FramePumpResult` so the realtime pump emits both the existing full scene and a compact OCR-light snapshot. Added `HuahuaApp.last_fast_snapshot` and update points for quick capture and auto-follow.
+- Validation evidence: Ran `python -m compileall huahua_assistant run_app.py` successfully. Ran `git diff --check` successfully with only CRLF normalization warnings. Ran a minimal in-memory snapshot construction command and got a stable signature with `blank=36`, `reliable=True`, and no reasons. `rg "FastVisionSnapshot|snapshot_from_scene|last_fast_snapshot|snapshot" -n huahua_assistant` shows the expected model, pump, and app integration points.
+- Remaining risk: The snapshot currently wraps existing quick-scene recognition; it does not yet perform independent ROI-only CV extraction, so recognition speed is still governed by `VisionTracker.analyze_quick`. Reliability thresholds are conservative starting points and may need tuning against real captures. Event detection is not implemented yet; this task only provides the compact data object for it.
+- Next step: Task 6 should run the second major check/debug cycle to verify the realtime pump plus FastVision snapshot do not break old complete/quick paths, then Task 7 can build event detection on top of snapshot signature changes.
 
 ## Task 6 - Major Check 2
 - Status: pending

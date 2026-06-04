@@ -8,6 +8,7 @@ from typing import Callable
 import numpy as np
 
 from .capture import CaptureResult, capture_target
+from .fast_vision import FastVisionSnapshot, snapshot_from_scene
 from .models import SceneObservation
 
 
@@ -17,6 +18,7 @@ class FramePumpResult:
     capture: CaptureResult
     frame_shape: tuple[int, int, int] | None
     scene: SceneObservation | None
+    snapshot: FastVisionSnapshot | None
     elapsed: float
     perf: dict
     error: str | None = None
@@ -103,6 +105,7 @@ class FramePump:
                 capture=capture,
                 frame_shape=tuple(int(item) for item in frame.shape),
                 scene=scene,
+                snapshot=snapshot_from_scene(scene),
                 elapsed=time.perf_counter() - started_at,
                 perf={
                     "capture": round(capture_elapsed, 3),
@@ -118,6 +121,7 @@ class FramePump:
                 capture=CaptureResult(image=np.zeros((1, 1, 3), dtype=np.uint8), source="frame-pump:error"),
                 frame_shape=None,
                 scene=None,
+                snapshot=None,
                 elapsed=time.perf_counter() - started_at,
                 perf={
                     "capture": round(capture_elapsed, 3),

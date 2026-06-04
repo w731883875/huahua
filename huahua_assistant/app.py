@@ -97,6 +97,8 @@ class HuahuaApp(tk.Tk):
         )
         self.notice_var = tk.StringVar(value="提示：关键风险和高价值记录会显示在这里。")
         self.notice_label: tk.Label | None = None
+        self.perf_var = tk.StringVar(value="性能：等待识别")
+        self.perf_label: tk.Label | None = None
         self.board_var = tk.StringVar(value="局面：尚未识别")
         self.debug_path = Path("runtime/debug.png")
         self.current_scene: SceneObservation | None = None
@@ -157,6 +159,8 @@ class HuahuaApp(tk.Tk):
         self.last_high_value_key: str | None = None
         self.last_finish_skip_reason: str | None = None
         self.last_finish_diagnostic: dict | None = None
+        self.last_perf: dict = {}
+        self.last_desktop_pet_perf: dict = {}
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -283,6 +287,20 @@ class HuahuaApp(tk.Tk):
         self.notice_label.pack(fill=tk.X, padx=14, pady=(0, 6))
         self._set_notice("提示：完整识别建立地图；快速获取/自动跟随用于实战节奏。低置信度不会写入高分轨迹。", "info")
 
+        self.perf_label = tk.Label(
+            self,
+            textvariable=self.perf_var,
+            anchor="w",
+            justify=tk.LEFT,
+            padx=10,
+            pady=5,
+            fg="#d7e3ee",
+            bg="#162232",
+            font=("Microsoft YaHei UI", 9),
+            wraplength=1120,
+        )
+        self.perf_label.pack(fill=tk.X, padx=14, pady=(0, 6))
+
         body = tk.Frame(self, bg="#101820")
         body.pack(fill=tk.BOTH, expand=True, padx=14, pady=8)
 
@@ -320,6 +338,41 @@ class HuahuaApp(tk.Tk):
         self.notice_var.set(message)
         if self.notice_label is not None:
             self.notice_label.configure(bg=bg, fg=fg)
+
+    def _update_perf_panel(
+        self,
+        *,
+        mode: str | None = None,
+        elapsed: float | None = None,
+        capture_source: str | None = None,
+        capture_perf: dict | None = None,
+        recommendation_elapsed: float | None = None,
+    ) -> None:
+        perf = dict(self.last_perf)
+        if mode is not None:
+            perf["mode"] = mode
+        if elapsed is not None:
+            perf["elapsed"] = round(float(elapsed), 3)
+        if capture_source is not None:
+            perf["source"] = capture_source
+        if capture_perf is not None:
+            perf["capture_perf"] = dict(capture_perf)
+        if recommendation_elapsed is not None:
+            perf["recommendation"] = round(float(recommendation_elapsed), 3)
+        quality = self.last_capture_quality
+        if quality is not None:
+            perf["quality_ok"] = bool(quality.get("ok"))
+            perf["quality_score"] = quality.get("score")
+            perf["quality_reason"] = quality.get("reason")
+        pet_state = self.last_pet_state
+        if pet_state is not None:
+            perf["pet_state"] = pet_state.mode
+            perf["pet_message"] = pet_state.message
+        pet_perf = getattr(self, "last_desktop_pet_perf", None)
+        if isinstance(pet_perf, dict):
+            perf["pet_render"] = pet_perf.get("render")
+        self.last_perf = perf
+        self.perf_var.set(_format_perf_panel(perf))
 
     def capture_async(self) -> None:
         self.status_var.set("正在完整识别游戏窗口...")
@@ -844,6 +897,8 @@ class HuahuaApp(tk.Tk):
             self.install_plan = None
             self._update_fast_snapshot(None)
             self._clear_brush_choice()
+            self.last_capture_quality = None
+            self._update_perf_panel(mode="完整识别", elapsed=elapsed, capture_source=capture_source)
             self.board_var.set("局面：未识别到棋盘")
             self.status_var.set(f"来源：{capture_source}。未找到棋盘。{elapsed:.2f}s。调试图：{debug_path}")
             self._draw_empty_grid()
@@ -870,9 +925,17 @@ class HuahuaApp(tk.Tk):
             )
         self._clear_brush_choice()
         self._apply_detected_brush_options(scene.brush_options)
+        recommendation_started_at = time.perf_counter()
         self.recommendations = recommend_placements(self.current_state, learning_stats=load_learning_stats())
         self.install_plan = recommend_install_plan(self.current_state)
+        recommendation_elapsed = time.perf_counter() - recommendation_started_at
         self._update_fast_snapshot(snapshot_from_scene(scene))
+        self._update_perf_panel(
+            mode="完整识别",
+            elapsed=elapsed,
+            capture_source=capture_source,
+            recommendation_elapsed=recommendation_elapsed,
+        )
         high_value_notice = self._record_high_value_seen(
             scene,
             self.current_state,
@@ -954,6 +1017,9 @@ class HuahuaApp(tk.Tk):
         if scene is None:
             prefix = "自动跟随" if auto else "快速获取"
             perf_text = _format_fast_capture_perf(capture_perf)
+            self.last_capture_quality = None
+            self.last_pet_state = PetBrainState(mode="observing", message="等待识别", confidence=0.2)
+            self._update_perf_panel(mode=prefix, elapsed=elapsed, capture_source=capture_source, capture_perf=capture_perf)
             self.status_var.set(f"{prefix}：未找到棋盘。来源={capture_source}，耗时={elapsed:.2f}s。{perf_text}")
             return
 
@@ -997,11 +1063,20 @@ class HuahuaApp(tk.Tk):
         self.last_capture_quality = None
         self.last_rule_anomalies = []
         self._merge_quick_brush_stage2(scene.brush_options)
+        recommendation_started_at = time.perf_counter()
         self.recommendations = recommend_placements(self.current_state, learning_stats=load_learning_stats())
         self.install_plan = recommend_install_plan(self.current_state)
+        recommendation_elapsed = time.perf_counter() - recommendation_started_at
         quick_quality = _quick_capture_quality(scene, elapsed, capture_perf, capture_source=capture_source)
         self.last_capture_quality = quick_quality
         self.last_pet_state = evaluate_pet_state(self)
+        self._update_perf_panel(
+            mode="自动跟随" if auto else "快速获取",
+            elapsed=elapsed,
+            capture_source=capture_source,
+            capture_perf=capture_perf,
+            recommendation_elapsed=recommendation_elapsed,
+        )
         quick_saved = self._record_quick_capture_step(
             scene,
             self.current_state,
@@ -1160,6 +1235,9 @@ class HuahuaApp(tk.Tk):
         self.last_fast_snapshot = None
         self.last_fast_events = ()
         self.last_pet_state = None
+        self.last_capture_quality = None
+        self.last_perf = {}
+        self._update_perf_panel(mode="新局", elapsed=0.0)
         self.recommendations = []
         self.install_plan = None
         self.selected_backpack_index = None
@@ -2952,7 +3030,9 @@ class HuahuaApp(tk.Tk):
         self.region_text.configure(state=tk.NORMAL)
         self.region_text.delete("1.0", tk.END)
         if scene is None:
-            self.region_text.insert(tk.END, "识别区域\n\n无")
+            self.region_text.insert(tk.END, "识别区域\n\n")
+            self._write_perf_debug()
+            self.region_text.insert(tk.END, "无")
             self.region_text.configure(state=tk.DISABLED)
             return
 
@@ -2966,6 +3046,7 @@ class HuahuaApp(tk.Tk):
             RegionKind.REFRESH_AFFIX: "刷新词缀",
         }
         self.region_text.insert(tk.END, "识别区域\n\n")
+        self._write_perf_debug()
         if self.manual_correction_applied:
             self.region_text.insert(tk.END, "已应用人工纠错\n当前局面已使用纠错值重算；上方识别区域仍保留原始截图识别值。\n\n")
         self.region_text.insert(
@@ -3047,6 +3128,12 @@ class HuahuaApp(tk.Tk):
         self._write_brush_recommendations()
         self._write_special_actions()
         self.region_text.configure(state=tk.DISABLED)
+
+    def _write_perf_debug(self) -> None:
+        self.region_text.insert(tk.END, "性能面板\n")
+        for line in _format_perf_details(self.last_perf):
+            self.region_text.insert(tk.END, f"{line}\n")
+        self.region_text.insert(tk.END, "\n")
 
     def _write_coordinate_debug(self, scene: SceneObservation) -> None:
         window = self.last_capture_window
@@ -4670,6 +4757,68 @@ def _format_fast_capture_perf(perf: dict | None) -> str:
     if full_refresh > 0.01:
         parts.append(f"完整补读={full_refresh:.2f}s")
     return "耗时拆分：" + "，".join(parts) + "。"
+
+
+def _format_perf_panel(perf: dict) -> str:
+    if not perf:
+        return "性能：等待识别"
+    mode = str(perf.get("mode") or "-")
+    elapsed = _format_seconds(perf.get("elapsed"))
+    capture_perf = perf.get("capture_perf") if isinstance(perf.get("capture_perf"), dict) else {}
+    capture = _format_seconds(capture_perf.get("capture"))
+    analysis = _format_seconds(capture_perf.get("analysis"))
+    recommendation = _format_seconds(perf.get("recommendation"))
+    pet = _format_seconds(perf.get("pet_render"))
+    quality = "通过" if perf.get("quality_ok") is True else "暂缓" if perf.get("quality_ok") is False else "-"
+    pet_message = str(perf.get("pet_message") or "-")
+    source = _short_source(perf.get("source"))
+    return (
+        f"性能：{mode} 总={elapsed} 截图={capture} 分析={analysis} "
+        f"推荐={recommendation} 桌宠={pet} 质量={quality} 桌宠状态={pet_message} 来源={source}"
+    )
+
+
+def _format_perf_details(perf: dict) -> list[str]:
+    if not perf:
+        return ["等待识别"]
+    capture_perf = perf.get("capture_perf") if isinstance(perf.get("capture_perf"), dict) else {}
+    lines = [
+        f"模式={perf.get('mode', '-')}",
+        f"总耗时={_format_seconds(perf.get('elapsed'))}",
+        f"截图={_format_seconds(capture_perf.get('capture'))} 分析={_format_seconds(capture_perf.get('analysis'))}",
+        f"写图={_format_seconds(capture_perf.get('write'))} 完整补读={_format_seconds(capture_perf.get('full_refresh'))}",
+        f"推荐={_format_seconds(perf.get('recommendation'))} 桌宠渲染={_format_seconds(perf.get('pet_render'))}",
+        f"质量={'通过' if perf.get('quality_ok') is True else '暂缓' if perf.get('quality_ok') is False else '-'} 评分={_format_score(perf.get('quality_score'))}",
+        f"原因={perf.get('quality_reason', '-')}",
+        f"桌宠={perf.get('pet_state', '-')} / {perf.get('pet_message', '-')}",
+        f"来源={perf.get('source', '-')}",
+    ]
+    if capture_perf.get("pump_interval") is not None:
+        lines.insert(4, f"帧泵间隔={_format_seconds(capture_perf.get('pump_interval'))}")
+    return lines
+
+
+def _format_seconds(value) -> str:
+    if isinstance(value, (int, float)):
+        return f"{float(value):.2f}s"
+    return "-"
+
+
+def _format_score(value) -> str:
+    if isinstance(value, (int, float)):
+        return f"{float(value):.2f}"
+    return "-"
+
+
+def _short_source(source) -> str:
+    text = str(source or "-")
+    if text.startswith("window-content"):
+        return "窗口内容"
+    if text.startswith("window-screen"):
+        return "桌面区域"
+    if text.startswith("screen:fallback"):
+        return "桌面兜底"
+    return text[:24]
 
 
 def _scene_has_finish_evidence(scene: SceneObservation | None, state: PuzzleState | None) -> bool:

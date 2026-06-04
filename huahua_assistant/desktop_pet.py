@@ -1121,6 +1121,7 @@ def install_desktop_pet_markers(app_cls: type) -> None:
         return existing
 
     def show_actor(self) -> None:
+        started_at = time.perf_counter()
         try:
             pet_state = evaluate_pet_state(self)
             setattr(self, "last_pet_state", pet_state)
@@ -1128,6 +1129,10 @@ def install_desktop_pet_markers(app_cls: type) -> None:
             if hasattr(self, "desktop_pet_drag_var"):
                 actor(self).set_draggable(bool(self.desktop_pet_drag_var.get()))
             actor(self).show(active=active, window_info=getattr(self, "last_capture_window", None), pet_state=pet_state)
+            setattr(self, "last_desktop_pet_perf", {"render": round(time.perf_counter() - started_at, 3)})
+            update_perf = getattr(self, "_update_perf_panel", None)
+            if callable(update_perf):
+                update_perf()
         except tk.TclError:
             return
 

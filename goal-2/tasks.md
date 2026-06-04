@@ -73,12 +73,12 @@
 - Next step: Task 10 should add a performance panel showing capture, fast CV, recommendation, desktop-pet update timing, latest pet state, and source/quality reason so the 0.5s target can be measured directly in real use.
 
 ## Task 10 - Performance Panel
-- Status: pending
+- Status: completed
 - Goal: Show capture, fast CV, recommendation, desktop-pet update timing, and latest state in the UI to support the 0.5s target.
-- Work performed:
-- Validation evidence:
-- Remaining risk:
-- Next step:
+- Work performed: Added a compact Chinese performance strip below the notice banner and a detailed `性能面板` block at the top of the right-side diagnostics. The panel tracks mode, total elapsed time, capture source, capture/analysis/write/full-refresh/pump interval timing from fast paths, recommendation timing, latest quality gate result/reason, latest pet state/message, and desktop-pet render time. Integrated updates for complete recognition, quick recognition, auto-follow results, no-board fast results, new-session reset, and desktop-pet render callbacks. Desktop-pet `show_actor` now measures render/update cost and feeds it back into the app performance panel without changing click-through behavior or learning records.
+- Validation evidence: Ran `python -m compileall huahua_assistant run_app.py` successfully. Ran `git diff --check` successfully with only CRLF normalization warnings. Smoke-tested `_format_perf_panel` and `_format_perf_details` with a synthetic auto-follow perf payload and got visible capture/analysis/recommendation/pet timings plus source and quality. Smoke-tested empty perf output as `性能：等待识别` and unsafe `screen:fallback` output as quality `暂缓` with source `桌面兜底` and pet state `截图不稳`. `rg "_update_perf_panel|perf_var|last_perf|last_desktop_pet_perf|_format_perf_panel|_format_perf_details" -n huahua_assistant` shows expected app and desktop-pet integration points.
+- Remaining risk: Complete recognition still reports only total elapsed/source, not internal OCR sub-stage timing; the 0.5s target is primarily for quick/auto-follow paths where capture/analysis/recommendation/pet timing is now visible. Live in-game latency must still be measured by running the tool against the user's actual game window.
+- Next step: Task 11 should strengthen trust gates and learning safety so untrusted fast-loop frames and diagnostic-only events cannot pollute high-score trajectories while still preserving useful real observation signals.
 
 ## Task 11 - Trust Gate And Learning Safety
 - Status: pending

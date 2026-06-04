@@ -49,12 +49,12 @@
 - Next step: Task 7 should implement an event detector over consecutive `FastVisionSnapshot` objects for board changes, backpack appearance/disappearance, current paint changes, brush-stage changes, and finish-drawing candidates.
 
 ## Task 7 - Event Detector
-- Status: pending
+- Status: completed
 - Goal: Detect events from fast frame changes: board change, backpack appearance, selected state, new current paint, brush stage, finish-drawing candidate.
-- Work performed:
-- Validation evidence:
-- Remaining risk:
-- Next step:
+- Work performed: Added `huahua_assistant/fast_events.py` with `FastVisionEvent` and `detect_fast_events(previous, current)`. The detector emits snapshot-ready, board-changed, paint-changed, backpack-appeared/disappeared/changed, conservative selection-state-changed, current-paint appeared/disappeared/changed, brush-stage appeared/disappeared/changed, and finish-candidate events. Integrated event state into `HuahuaApp` through `previous_fast_snapshot`, `last_fast_snapshot`, `last_fast_events`, and `_update_fast_snapshot()`. Reset fast-event state when starting a new real session. Kept events in memory only; they are not written into learning trajectories.
+- Validation evidence: Ran `python -m compileall huahua_assistant run_app.py` successfully. Ran `git diff --check` successfully with only CRLF normalization warnings. Ran an in-memory board-change test and got `['board_changed', 'paint_changed', 'finish_candidate']`. Ran an in-memory backpack fingerprint-only change test and got `['selection_state_changed']`. `rg "FastVisionEvent|detect_fast_events|last_fast_events|previous_fast_snapshot|_update_fast_snapshot" -n huahua_assistant` shows the expected model and app integration points.
+- Remaining risk: Selection detection is deliberately conservative because the current backpack model has no explicit selected-slot field; it infers a possible selection-state change from backpack fingerprint changes when logical backpack contents and board state remain stable. Finish candidates are hints, not authoritative settlement proof. Events are not yet consumed by a desktop-pet state machine.
+- Next step: Task 8 should add the desktop-pet state machine that consumes current recommendations plus `last_fast_events` to output observing, recommend-backpack, recommend-board-cell, recommend-brush, wait-for-drop, and finish-hint states.
 
 ## Task 8 - Pet Brain State Machine
 - Status: pending

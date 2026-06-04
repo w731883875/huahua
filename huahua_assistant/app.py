@@ -15,6 +15,7 @@ from tkinter import filedialog, messagebox
 from .capture import DEFAULT_WINDOW_TITLE, WindowInfo, capture_target, find_window, write_image
 from .config import config_value
 from .codes import affix_code, affix_display_from_code, brush_code, brush_payload_codes, compact_paint_with_code, compact_rule_with_code
+from .fast_events import FastVisionEvent, detect_fast_events
 from .fast_vision import FastVisionSnapshot, snapshot_from_scene
 from .frame_pump import FramePump, default_auto_capture
 from .game_model import (
@@ -124,6 +125,8 @@ class HuahuaApp(tk.Tk):
         self.last_capture_window: WindowInfo | None = None
         self.last_capture_size: tuple[int, int] | None = None
         self.last_fast_snapshot: FastVisionSnapshot | None = None
+        self.previous_fast_snapshot: FastVisionSnapshot | None = None
+        self.last_fast_events: tuple[FastVisionEvent, ...] = ()
         self.tracker = VisionTracker()
         self.detected_backpack_cache: dict[str, tuple[Paint, float]] = {}
         self.backpack_session_key: str | None = None
@@ -523,6 +526,17 @@ class HuahuaApp(tk.Tk):
         self.last_capture_window = window
         self.last_capture_size = capture_size if _valid_capture_size(capture_size) else None
 
+    def _update_fast_snapshot(self, snapshot: FastVisionSnapshot | None) -> None:
+        if snapshot is None:
+            self.previous_fast_snapshot = self.last_fast_snapshot
+            self.last_fast_snapshot = None
+            self.last_fast_events = ()
+            return
+        previous = self.last_fast_snapshot
+        self.previous_fast_snapshot = previous
+        self.last_fast_snapshot = snapshot
+        self.last_fast_events = detect_fast_events(previous, snapshot)
+
     def _screen_point_from_capture_point(self, x: float, y: float) -> tuple[int, int] | None:
         local = self._window_local_point_from_capture_point(x, y)
         if local is None:
@@ -705,7 +719,7 @@ class HuahuaApp(tk.Tk):
             self._schedule_auto_follow(delay_ms=80)
             return
         self.auto_follow_last_sequence = result.sequence
-        self.last_fast_snapshot = result.snapshot
+        self._update_fast_snapshot(result.snapshot)
         if result.error:
             self._auto_follow_error(RuntimeError(result.error), generation)
             return
@@ -898,7 +912,7 @@ class HuahuaApp(tk.Tk):
     ) -> None:
         self._restore_app_window()
         self._set_last_capture_context(capture_window, capture_size)
-        self.last_fast_snapshot = snapshot_from_scene(scene)
+        self._update_fast_snapshot(snapshot_from_scene(scene))
         self._render_fast_scene_result(scene, capture_source, elapsed, auto=False, capture_perf=capture_perf)
 
     def _render_auto_follow_result(
@@ -915,7 +929,7 @@ class HuahuaApp(tk.Tk):
             self.auto_follow_busy = False
             return
         try:
-            self.last_fast_snapshot = snapshot_from_scene(scene)
+            self._update_fast_snapshot(snapshot_from_scene(scene))
             self._set_last_capture_context(capture_window, capture_size)
             self._render_fast_scene_result(scene, capture_source, elapsed, auto=True, capture_perf=capture_perf)
         finally:
@@ -1129,6 +1143,9 @@ class HuahuaApp(tk.Tk):
         self.real_session_finished = False
         self.current_scene = None
         self.current_state = None
+        self.previous_fast_snapshot = None
+        self.last_fast_snapshot = None
+        self.last_fast_events = ()
         self.recommendations = []
         self.install_plan = None
         self.selected_backpack_index = None

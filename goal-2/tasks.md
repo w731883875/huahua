@@ -81,12 +81,12 @@
 - Next step: Task 11 should strengthen trust gates and learning safety so untrusted fast-loop frames and diagnostic-only events cannot pollute high-score trajectories while still preserving useful real observation signals.
 
 ## Task 11 - Trust Gate And Learning Safety
-- Status: pending
+- Status: completed
 - Goal: Ensure untrusted fast-loop results do not pollute real high-score trajectories, while recording explainable observation events.
-- Work performed:
-- Validation evidence:
-- Remaining risk:
-- Next step:
+- Work performed: Added unified trajectory trust helpers in `huahua_assistant/app.py` so only captures with `quality.ok is True` can become real trajectory steps. Low-quality full/auto captures are now recorded as `capture_step_ignored` observations and never appended to `real_trajectory_steps`, even when finish evidence is visible. Tentative current-paint placement confirmation now rejects untrusted pending/current steps and records `trajectory_step_ignored` diagnostics instead. Finish scoring now uses `_best_trusted_terminal_summary`, which prevents a low-quality latest frame from contributing high-value terminal paints; saved trajectory payloads include only trusted steps. Added storage-level protection in `huahua_assistant/learning.py` so `record_high_score_trajectory`, export, merge, and stats ignore trajectories unless every saved step is trusted real-capture data. Added `trajectory_step_ignored` to learning stats and surfaced it in the UI as trust-gate interception count.
+- Validation evidence: Ran `python -m compileall huahua_assistant run_app.py` successfully. Ran `git diff --check` successfully with only CRLF normalization warnings. Smoke-tested trusted terminal selection: a low-quality current frame containing a Lv7 treasure did not override a trusted previous Monster Lv7 step, while a trusted current frame did count the Lv7 treasure. Smoke-tested quality helper returning true only for `{'ok': True}`. Smoke-tested finish reliability rejecting empty steps. Smoke-tested learning storage with a temporary runtime directory: simulation source, empty steps, and low-quality steps all returned `False`, while real source with trusted steps returned `True` and stats reported one trusted trajectory. Smoke-tested ignored-step stats counting `capture_step_ignored` and `trajectory_step_ignored` while filtering simulation events.
+- Remaining risk: This task hardens data safety but does not improve underlying recognition accuracy or live latency. If a frame is mistakenly marked `quality.ok=True` despite bad recognition, it can still enter the trusted path; future work should improve quality scoring with stronger board/backpack/template confidence and live replay validation.
+- Next step: Task 12 should perform the final review across UX, performance, data safety, rollback, packaging impact, and next-stage OCR throttling strategy.
 
 ## Task 12 - Final Review
 - Status: pending

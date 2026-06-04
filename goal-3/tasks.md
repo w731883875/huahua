@@ -17,12 +17,12 @@
 - Next step: Task 3 should perform the first major check to verify the new gate model does not break trust boundaries, old trajectory compatibility, compile, stats loading, or UI assumptions.
 
 ## Task 3 - Major Check 1
-- Status: pending
+- Status: completed
 - Goal: Verify gate changes do not break trust boundaries, old trajectory compatibility, compile, or stats loading.
-- Work performed:
-- Validation evidence:
-- Remaining risk:
-- Next step:
+- Work performed: Performed the first major check after the high-score gate model. Verified requirement alignment, trust boundaries, backward compatibility for older trajectory payloads, compile health, diff whitespace health, stats loading, and the current UI/stats assumption. No code fixes were required. Confirmed the gate keeps the user's intended initial high-score threshold: Lv6+ treasure/box or any Lv7+ paint. Confirmed the storage choke point still rejects simulation and low-quality real-capture payloads, and now also rejects payloads explicitly marked with `high_score_gate.passed=False`. Confirmed old trusted trajectories without `high_score_gate` remain countable for compatibility.
+- Validation evidence: Ran `python -m compileall huahua_assistant run_app.py` successfully. Ran `git diff --check` successfully. Smoke-tested `_high_score_gate()` with low-value, Lv6 treasure, and Lv7 paint terminal summaries: low-value returned `False/below_high_score_gate`, Lv6 treasure returned `True/treasure6_plus` with reasons `['treasure6_plus', 'score_3006']`, and Lv7 paint returned `True/level7_paint`. Smoke-tested `_should_save_auto_trajectory()` returning `(True, 'treasure6_plus')` for Lv6 treasure. Smoke-tested stats compatibility: old trusted trajectory counted as 1, a payload with `high_score_gate.passed=False` counted as 0, and a payload with `passed=True` aggregated `{'level7_paint': 1}` under `high_score_gate_primary`. Smoke-tested `record_high_score_trajectory()` returning `False` for `source='simulation'`, `False` for low-quality real capture, `False` for explicit gate failure, and `True` for trusted real capture with `high_score_gate.passed=True`. Smoke-tested `load_learning_stats()` on existing runtime logs; it loaded without errors and returned 4 trusted trajectories plus existing gate stats.
+- Remaining risk: New gate stats are aggregated but not yet shown prominently in the right-side UI or stats dialog; this is intentionally deferred to Task 8. Existing runtime stats include legacy primary reasons such as `score_6010`, `auto_settlement`, and `manual_finish`; this is expected because older trajectories predate structured high-score gates. Current compile refreshed `__pycache__` runtime artifacts, which remain uncommitted and should stay out of commits.
+- Next step: Task 4 should complete and review the trajectory payload metadata so every saved high-score trajectory carries enough compact state-action-result context for later imitation analysis.
 
 ## Task 4 - Complete Trajectory Payload Metadata
 - Status: pending

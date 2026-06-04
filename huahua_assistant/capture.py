@@ -6,7 +6,7 @@ from ctypes import wintypes
 from dataclasses import dataclass
 from os.path import basename
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Protocol
 
 import cv2
 import mss
@@ -55,6 +55,102 @@ class CaptureResult:
     window: WindowInfo | None = None
 
 
+class CaptureBackend(Protocol):
+    name: str
+
+    def capture_window_content(self, window: WindowInfo) -> tuple[np.ndarray | None, str]:
+        """Capture pixels owned by the target window, not composed desktop pixels."""
+
+    def capture_window_region(self, window: WindowInfo) -> tuple[np.ndarray | None, str]:
+        """Capture the target window rectangle from the composed desktop."""
+
+
+@dataclass(frozen=True)
+class CaptureBackendPlan:
+    name: str
+    content_backends: tuple[CaptureBackend, ...]
+    region_backends: tuple[CaptureBackend, ...]
+
+
+class LegacyCaptureBackend:
+    name = "legacy"
+
+    def capture_window_content(self, window: WindowInfo) -> tuple[np.ndarray | None, str]:
+        try:
+            image = _capture_window_print(window)
+        except Exception as exc:
+            return None, f"printwindow_error:{type(exc).__name__}"
+        if image is None:
+            return None, "printwindow_failed"
+        if not _looks_like_valid_capture(image):
+            return None, "printwindow_invalid"
+        return image, "printwindow"
+
+    def capture_window_region(self, window: WindowInfo) -> tuple[np.ndarray | None, str]:
+        region = {
+            "left": window.left,
+            "top": window.top,
+            "width": window.width,
+            "height": window.height,
+        }
+        try:
+            image = capture_screen(region)
+        except Exception as exc:
+            return None, f"mss_region_error:{type(exc).__name__}"
+        return image, "mss-region"
+
+
+class DxcamRegionCaptureBackend:
+    name = "dxcam"
+
+    def __init__(self) -> None:
+        self._camera = None
+        self._camera_error: str | None = None
+
+    def capture_window_content(self, window: WindowInfo) -> tuple[np.ndarray | None, str]:
+        return None, "window_content_unavailable"
+
+    def capture_window_region(self, window: WindowInfo) -> tuple[np.ndarray | None, str]:
+        camera, reason = self._get_camera()
+        if camera is None:
+            return None, reason
+
+        try:
+            image = camera.grab(region=(window.left, window.top, window.right, window.bottom))
+        except Exception as exc:
+            return None, f"dxcam_region_error:{type(exc).__name__}"
+        if image is None:
+            return None, "dxcam_region_failed"
+        image = np.ascontiguousarray(image)
+        if not _looks_like_valid_capture(image):
+            return None, "dxcam_region_invalid"
+        return image, "dxcam-region"
+
+    def _get_camera(self):
+        if self._camera is not None:
+            return self._camera, "dxcam"
+        if self._camera_error is not None:
+            return None, self._camera_error
+        try:
+            import dxcam  # type: ignore[import-not-found]
+        except Exception as exc:
+            self._camera_error = f"dxcam_unavailable:{type(exc).__name__}"
+            return None, self._camera_error
+        try:
+            self._camera = dxcam.create(output_color="BGR")
+        except Exception as exc:
+            self._camera_error = f"dxcam_create_error:{type(exc).__name__}"
+            return None, self._camera_error
+        if self._camera is None:
+            self._camera_error = "dxcam_create_failed"
+            return None, self._camera_error
+        return self._camera, "dxcam"
+
+
+_LEGACY_BACKEND = LegacyCaptureBackend()
+_DXCAM_BACKEND = DxcamRegionCaptureBackend()
+
+
 def capture_screen(region: dict[str, int] | None = None) -> np.ndarray:
     with mss.mss() as sct:
         target = region if region is not None else sct.monitors[1]
@@ -66,15 +162,31 @@ def capture_screen(region: dict[str, int] | None = None) -> np.ndarray:
 def capture_window_content(window: WindowInfo) -> tuple[np.ndarray | None, str]:
     """Capture window-owned pixels first so desktop overlays do not enter recognition."""
 
-    try:
-        image = _capture_window_print(window)
-    except Exception as exc:
-        return None, f"printwindow_error:{type(exc).__name__}"
-    if image is None:
-        return None, "printwindow_failed"
-    if not _looks_like_valid_capture(image):
-        return None, "printwindow_invalid"
-    return image, "printwindow"
+    return _LEGACY_BACKEND.capture_window_content(window)
+
+
+def resolve_capture_backend(backend: str | CaptureBackend | None = None) -> CaptureBackendPlan:
+    if backend is None:
+        backend = _capture_config_value("capture.backend", "auto")
+    if not isinstance(backend, str):
+        return CaptureBackendPlan(
+            name=getattr(backend, "name", backend.__class__.__name__),
+            content_backends=(backend,),
+            region_backends=(backend, _LEGACY_BACKEND),
+        )
+
+    requested = backend.strip().casefold() or "auto"
+    if requested in {"legacy", "printwindow", "mss"}:
+        return CaptureBackendPlan("legacy", (_LEGACY_BACKEND,), (_LEGACY_BACKEND,))
+    if requested in {"dxcam", "highspeed"}:
+        return CaptureBackendPlan(requested, (_DXCAM_BACKEND,), (_DXCAM_BACKEND, _LEGACY_BACKEND))
+    if requested == "auto":
+        highspeed_enabled = _capture_config_bool("capture.highspeed_enabled", False)
+        allow_composited = _capture_config_bool("capture.allow_composited_highspeed", False)
+        if highspeed_enabled and allow_composited:
+            return CaptureBackendPlan("auto", (_LEGACY_BACKEND,), (_DXCAM_BACKEND, _LEGACY_BACKEND))
+        return CaptureBackendPlan("auto", (_LEGACY_BACKEND,), (_LEGACY_BACKEND,))
+    raise ValueError(f"Unknown capture backend: {backend}")
 
 
 def capture_target(
@@ -83,7 +195,9 @@ def capture_target(
     fallback_if_target_uncaptureable: bool = False,
     activate: bool = True,
     activation_delay: float = 0.35,
+    backend: str | CaptureBackend | None = None,
 ) -> CaptureResult:
+    backend_plan = resolve_capture_backend(backend)
     candidates = _target_candidates(window_title)
     matches = find_matching_windows(candidates)
     for matched in matches:
@@ -104,24 +218,45 @@ def capture_target(
             refreshed_captureable = [item for item in refreshed_matches if item.captureable]
             if refreshed_captureable:
                 window = max(refreshed_captureable, key=lambda item: item.width * item.height)
-        internal_image, internal_method = capture_window_content(window)
-        if internal_image is not None:
+        attempts: list[str] = []
+        for capture_backend in backend_plan.content_backends:
+            internal_image, internal_method = capture_backend.capture_window_content(window)
+            attempts.append(f"{capture_backend.name}:{internal_method}")
+            if internal_image is not None:
+                return CaptureResult(
+                    image=internal_image,
+                    source=(
+                        f"window-content:{window.title} process:{window.process_name} "
+                        f"backend:{capture_backend.name} method:{internal_method}"
+                    ),
+                    window=window,
+                )
+
+        for capture_backend in backend_plan.region_backends:
+            region_image, region_method = capture_backend.capture_window_region(window)
+            attempts.append(f"{capture_backend.name}:{region_method}")
+            if region_image is not None:
+                return CaptureResult(
+                    image=region_image,
+                    source=(
+                        f"window-screen:{window.title} process:{window.process_name} "
+                        f"backend:{capture_backend.name} method:{region_method} "
+                        f"content_failed:{_format_capture_attempts(attempts)}"
+                    ),
+                    window=window,
+                )
+
+        failed = _format_capture_attempts(attempts)
+        if fallback_to_screen:
             return CaptureResult(
-                image=internal_image,
-                source=f"window-content:{window.title} process:{window.process_name} method:{internal_method}",
+                image=capture_screen(),
+                source=(
+                    f"screen:fallback window_capture_failed:{window.title} "
+                    f"process:{window.process_name} attempts:{failed}"
+                ),
                 window=window,
             )
-        region = {
-            "left": window.left,
-            "top": window.top,
-            "width": window.width,
-            "height": window.height,
-        }
-        return CaptureResult(
-            image=capture_screen(region),
-            source=f"window-screen:{window.title} process:{window.process_name} internal_failed:{internal_method}",
-            window=window,
-        )
+        raise RuntimeError(f"Window capture failed: {failed}")
 
     if matches:
         found = ", ".join(_window_summary(item) for item in matches)
@@ -141,6 +276,27 @@ def capture_target(
         image=capture_screen(),
         source=source,
     )
+
+
+def _capture_config_value(path: str, default):
+    try:
+        from .config import config_value
+    except Exception:
+        return default
+    return config_value(path, default)
+
+
+def _capture_config_bool(path: str, default: bool) -> bool:
+    value = _capture_config_value(path, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().casefold() in {"1", "true", "yes", "on", "enabled"}
+    return bool(value)
+
+
+def _format_capture_attempts(attempts: Iterable[str]) -> str:
+    return ",".join(item for item in attempts if item) or "none"
 
 
 def find_window(title_contains: str) -> WindowInfo | None:

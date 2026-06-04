@@ -74,6 +74,11 @@ DEFAULT_STRATEGY_CONFIG: dict[str, Any] = {
     "debug": {
         "save_fast_captures": False,
     },
+    "capture": {
+        "backend": "auto",
+        "highspeed_enabled": False,
+        "allow_composited_highspeed": False,
+    },
 }
 
 _CACHE: dict[str, Any] | None = None

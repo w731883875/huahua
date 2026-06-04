@@ -34,6 +34,12 @@ def main() -> None:
     capture.add_argument("--image", type=Path, default=Path("runtime/capture.png"))
     capture.add_argument("--debug", type=Path, default=Path("runtime/debug.png"))
     capture.add_argument("--window", default=DEFAULT_WINDOW_TITLE)
+    capture.add_argument(
+        "--backend",
+        default=None,
+        choices=["auto", "legacy", "dxcam", "highspeed"],
+        help="Capture backend. Default follows runtime config.",
+    )
     capture.add_argument("--no-fallback", action="store_true")
     capture.add_argument(
         "--fallback-uncaptureable",
@@ -64,6 +70,7 @@ def main() -> None:
             args.window,
             fallback_to_screen=not args.no_fallback,
             fallback_if_target_uncaptureable=args.fallback_uncaptureable,
+            backend=args.backend,
         )
         write_image(args.image, capture_result.image)
         scene, debug_path = analyze_and_save_debug(capture_result.image, args.debug)

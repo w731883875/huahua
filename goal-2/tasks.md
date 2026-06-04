@@ -17,12 +17,12 @@
 - Next step: Task 3 should perform the first major check/debug cycle to verify the abstraction did not drift from requirements, the old complete/quick recognition path still compiles, and dependency/fallback risk is documented.
 
 ## Task 3 - Major Check 1
-- Status: pending
+- Status: completed
 - Goal: Check whether Tasks 1-2 drifted from requirements; verify complete/quick recognition still runs; inspect dependency and fallback risk.
-- Work performed:
-- Validation evidence:
-- Remaining risk:
-- Next step:
+- Work performed: Performed the first major check/debug cycle after the baseline and capture-backend abstraction. Confirmed the app still calls `capture_target(... activate=False)` from full capture, quick capture, and auto-follow without requiring the new backend parameter. Confirmed default backend resolution is `auto` with only `legacy` content/region backends, so optional high-speed composited capture is not silently enabled. Checked desktop-pet marker patch still hides marker surfaces before full/quick/auto-follow captures. Checked real learning writes still pass through `record_observation`, `record_correction`, and `record_high_score_trajectory` gates that ignore non-`real_capture` sources, and quick capture still records low-confidence frames as `quick_capture_ignored` instead of trajectory steps.
+- Validation evidence: Ran `python -B -c "from huahua_assistant.capture import resolve_capture_backend; p=resolve_capture_backend(); print(p.name, [b.name for b in p.content_backends], [b.name for b in p.region_backends])"` and got `auto ['legacy'] ['legacy']`. Ran `python -m compileall huahua_assistant run_app.py` successfully. Ran `git diff --check` successfully. `rg "capture_target\(" -n huahua_assistant run_app.py` shows only the expected app/CLI/capture definition call sites. Inspected `desktop_pet.py` patched capture hooks and `learning.py` real-capture guards.
+- Remaining risk: The objective is not complete yet. Auto-follow still starts a worker per tick and can feel bursty; there is no latest-frame pump yet. `dxcam` remains optional and, if explicitly enabled later, can capture desktop composition including overlays unless coordinated with hiding/region safety. No live game-window runtime test was performed in this check because the task was code-path validation.
+- Next step: Task 4 should add a realtime frame-pump prototype that keeps only the newest frame, records capture timing, and gives the later fast-vision/event/state-machine layers a stable 0.5-second observation loop.
 
 ## Task 4 - Frame Pump Prototype
 - Status: pending

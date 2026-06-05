@@ -49,12 +49,12 @@
 - Next step: Task 7 should implement unknown/new affix collection from real brush recognition, counting recognized stage2 strings that do not map to known affix codes and keeping noisy samples separate from recommendation priors until enough evidence exists.
 
 ## Task 7 - Unknown/New Affix Collection
-- Status: pending
+- Status: completed
 - Goal: Record and report recognized brush/affix strings that do not map to known catalog codes, with counts and confidence samples.
-- Work performed:
-- Validation evidence:
-- Remaining risk:
-- Next step:
+- Work performed: Added unknown/new brush and affix aggregation in `huahua_assistant/learning.py`, derived from existing real `brush_options` observations so historical logs are reprocessed without a schema migration. Unknown stage1 brush options are counted when `brush_code()` cannot map the recognized string. Unknown stage2 affixes are counted when `affix_code()` cannot map the recognized string. Added filtering so empty strings, `None`, `null`, `unknown`, and `?` do not become fake new-word candidates. Added `unknown_stage1_seen`, `unknown_stage1_seen_total`, `unknown_stage1_seen_pct`, `unknown_affix_seen`, `unknown_affix_seen_total`, `unknown_affix_seen_pct`, `unknown_affix_appearance_rates`, `unknown_affix_samples`, and `new_affix_candidates`. Unknown affix samples keep compact evidence only: timestamp, recognition confidence, stage2 score, chosen stage1, chosen stage1 code, stage1 options/codes, and stage1 scores. Candidate rows include count, rate, percent, average score, average confidence, and up to five samples. Unknown values are reported only as observation data and do not feed recommendation priors yet.
+- Validation evidence: Ran `python -m compileall huahua_assistant run_app.py` successfully. Ran `git diff --check` successfully with only CRLF normalization warnings. Smoke-tested `_build_stats()` with mixed real/simulation `brush_options`: known affix `作用范围内颜料变成随机怪物类型颜料` was not reported as unknown, empty/`unknown`/`?` entries were filtered, unknown real stage1 `mystery_stage1` counted once, unknown real stage2 `全新未知词条` counted twice with 100.0% unknown-affix share, sample evidence preserved score 0.73 and chosen stage1, new-affix candidate sorted first with count 2 and average score 0.73, and simulated `模拟未知词条` was ignored. Smoke-tested `load_learning_stats()` against existing runtime logs; new unknown stats loaded without errors and currently reported 0 unknown affixes/stage1 entries for existing data. Code commit: `5d9c168 Collect unknown affix stats`.
+- Remaining risk: Unknown entries are still based on recognized text, so OCR/template noise can appear if the recognizer outputs a plausible but wrong string. The samples are intentionally capped and separated from recommendation priors until enough evidence is available. UI visibility is deferred to Task 8.
+- Next step: Task 8 should surface high-score gate counts, affix percentages, and unknown/new affix candidates in the right-side learning panel and stats dialog.
 
 ## Task 8 - UI Stats Surface
 - Status: pending

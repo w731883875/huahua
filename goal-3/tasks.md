@@ -41,12 +41,12 @@
 - Next step: Task 6 should perform the second major check to verify v2 trajectory metadata and affix percentage stats remain real-data-only, compact, export/merge-safe, and backward-compatible.
 
 ## Task 6 - Major Check 2
-- Status: pending
+- Status: completed
 - Goal: Verify trajectory metadata and affix percentage stats are real-data-only, compact, export/merge-safe, and backward-compatible.
-- Work performed:
-- Validation evidence:
-- Remaining risk:
-- Next step:
+- Work performed: Performed the second major check after v2 trajectory metadata and affix percentage aggregation. Verified requirement alignment, build health, diff whitespace health, real-data-only filtering, old trajectory compatibility, explicit high-score gate rejection, existing runtime stats loading, and export/merge safety. No code fixes were required. Confirmed v2 state-action-result metadata remains additive and does not weaken the centralized trajectory trust gate. Confirmed percentage stats are derived from real `brush_options` observations and keep old raw-count fields intact for backward compatibility.
+- Validation evidence: Ran `python -m compileall huahua_assistant run_app.py` successfully. Ran `git diff --check` successfully. Smoke-tested `_build_stats()` with two real `brush_options` observations, one simulated observation, one legacy trusted trajectory, and one explicit `high_score_gate.passed=False` trajectory: stage1 total was 4 with transform 25.0%, stack 50.0%, spread 25.0%; stage2 affix total was 4 with A 25.0% and B 75.0%; simulated `SIM` / `9-9` values were ignored; the legacy trusted trajectory counted as 1 and the gate-false trajectory was rejected. Smoke-tested `load_learning_stats()` against existing runtime logs: loaded 4 trajectories, stage1 total 4, affix total 4, `affix_appearance_rates` present, and policy-prior samples remained available. In an isolated temporary runtime, smoke-tested export/merge: a trusted real trajectory saved, gate-false and simulation trajectories were rejected, simulation observation was ignored, bundle export contained 1 real observation and 1 trajectory, merged bundle restored 1 trajectory plus percentage distribution totals without touching production runtime data.
+- Remaining risk: Unknown/new affix classification is still not implemented and remains the next required functional task. UI display is also still deferred; current evidence proves the data exists in stats/export, not that it is visible to the user yet. Existing older trajectories are compatible but lack v2 transition metadata unless recaptured.
+- Next step: Task 7 should implement unknown/new affix collection from real brush recognition, counting recognized stage2 strings that do not map to known affix codes and keeping noisy samples separate from recommendation priors until enough evidence exists.
 
 ## Task 7 - Unknown/New Affix Collection
 - Status: pending

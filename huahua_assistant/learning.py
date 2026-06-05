@@ -8,6 +8,8 @@ from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
 
+from .codes import affix_code, brush_code
+
 
 RUNTIME_DIR = Path("runtime")
 OBSERVATION_LOG = RUNTIME_DIR / "observations.jsonl"
@@ -232,6 +234,9 @@ def _build_stats(
     affix_code_seen = Counter()
     stage1_seen = Counter()
     stage1_code_seen = Counter()
+    unknown_stage1_seen = Counter()
+    unknown_affix_seen = Counter()
+    unknown_affix_samples: dict[str, list[dict[str, Any]]] = {}
     current_seen = Counter()
     current_code_seen = Counter()
     mismatch_seen = Counter()
@@ -281,10 +286,15 @@ def _build_stats(
         if event_type == "brush_options":
             for item in payload.get("stage1_options") or []:
                 stage1_seen[item] += 1
+                if brush_code(item) is None and (item_text := _unknown_text(item)):
+                    unknown_stage1_seen[item_text] += 1
             for item in payload.get("stage1_codes") or []:
                 stage1_code_seen[str(item)] += 1
             for item in payload.get("stage2_options") or []:
                 affix_seen[item] += 1
+                if affix_code(item) is None and (item_text := _unknown_text(item)):
+                    unknown_affix_seen[item_text] += 1
+                    _append_unknown_affix_sample(unknown_affix_samples, item_text, payload, event)
             for item in payload.get("stage2_codes") or []:
                 affix_code_seen[str(item)] += 1
         elif event_type == "current_paint":
@@ -447,17 +457,28 @@ def _build_stats(
         "stage1_code_seen_total": sum(stage1_code_seen.values()),
         "stage1_seen_pct": _counter_percentages(stage1_seen),
         "stage1_code_seen_pct": _counter_percentages(stage1_code_seen),
+        "unknown_stage1_seen": dict(unknown_stage1_seen),
+        "unknown_stage1_seen_total": sum(unknown_stage1_seen.values()),
+        "unknown_stage1_seen_pct": _counter_percentages(unknown_stage1_seen),
         "affix_seen": dict(affix_seen),
         "affix_code_seen": dict(affix_code_seen),
         "affix_seen_total": sum(affix_seen.values()),
         "affix_code_seen_total": sum(affix_code_seen.values()),
         "affix_seen_pct": _counter_percentages(affix_seen),
         "affix_code_seen_pct": _counter_percentages(affix_code_seen),
+        "unknown_affix_seen": dict(unknown_affix_seen),
+        "unknown_affix_seen_total": sum(unknown_affix_seen.values()),
+        "unknown_affix_seen_pct": _counter_percentages(unknown_affix_seen),
+        "unknown_affix_samples": unknown_affix_samples,
+        "unknown_affix_appearance_rates": _counter_distribution(unknown_affix_seen),
+        "new_affix_candidates": _unknown_affix_candidates(unknown_affix_seen, unknown_affix_samples),
         "affix_appearance_rates": {
             "stage1": _counter_distribution(stage1_seen),
             "stage1_codes": _counter_distribution(stage1_code_seen),
             "stage2": _counter_distribution(affix_seen),
             "stage2_codes": _counter_distribution(affix_code_seen),
+            "unknown_stage1": _counter_distribution(unknown_stage1_seen),
+            "unknown_stage2": _counter_distribution(unknown_affix_seen),
         },
         "current_paint_seen": dict(current_seen),
         "current_paint_code_seen": dict(current_code_seen),
@@ -556,6 +577,75 @@ def _counter_distribution(counter: Counter) -> dict[str, Any]:
         "total": int(total),
         "items": items,
     }
+
+
+def _unknown_text(value: Any) -> str | None:
+    text = str(value).strip()
+    if not text or text.casefold() in {"none", "null", "unknown", "?"}:
+        return None
+    return text
+
+
+def _append_unknown_affix_sample(
+    samples: dict[str, list[dict[str, Any]]],
+    name: str,
+    payload: dict[str, Any],
+    event: dict[str, Any],
+) -> None:
+    bucket = samples.setdefault(name, [])
+    if len(bucket) >= 5:
+        return
+    scores = payload.get("stage2_scores") if isinstance(payload.get("stage2_scores"), dict) else {}
+    stage1_scores = payload.get("stage1_scores") if isinstance(payload.get("stage1_scores"), dict) else {}
+    sample = {
+        "ts": event.get("ts"),
+        "confidence": payload.get("confidence"),
+        "score": scores.get(name),
+        "chosen_stage1": payload.get("chosen_stage1"),
+        "chosen_stage1_code": payload.get("chosen_stage1_code"),
+        "stage1_options": list(payload.get("stage1_options") or [])[:3],
+        "stage1_codes": list(payload.get("stage1_codes") or [])[:3],
+    }
+    if stage1_scores:
+        sample["stage1_scores"] = {
+            str(key): round(float(value), 3)
+            for key, value in stage1_scores.items()
+            if isinstance(value, (int, float))
+        }
+    bucket.append(sample)
+
+
+def _unknown_affix_candidates(
+    counter: Counter,
+    samples: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    total = sum(counter.values())
+    candidates: list[dict[str, Any]] = []
+    for name, count in sorted(counter.items(), key=lambda item: (-item[1], str(item[0]))):
+        sample_list = samples.get(str(name), [])
+        score_values = [
+            float(sample.get("score"))
+            for sample in sample_list
+            if isinstance(sample.get("score"), (int, float))
+        ]
+        confidence_values = [
+            float(sample.get("confidence"))
+            for sample in sample_list
+            if isinstance(sample.get("confidence"), (int, float))
+        ]
+        rate = float(count) / float(total) if total else 0.0
+        candidates.append(
+            {
+                "name": str(name),
+                "count": int(count),
+                "rate": round(rate, 6),
+                "pct": round(rate * 100.0, 3),
+                "avg_score": round(sum(score_values) / len(score_values), 3) if score_values else None,
+                "avg_confidence": round(sum(confidence_values) / len(confidence_values), 3) if confidence_values else None,
+                "samples": sample_list,
+            }
+        )
+    return candidates
 
 
 def _placement_cells_from_inferred(inferred: dict[str, Any]) -> list[dict[str, Any]]:

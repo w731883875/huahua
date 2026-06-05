@@ -65,12 +65,12 @@
 - Next step: Task 9 should perform the third major check covering UI readability, data safety, stats correctness, compile, smoke tests, and rollback readiness.
 
 ## Task 9 - Major Check 3
-- Status: pending
+- Status: completed
 - Goal: Broad check for UI readability, data safety, stats correctness, compile, smoke tests, and rollback readiness.
-- Work performed:
-- Validation evidence:
-- Remaining risk:
-- Next step:
+- Work performed: Performed the third major check after UI stats surfacing. Verified requirement alignment, build health, diff whitespace health, UI formatting, real-data-only filtering, unknown-affix filtering, high-score trajectory trust gates, existing runtime stats loading, export/merge safety, and rollback readiness. No code fixes were required. Confirmed the UI helpers only read from `load_learning_stats()` and do not alter storage, trust gates, or recommendation priors. Confirmed new stats are additive and can be ignored/rolled back without changing raw JSONL logs.
+- Validation evidence: Ran `python -m compileall huahua_assistant run_app.py` successfully. Ran `git diff --check` successfully. Smoke-tested `_build_stats()` and `_format_correction_stats()` with mixed real/simulation brush observations and trusted/untrusted trajectories: real unknown stage1 counted, real unknown stage2 counted, simulated unknown affix ignored, known catalog affix not reported as unknown, legacy trusted trajectory counted, explicit `high_score_gate.passed=False` trajectory rejected, and UI text contained `高分轨迹门槛`, `词条出现概率`, and `未知/新词条候选`. Smoke-tested `load_learning_stats()` on existing runtime logs; it loaded 4 trajectories, stage1 total 4, and `new_affix_candidates` as a list. In isolated temporary runtimes, smoke-tested export/merge twice: trusted real trajectory saved, gate-false trajectory rejected, bundle export contained only real observation and trusted trajectory, merge restored the stats, known catalog affix was not flagged unknown, and simulation affix was ignored. The first export smoke exposed a PowerShell here-string Chinese encoding limitation, so it was repeated with an ASCII unknown and a known affix pulled from `build_affix_catalog()` to avoid false evidence.
+- Remaining risk: Existing source still contains older mojibake UI text outside this goal's scope; new Task 8 UI text is readable, but live Tk layout was not screenshot-verified in this check. Unknown/new affix statistics are still observation-only and intentionally do not affect recommendations until Task 10 adds imitation/prior hooks with sample thresholds.
+- Next step: Task 10 should add lightweight derived imitation-analysis hooks for top actions, placements, brush choices, and sample thresholds so high-score trajectory data can start informing future recommendation logic safely.
 
 ## Task 10 - Imitation Analysis Hooks
 - Status: pending

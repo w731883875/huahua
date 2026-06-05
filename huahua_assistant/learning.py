@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .codes import affix_code, brush_code
+from .config import config_value
 
 
 RUNTIME_DIR = Path("runtime")
@@ -267,6 +268,17 @@ def _build_stats(
     high_score_gate_reasons = Counter()
     high_score_gate_primary = Counter()
     trajectory_scores: list[float] = []
+    imitation_actions = Counter()
+    imitation_action_codes = Counter()
+    imitation_action_score_delta = Counter()
+    imitation_action_score_samples = Counter()
+    imitation_recommendation_hits = Counter()
+    imitation_recommendation_shorts = Counter()
+    imitation_recommendation_tags = Counter()
+    imitation_brush_choices = Counter()
+    imitation_brush_choice_codes = Counter()
+    imitation_affix_choices = Counter()
+    imitation_affix_choice_codes = Counter()
     treasure_count = 0
     quick_steps = 0
     quick_actions = Counter()
@@ -382,6 +394,8 @@ def _build_stats(
         final_score = payload.get("internal_score", payload.get("final_score"))
         if isinstance(final_score, (int, float)):
             trajectory_scores.append(float(final_score))
+        previous_brush_choice: str | None = None
+        previous_affix_choice: str | None = None
         for step in payload.get("steps") or []:
             action = step.get("action") or step.get("type") or "unknown"
             inferred = step.get("inferred_action") or {}
@@ -390,6 +404,15 @@ def _build_stats(
             inferred_actions[inferred_type] += 1
             if inferred.get("code"):
                 inferred_action_codes[str(inferred.get("code"))] += 1
+            if inferred_type not in {"session_start", "capture_update", "unknown"}:
+                imitation_actions[inferred_type] += 1
+                if inferred.get("code"):
+                    imitation_action_codes[str(inferred.get("code"))] += 1
+                outcome = step.get("outcome") if isinstance(step.get("outcome"), dict) else {}
+                score_delta = outcome.get("score_delta")
+                if isinstance(score_delta, (int, float)):
+                    imitation_action_score_delta[inferred_type] += float(score_delta)
+                    imitation_action_score_samples[inferred_type] += 1
             detail = inferred.get("detail") if isinstance(inferred.get("detail"), dict) else {}
             if detail.get("code"):
                 inferred_action_details[str(detail.get("code"))] += 1
@@ -426,6 +449,41 @@ def _build_stats(
                 trajectory_affixes[str(step.get("affix"))] += 1
             if step.get("affix_code"):
                 trajectory_affix_codes[str(step.get("affix_code"))] += 1
+            chosen_brush_key = str(chosen_brush_code or chosen_brush or "")
+            if chosen_brush_key and chosen_brush_key != previous_brush_choice:
+                if chosen_brush:
+                    imitation_brush_choices[str(chosen_brush)] += 1
+                if chosen_brush_code:
+                    imitation_brush_choice_codes[str(chosen_brush_code)] += 1
+                previous_brush_choice = chosen_brush_key
+            active_affix = step.get("active_affix") if isinstance(step.get("active_affix"), dict) else {}
+            chosen_affix = active_affix.get("name") or step.get("affix")
+            chosen_affix_code = active_affix.get("code") or step.get("affix_code")
+            chosen_affix_key = str(chosen_affix_code or chosen_affix or "")
+            if chosen_affix_key and chosen_affix_key != previous_affix_choice:
+                if chosen_affix:
+                    imitation_affix_choices[str(chosen_affix)] += 1
+                if chosen_affix_code:
+                    imitation_affix_choice_codes[str(chosen_affix_code)] += 1
+                previous_affix_choice = chosen_affix_key
+            chosen_recommendation = step.get("chosen_recommendation")
+            if isinstance(chosen_recommendation, dict):
+                imitation_recommendation_hits["decisions"] += 1
+                if chosen_recommendation.get("matched") is True:
+                    imitation_recommendation_hits["hit"] += 1
+                    rank = chosen_recommendation.get("rank")
+                    if isinstance(rank, int):
+                        imitation_recommendation_hits[f"rank_{rank}"] += 1
+                else:
+                    imitation_recommendation_hits["miss"] += 1
+                rec = chosen_recommendation.get("recommendation")
+                if isinstance(rec, dict):
+                    explanation = rec.get("explanation") if isinstance(rec.get("explanation"), dict) else {}
+                    short = explanation.get("short")
+                    if short:
+                        imitation_recommendation_shorts[str(short)] += 1
+                    for tag in explanation.get("tags") or ():
+                        imitation_recommendation_tags[str(tag)] += 1
             _accumulate_recommendation_stats(
                 step.get("top") or (),
                 cells=recommendation_cells,
@@ -448,6 +506,28 @@ def _build_stats(
         if samples >= 3 and error_rate >= 0.25:
             risky_fields.append(field)
     risky_fields.sort(key=lambda field: (field_accuracy[field]["error_rate"], field_accuracy[field]["errors"]), reverse=True)
+    policy_prior_samples = {
+        "placements": sum(placement_cells.values()),
+        "brushes": max(sum(trajectory_brushes.values()), sum(trajectory_brush_codes.values())),
+        "affixes": max(sum(trajectory_affixes.values()), sum(trajectory_affix_codes.values())),
+    }
+    imitation_policy = _imitation_policy_summary(
+        trajectory_count=len(trajectories),
+        trajectory_scores=trajectory_scores,
+        action_counts=imitation_actions,
+        action_codes=imitation_action_codes,
+        action_score_delta=imitation_action_score_delta,
+        action_score_samples=imitation_action_score_samples,
+        placement_cells=placement_cells,
+        placement_zones=placement_zones,
+        brush_choices=imitation_brush_choices,
+        brush_choice_codes=imitation_brush_choice_codes,
+        affix_choices=imitation_affix_choices,
+        affix_choice_codes=imitation_affix_choice_codes,
+        recommendation_hits=imitation_recommendation_hits,
+        recommendation_shorts=imitation_recommendation_shorts,
+        recommendation_tags=imitation_recommendation_tags,
+    )
     return {
         "total_events": len(events),
         "event_counts": dict(event_counts),
@@ -513,11 +593,10 @@ def _build_stats(
         "trajectory_affix_codes": dict(trajectory_affix_codes),
         "high_score_gate_primary": dict(high_score_gate_primary),
         "high_score_gate_reasons": dict(high_score_gate_reasons),
-        "policy_prior_samples": {
-            "placements": sum(placement_cells.values()),
-            "brushes": max(sum(trajectory_brushes.values()), sum(trajectory_brush_codes.values())),
-            "affixes": max(sum(trajectory_affixes.values()), sum(trajectory_affix_codes.values())),
-        },
+        "policy_prior_samples": policy_prior_samples,
+        "imitation_samples": imitation_policy["samples"],
+        "imitation_ready": imitation_policy["ready"],
+        "imitation_policy": imitation_policy,
         "trajectory_best_score": max(trajectory_scores) if trajectory_scores else None,
         "trajectory_avg_score": (sum(trajectory_scores) / len(trajectory_scores)) if trajectory_scores else None,
         "treasure_ratio": treasure_count / total_backpack if total_backpack else 0.0,
@@ -646,6 +725,113 @@ def _unknown_affix_candidates(
             }
         )
     return candidates
+
+
+def _imitation_policy_summary(
+    *,
+    trajectory_count: int,
+    trajectory_scores: list[float],
+    action_counts: Counter,
+    action_codes: Counter,
+    action_score_delta: Counter,
+    action_score_samples: Counter,
+    placement_cells: Counter,
+    placement_zones: Counter,
+    brush_choices: Counter,
+    brush_choice_codes: Counter,
+    affix_choices: Counter,
+    affix_choice_codes: Counter,
+    recommendation_hits: Counter,
+    recommendation_shorts: Counter,
+    recommendation_tags: Counter,
+) -> dict[str, Any]:
+    samples = {
+        "trajectories": int(trajectory_count),
+        "actions": int(sum(action_counts.values())),
+        "placements": int(sum(placement_cells.values())),
+        "brushes": int(max(sum(brush_choices.values()), sum(brush_choice_codes.values()))),
+        "affixes": int(max(sum(affix_choices.values()), sum(affix_choice_codes.values()))),
+        "recommendation_decisions": int(recommendation_hits.get("decisions", 0)),
+    }
+    thresholds = {
+        "actions": _config_int("learning.action_min_samples", 30),
+        "placements": _config_int("learning.placement_min_samples", 30),
+        "brushes": _config_int("learning.brush_min_samples", 20),
+        "affixes": _config_int("learning.affix_min_samples", 20),
+    }
+    ready = {
+        key: samples.get(key, 0) >= threshold
+        for key, threshold in thresholds.items()
+    }
+    ready["recommendations"] = samples["recommendation_decisions"] >= thresholds["placements"]
+    return {
+        "samples": samples,
+        "thresholds": thresholds,
+        "ready": ready,
+        "top_actions": _counter_distribution(action_counts),
+        "top_action_codes": _counter_distribution(action_codes),
+        "action_score_delta": _average_delta_distribution(action_score_delta, action_score_samples),
+        "top_placement_cells": _counter_distribution(placement_cells),
+        "top_placement_zones": _counter_distribution(placement_zones),
+        "top_brush_choices": _counter_distribution(brush_choices),
+        "top_brush_codes": _counter_distribution(brush_choice_codes),
+        "top_affix_choices": _counter_distribution(affix_choices),
+        "top_affix_codes": _counter_distribution(affix_choice_codes),
+        "recommendation_hits": _recommendation_hit_summary(recommendation_hits),
+        "recommendation_shorts": _counter_distribution(recommendation_shorts),
+        "recommendation_tags": _counter_distribution(recommendation_tags),
+        "score": {
+            "best": max(trajectory_scores) if trajectory_scores else None,
+            "avg": round(sum(trajectory_scores) / len(trajectory_scores), 3) if trajectory_scores else None,
+        },
+    }
+
+
+def _config_int(path: str, default: int) -> int:
+    try:
+        return int(config_value(path, default))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _average_delta_distribution(sums: Counter, counts: Counter) -> dict[str, Any]:
+    items: list[dict[str, Any]] = []
+    for key, count in sorted(counts.items(), key=lambda item: (-item[1], str(item[0]))):
+        if count <= 0:
+            continue
+        avg = float(sums.get(key, 0.0)) / float(count)
+        items.append(
+            {
+                "key": str(key),
+                "count": int(count),
+                "avg_score_delta": round(avg, 3),
+            }
+        )
+    return {
+        "total": int(sum(counts.values())),
+        "items": items,
+    }
+
+
+def _recommendation_hit_summary(counter: Counter) -> dict[str, Any]:
+    decisions = int(counter.get("decisions", 0))
+    hits = int(counter.get("hit", 0))
+    misses = int(counter.get("miss", 0))
+    top1 = int(counter.get("rank_1", 0))
+    return {
+        "decisions": decisions,
+        "hits": hits,
+        "misses": misses,
+        "hit_rate": round(float(hits) / float(decisions), 6) if decisions else 0.0,
+        "hit_pct": round(float(hits) * 100.0 / float(decisions), 3) if decisions else 0.0,
+        "top1": top1,
+        "top1_rate": round(float(top1) / float(decisions), 6) if decisions else 0.0,
+        "top1_pct": round(float(top1) * 100.0 / float(decisions), 3) if decisions else 0.0,
+        "rank_counts": {
+            key: int(counter.get(key, 0))
+            for key in sorted((key for key in counter if str(key).startswith("rank_")), key=str)
+        },
+    }
 
 
 def _placement_cells_from_inferred(inferred: dict[str, Any]) -> list[dict[str, Any]]:

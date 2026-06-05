@@ -3396,6 +3396,7 @@ class HuahuaApp(tk.Tk):
         inferred_codes = stats.get("inferred_action_codes") or {}
         refresh_events = stats.get("refresh_events") or {}
         prior_samples = stats.get("policy_prior_samples") or {}
+        imitation_policy = stats.get("imitation_policy") or {}
         recommendation_shorts = stats.get("recommendation_shorts") or {}
         recommendation_tags = stats.get("recommendation_tags") or {}
         high_value_recommendation_tags = stats.get("high_value_recommendation_tags") or {}
@@ -3421,6 +3422,7 @@ class HuahuaApp(tk.Tk):
         rec_short_text = ", ".join(f"{name}x{count}" for name, count in top_rec_shorts) if top_rec_shorts else "-"
         rec_tag_text = ", ".join(f"{name}x{count}" for name, count in top_rec_tags) if top_rec_tags else "-"
         high_value_tag_text = ", ".join(f"{name}x{count}" for name, count in top_high_value_tags) if top_high_value_tags else "-"
+        imitation_text = _format_imitation_policy_summary(imitation_policy)
         gate_text = _format_count_summary(gate_primary, limit=3)
         gate_reason_text = _format_count_summary(gate_reasons, limit=4)
         best_score_text = f"{best_score:.0f}" if isinstance(best_score, (int, float)) else "-"
@@ -3447,6 +3449,8 @@ class HuahuaApp(tk.Tk):
             f"宝箱占比={stats.get('treasure_ratio', 0.0):.3f}\n"
             "文件=runtime/observations.jsonl, runtime/corrected_observations.jsonl, runtime/high_score_trajectories.jsonl, runtime/stats.json\n\n",
         )
+
+        self.region_text.insert(tk.END, f"模仿分析：{imitation_text}\n\n")
 
     def _write_install_plan(self) -> None:
         self.region_text.insert(tk.END, "安装计划（逐步模拟，每步立即结算）\n")
@@ -3606,6 +3610,7 @@ def _format_correction_stats(stats: dict) -> str:
                 f"准确率{accuracy:.0%} 错误率{error_rate:.0%}{risk}"
             )
     lines.extend(_format_learning_stats_detail_lines(stats))
+    lines.extend(_format_imitation_policy_detail_lines(stats.get("imitation_policy") or {}))
     lines.extend(
         [
             "",
@@ -3696,6 +3701,70 @@ def _format_unknown_affix_summary(stats: dict, *, limit: int) -> str:
         pct_text = f"{float(pct):.1f}%" if isinstance(pct, (int, float)) else "-"
         score_text = f"均分{float(avg_score):.2f}" if isinstance(avg_score, (int, float)) else "均分-"
         parts.append(f"{name}x{count}({pct_text},{score_text})")
+    return ", ".join(parts) if parts else "-"
+
+
+def _format_imitation_policy_summary(policy: dict) -> str:
+    if not isinstance(policy, dict) or not policy:
+        return "暂无高分样本"
+    samples = policy.get("samples") if isinstance(policy.get("samples"), dict) else {}
+    ready = policy.get("ready") if isinstance(policy.get("ready"), dict) else {}
+    hits = policy.get("recommendation_hits") if isinstance(policy.get("recommendation_hits"), dict) else {}
+    hit_pct = hits.get("hit_pct")
+    hit_text = f"{float(hit_pct):.1f}%" if isinstance(hit_pct, (int, float)) else "-"
+    ready_names = [str(name) for name, ok in ready.items() if ok]
+    ready_text = ",".join(ready_names) if ready_names else "样本未达标"
+    return (
+        f"轨迹{samples.get('trajectories', 0)} 动作{samples.get('actions', 0)} "
+        f"落点{samples.get('placements', 0)} 词条{samples.get('affixes', 0)} "
+        f"推荐命中{hit_text} 可用={ready_text}"
+    )
+
+
+def _format_imitation_policy_detail_lines(policy: dict) -> list[str]:
+    if not isinstance(policy, dict) or not policy:
+        return [
+            "",
+            "模仿分析",
+            "- 暂无可信高分轨迹样本",
+        ]
+    samples = policy.get("samples") if isinstance(policy.get("samples"), dict) else {}
+    thresholds = policy.get("thresholds") if isinstance(policy.get("thresholds"), dict) else {}
+    ready = policy.get("ready") if isinstance(policy.get("ready"), dict) else {}
+    hits = policy.get("recommendation_hits") if isinstance(policy.get("recommendation_hits"), dict) else {}
+    return [
+        "",
+        "模仿分析（可信高分轨迹）",
+        f"- 样本：{samples}",
+        f"- 阈值：{thresholds}",
+        f"- 就绪：{ready}",
+        f"- 推荐命中：决策{hits.get('decisions', 0)} 命中{hits.get('hits', 0)} 命中率{float(hits.get('hit_pct', 0.0) or 0.0):.1f}% Top1={float(hits.get('top1_pct', 0.0) or 0.0):.1f}%",
+        f"- 高频动作：{_format_distribution_summary(policy.get('top_actions'), limit=8)}",
+        f"- 动作收益：{_format_action_delta_summary(policy.get('action_score_delta'), limit=8)}",
+        f"- 高频落点：{_format_distribution_summary(policy.get('top_placement_cells'), limit=10)}",
+        f"- 地形区域：{_format_distribution_summary(policy.get('top_placement_zones'), limit=6)}",
+        f"- 高频笔触：{_format_distribution_summary(policy.get('top_brush_codes'), limit=6)}",
+        f"- 高频词条：{_format_distribution_summary(policy.get('top_affix_codes'), limit=8)}",
+        f"- 命中推荐语义：{_format_distribution_summary(policy.get('recommendation_shorts'), limit=6)}",
+        f"- 命中推荐标签：{_format_distribution_summary(policy.get('recommendation_tags'), limit=8)}",
+    ]
+
+
+def _format_action_delta_summary(distribution, *, limit: int) -> str:
+    if not isinstance(distribution, dict):
+        return "-"
+    items = distribution.get("items") or []
+    if not isinstance(items, list) or not items:
+        return "-"
+    parts: list[str] = []
+    for item in items[:limit]:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key", "-"))
+        count = int(item.get("count", 0) or 0)
+        avg_delta = item.get("avg_score_delta")
+        delta_text = f"{float(avg_delta):+.1f}" if isinstance(avg_delta, (int, float)) else "-"
+        parts.append(f"{key}x{count}({delta_text})")
     return ", ".join(parts) if parts else "-"
 
 

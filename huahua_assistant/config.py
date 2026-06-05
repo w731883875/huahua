@@ -66,6 +66,7 @@ DEFAULT_STRATEGY_CONFIG: dict[str, Any] = {
         "treasure_overwrite_discount": 0.65,
     },
     "learning": {
+        "action_min_samples": 30,
         "placement_min_samples": 30,
         "brush_min_samples": 20,
         "affix_min_samples": 20,

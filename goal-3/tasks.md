@@ -73,12 +73,12 @@
 - Next step: Task 10 should add lightweight derived imitation-analysis hooks for top actions, placements, brush choices, and sample thresholds so high-score trajectory data can start informing future recommendation logic safely.
 
 ## Task 10 - Imitation Analysis Hooks
-- Status: pending
+- Status: completed
 - Goal: Add lightweight derived stats for later imitation: top actions/placements/brush choices among saved high-score trajectories and sample thresholds for when to trust them.
-- Work performed:
-- Validation evidence:
-- Remaining risk:
-- Next step:
+- Work performed: Added derived imitation-analysis statistics from trusted real high-score trajectories in `huahua_assistant/learning.py`. The new `imitation_policy` block summarizes sample counts, configured readiness thresholds, readiness flags, top non-noop actions, action codes, average action score deltas, top placement cells/zones, chosen brush/affix names and codes, recommendation hit/miss rates, Top1 rates, and recommendation reason/tag distributions. Kept existing `policy_prior_samples`, `placement_cells`, `trajectory_brush_codes`, and `trajectory_affix_codes` fields intact for backward compatibility with the current recommendation engine. Added `learning.action_min_samples` default threshold. Surfaced the imitation summary in the right-side learning panel and detailed imitation distributions in the correction/stats dialog.
+- Validation evidence: Ran `python -m compileall huahua_assistant run_app.py` successfully after implementation. Ran `git diff --check` successfully with only CRLF normalization warnings. Smoke-tested `_build_stats()` with one trusted real high-score trajectory, one `high_score_gate.passed=False` trajectory, and one simulation trajectory: only the trusted real trajectory counted; `imitation_policy.samples` reported one action, one placement, one brush, one affix, and one recommendation decision; recommendation hit rate was 100%; top placement cell `2,3`, brush code `2`, and affix code `2-9` were counted; readiness flags remained false because sample counts were below thresholds. Smoke-tested UI formatting with `_format_correction_stats()` and `_format_imitation_policy_summary()`: output included `模仿分析`, `install_paint`, `2,3`, and `2-9`. Smoke-tested existing runtime stats with `load_learning_stats()`: loaded 4 trajectories and produced an `imitation_policy` dict plus `imitation_samples`/`imitation_ready` without errors. Code commit: `411017a Add imitation policy learning stats`.
+- Remaining risk: The imitation hooks still depend on inferred visual actions, so real mis-recognition can affect distributions until more live samples and correction data accumulate. Existing runtime data has 4 high-score trajectories and remains below the configured readiness thresholds, so the stats are visible but should not be treated as a strong policy yet. Chosen affix counting uses `active_affix`/legacy chosen fields and intentionally avoids unknown-affix candidates until they are cataloged and sufficiently sampled.
+- Next step: Task 11 should perform the final review across high-score gates, real-data-only boundaries, new/unknown affix collection, percentage stats, imitation hooks, UI visibility, export/merge safety, compile, and live-data validation guidance.
 
 ## Task 11 - Final Review
 - Status: pending

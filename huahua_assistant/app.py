@@ -3399,6 +3399,14 @@ class HuahuaApp(tk.Tk):
         recommendation_shorts = stats.get("recommendation_shorts") or {}
         recommendation_tags = stats.get("recommendation_tags") or {}
         high_value_recommendation_tags = stats.get("high_value_recommendation_tags") or {}
+        gate_primary = stats.get("high_score_gate_primary") or {}
+        gate_reasons = stats.get("high_score_gate_reasons") or {}
+        appearance_rates = stats.get("affix_appearance_rates") or {}
+        stage1_rate_text = _format_distribution_summary(appearance_rates.get("stage1"), limit=3)
+        stage2_rate_text = _format_distribution_summary(appearance_rates.get("stage2_codes"), limit=3)
+        if stage2_rate_text == "-":
+            stage2_rate_text = _format_distribution_summary(appearance_rates.get("stage2"), limit=3)
+        unknown_text = _format_unknown_affix_summary(stats, limit=2)
         top_affixes = _top_affix_display_items(affix_seen, affix_code_seen, limit=3)
         top_corrections = sorted(correction_fields.items(), key=lambda item: item[1], reverse=True)[:3]
         top_actions = sorted(inferred_actions.items(), key=lambda item: item[1], reverse=True)[:3]
@@ -3413,6 +3421,8 @@ class HuahuaApp(tk.Tk):
         rec_short_text = ", ".join(f"{name}x{count}" for name, count in top_rec_shorts) if top_rec_shorts else "-"
         rec_tag_text = ", ".join(f"{name}x{count}" for name, count in top_rec_tags) if top_rec_tags else "-"
         high_value_tag_text = ", ".join(f"{name}x{count}" for name, count in top_high_value_tags) if top_high_value_tags else "-"
+        gate_text = _format_count_summary(gate_primary, limit=3)
+        gate_reason_text = _format_count_summary(gate_reasons, limit=4)
         best_score_text = f"{best_score:.0f}" if isinstance(best_score, (int, float)) else "-"
         quick_avg_text = f"{quick_avg:.2f}s" if isinstance(quick_avg, (int, float)) else "-"
         finished_best_text = f"{finished_best:.0f}" if isinstance(finished_best, (int, float)) else "-"
@@ -3425,6 +3435,9 @@ class HuahuaApp(tk.Tk):
             f"高价值识别={high_value_seen} 明细={high_value_counts}\n"
             f"{_risk_hint_text(stats)}\n"
             f"高频词条={affix_text}\n"
+            f"高分门槛={gate_text} 原因={gate_reason_text}\n"
+            f"词条概率：一阶段={stage1_rate_text} 二阶段={stage2_rate_text}\n"
+            f"未知/新词条={unknown_text}\n"
             f"高频纠错={correction_text}\n"
             f"高价值轨迹={trajectories} 最佳={best_score_text}\n"
             f"推断动作={action_text}\n"
@@ -3592,6 +3605,7 @@ def _format_correction_stats(stats: dict) -> str:
                 f"- {_field_display_name(field)}: 样本{samples} 错{errors} "
                 f"准确率{accuracy:.0%} 错误率{error_rate:.0%}{risk}"
             )
+    lines.extend(_format_learning_stats_detail_lines(stats))
     lines.extend(
         [
             "",
@@ -3605,6 +3619,84 @@ def _format_correction_stats(stats: dict) -> str:
         ]
     )
     return "\n".join(lines)
+
+
+def _format_learning_stats_detail_lines(stats: dict) -> list[str]:
+    appearance_rates = stats.get("affix_appearance_rates") or {}
+    stage1 = _format_distribution_summary(appearance_rates.get("stage1"), limit=6)
+    stage1_codes = _format_distribution_summary(appearance_rates.get("stage1_codes"), limit=6)
+    stage2 = _format_distribution_summary(appearance_rates.get("stage2"), limit=8)
+    stage2_codes = _format_distribution_summary(appearance_rates.get("stage2_codes"), limit=8)
+    unknown_stage1 = _format_distribution_summary(appearance_rates.get("unknown_stage1"), limit=5)
+    unknown_stage2 = _format_distribution_summary(appearance_rates.get("unknown_stage2"), limit=5)
+    return [
+        "",
+        "高分轨迹门槛",
+        f"- 主门槛：{_format_count_summary(stats.get('high_score_gate_primary') or {}, limit=8)}",
+        f"- 命中原因：{_format_count_summary(stats.get('high_score_gate_reasons') or {}, limit=10)}",
+        "",
+        "词条出现概率（真实识别）",
+        f"- 一阶段名称：{stage1}",
+        f"- 一阶段编码：{stage1_codes}",
+        f"- 二阶段名称：{stage2}",
+        f"- 二阶段编码：{stage2_codes}",
+        "",
+        "未知/新词条候选",
+        f"- 未知一阶段：{unknown_stage1}",
+        f"- 未知二阶段：{unknown_stage2}",
+        f"- 候选明细：{_format_unknown_affix_summary(stats, limit=8)}",
+    ]
+
+
+def _format_count_summary(values: dict, *, limit: int) -> str:
+    items = []
+    for key, count in values.items():
+        try:
+            parsed = int(count)
+        except (TypeError, ValueError):
+            continue
+        items.append((str(key), parsed))
+    if not items:
+        return "-"
+    items.sort(key=lambda item: item[1], reverse=True)
+    return ", ".join(f"{key}x{count}" for key, count in items[:limit])
+
+
+def _format_distribution_summary(distribution, *, limit: int) -> str:
+    if not isinstance(distribution, dict):
+        return "-"
+    items = distribution.get("items") or []
+    if not isinstance(items, list) or not items:
+        return "-"
+    parts: list[str] = []
+    for item in items[:limit]:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key", "-"))
+        count = item.get("count", 0)
+        pct = item.get("pct")
+        pct_text = f"{float(pct):.1f}%" if isinstance(pct, (int, float)) else "-"
+        parts.append(f"{key}x{count}({pct_text})")
+    return ", ".join(parts) if parts else "-"
+
+
+def _format_unknown_affix_summary(stats: dict, *, limit: int) -> str:
+    candidates = stats.get("new_affix_candidates") or []
+    if not isinstance(candidates, list) or not candidates:
+        total = int(stats.get("unknown_affix_seen_total", 0) or 0)
+        return f"暂无（累计{total}）"
+    parts: list[str] = []
+    for item in candidates[:limit]:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", "-"))
+        count = int(item.get("count", 0) or 0)
+        pct = item.get("pct")
+        avg_score = item.get("avg_score")
+        pct_text = f"{float(pct):.1f}%" if isinstance(pct, (int, float)) else "-"
+        score_text = f"均分{float(avg_score):.2f}" if isinstance(avg_score, (int, float)) else "均分-"
+        parts.append(f"{name}x{count}({pct_text},{score_text})")
+    return ", ".join(parts) if parts else "-"
 
 
 def _top_affix_display_items(affix_seen: dict, affix_code_seen: dict, *, limit: int) -> list[tuple[str, int]]:

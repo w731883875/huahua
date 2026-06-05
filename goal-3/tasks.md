@@ -57,12 +57,12 @@
 - Next step: Task 8 should surface high-score gate counts, affix percentages, and unknown/new affix candidates in the right-side learning panel and stats dialog.
 
 ## Task 8 - UI Stats Surface
-- Status: pending
+- Status: completed
 - Goal: Show high-score gate counts, affix percentages, and unknown/new affixes in the right-side learning panel and stats dialog.
-- Work performed:
-- Validation evidence:
-- Remaining risk:
-- Next step:
+- Work performed: Added UI visibility for the learning stats introduced in Tasks 2, 5, and 7. The right-side learning panel now shows high-score gate primary reasons and reason distribution, stage1/stage2 affix appearance probability summaries, and unknown/new affix candidate summaries. The correction/stats dialog now includes detailed sections for high-score trajectory gates, real-capture affix appearance distributions by stage/name/code, and unknown/new affix candidates. Added formatting helpers in `huahua_assistant/app.py` for count summaries, distribution summaries, unknown candidate summaries, and detailed learning-stat lines. The UI reads only from `load_learning_stats()`, so it uses the same real-data-only filtered stats and does not alter learning storage or recommendation priors.
+- Validation evidence: Ran `python -m compileall huahua_assistant run_app.py` successfully. Ran `git diff --check` successfully with only CRLF normalization warnings. Smoke-tested `_format_correction_stats()`, `_format_distribution_summary()`, and `_format_unknown_affix_summary()` with synthetic stats containing high-score gates, affix percentages, and unknown candidates; output contained the sections `高分轨迹门槛`, `词条出现概率`, and `未知/新词条候选`, preserved `treasure7_plusx1`, formatted distribution output as `stackx2(50.0%), spreadx1(25.0%)`, and formatted unknown candidate output as `new affixx2(100.0%,均分0.73)`. Code commit: `f794a0d Surface learning stats in UI`.
+- Remaining risk: UI text includes new readable Chinese lines inside a file that still contains older mojibake text from prior source encoding issues; this task did not rewrite unrelated legacy UI strings. The stats are visible, but visual layout was verified through formatting smoke rather than a live Tk screenshot in this turn. Task 9 should perform a broader UI/readability and data-safety check.
+- Next step: Task 9 should perform the third major check covering UI readability, data safety, stats correctness, compile, smoke tests, and rollback readiness.
 
 ## Task 9 - Major Check 3
 - Status: pending

@@ -818,6 +818,7 @@ def _recommendation_hit_summary(counter: Counter) -> dict[str, Any]:
     hits = int(counter.get("hit", 0))
     misses = int(counter.get("miss", 0))
     top1 = int(counter.get("rank_1", 0))
+    top3 = sum(int(counter.get(f"rank_{rank}", 0)) for rank in range(1, 4))
     return {
         "decisions": decisions,
         "hits": hits,
@@ -827,6 +828,9 @@ def _recommendation_hit_summary(counter: Counter) -> dict[str, Any]:
         "top1": top1,
         "top1_rate": round(float(top1) / float(decisions), 6) if decisions else 0.0,
         "top1_pct": round(float(top1) * 100.0 / float(decisions), 3) if decisions else 0.0,
+        "top3": top3,
+        "top3_rate": round(float(top3) / float(decisions), 6) if decisions else 0.0,
+        "top3_pct": round(float(top3) * 100.0 / float(decisions), 3) if decisions else 0.0,
         "rank_counts": {
             key: int(counter.get(key, 0))
             for key in sorted((key for key in counter if str(key).startswith("rank_")), key=str)

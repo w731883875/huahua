@@ -31,17 +31,34 @@ Next step:
 
 ## Task 2: Add Per-Step Backpack Compact Details
 
-Status: pending
+Status: completed
 
 Add compact visible/cumulative backpack detail fields to real trajectory steps, keeping payload size modest and preserving existing `backpack` summary.
 
 Work performed:
 
+- Added `backpack_visible` and `backpack_cumulative` fields to `_compact_real_capture_step()` payloads while preserving the existing `backpack` summary.
+- Added compact visible backpack details with paint code, category, level, treasure flag, slot rectangle, fingerprint, and confidence fields.
+- Extended the detected backpack cache to retain compact detail metadata so cumulative backpack entries can carry recent slot/fingerprint/confidence data when available.
+- Kept cumulative fallback compact when metadata is missing, so old or partial states still emit code/category/level/treasure data.
+
 Validation evidence:
+
+- `python -m py_compile huahua_assistant\app.py`
+- staged-index syntax check: `git show :huahua_assistant/app.py` compiled successfully before commit.
+- Smoke test for `_compact_observed_backpack_paint()` and `_compact_cumulative_backpack()`.
+- `python scripts\check_encoding.py .`
+- `git diff --cached --check`
+- Commit: `39dcb88 Add compact backpack details to trajectory steps`
 
 Remaining risk:
 
+- Existing historical trajectory steps are not migrated; consumers should treat `backpack_visible` and `backpack_cumulative` as optional for older records.
+- Cumulative entries can only include slot/fingerprint/confidence when the paint came from the current session cache; fallback entries remain compact paint-only records.
+
 Next step:
+
+- Task 3: Major Checkpoint 1.
 
 ## Task 3: Major Checkpoint 1
 

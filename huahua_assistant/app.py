@@ -1823,10 +1823,16 @@ class HuahuaApp(tk.Tk):
         if not initial_snapshot:
             return False
         summary_kind = _compressed_summary_kind(terminal, high_score_gate)
+        sample_metadata = _compressed_summary_sample_metadata(summary_kind)
         payload = {
             "version": 1,
             "kind": summary_kind,
-            "weight": _compressed_summary_weight(summary_kind),
+            "weight": sample_metadata["training_weight"],
+            "training_weight": sample_metadata["training_weight"],
+            "sample_class": sample_metadata["sample_class"],
+            "sample_role": sample_metadata["sample_role"],
+            "candidate_sample": sample_metadata["candidate_sample"],
+            "candidate_metadata": sample_metadata,
             "session": self.real_session_id,
             "reason": reason,
             "skip_reason": skip_reason,
@@ -4971,6 +4977,44 @@ def _compressed_summary_weight(kind: str) -> float:
         "candidate_level6_cluster": 0.30,
         "low_value_terminal": 0.15,
     }.get(kind, 0.1)
+
+
+def _compressed_summary_sample_metadata(kind: str) -> dict:
+    weight = _compressed_summary_weight(kind)
+    metadata = {
+        "schema": "huahua-candidate-sample-v1",
+        "source": "compressed_run_summary",
+        "summary_kind": kind,
+        "sample_class": "terrain_baseline",
+        "sample_role": "low_value_terminal",
+        "candidate_sample": False,
+        "training_weight": weight,
+        "expert_eligible": False,
+        "use_for": ["terrain_prior", "negative_baseline"],
+        "exclude_from": ["expert_trajectory", "high_score_imitation"],
+    }
+    overrides = {
+        "candidate_high_score": {
+            "sample_class": "candidate",
+            "sample_role": "high_score_candidate",
+            "candidate_sample": True,
+            "use_for": ["candidate_review", "terrain_prior"],
+        },
+        "candidate_low_weight": {
+            "sample_class": "candidate",
+            "sample_role": "high_value_terminal_low_weight",
+            "candidate_sample": True,
+            "use_for": ["candidate_review", "low_weight_training", "terrain_prior"],
+        },
+        "candidate_level6_cluster": {
+            "sample_class": "candidate",
+            "sample_role": "level6_cluster_low_weight",
+            "candidate_sample": True,
+            "use_for": ["candidate_review", "low_weight_training", "terrain_prior"],
+        },
+    }
+    metadata.update(overrides.get(kind, {}))
+    return metadata
 
 
 def _summary_has_level6_cluster(summary: dict) -> bool:

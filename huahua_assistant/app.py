@@ -139,6 +139,8 @@ class HuahuaApp(tk.Tk):
         self.last_real_step_key: str | None = None
         self.last_auto_trajectory_key: str | None = None
         self.last_real_capture_step: dict | None = None
+        self.real_initial_snapshot: dict | None = None
+        self.last_compressed_summary_key: str | None = None
         self.last_capture_quality: dict | None = None
         self.last_rule_anomalies: list[dict] = []
         self.last_quick_step_key: str | None = None
@@ -1221,6 +1223,8 @@ class HuahuaApp(tk.Tk):
         self.last_quick_step_key = None
         self.last_auto_trajectory_key = None
         self.last_real_capture_step = None
+        self.real_initial_snapshot = None
+        self.last_compressed_summary_key = None
         self.last_high_value_key = None
         self.last_finish_skip_reason = None
         self.last_finish_diagnostic = None
@@ -1409,6 +1413,17 @@ class HuahuaApp(tk.Tk):
         high_score_gate = _high_score_gate(terminal)
         if not high_score_gate["passed"]:
             self.last_finish_skip_reason = high_score_gate["summary"]
+            compressed_saved = self._record_compressed_run_summary(
+                reason=reason,
+                skip_reason=self.last_finish_skip_reason,
+                terminal=terminal,
+                high_score_gate=high_score_gate,
+                score=score,
+                score_breakdown=score_breakdown,
+                reliable_steps=reliable_steps,
+                raw_finish_seen=raw_finish_seen,
+                finish_seen=finish_seen,
+            )
             self._set_finish_diagnostic(
                 saved=False,
                 score=score,
@@ -1430,10 +1445,12 @@ class HuahuaApp(tk.Tk):
                     "raw_finish_seen": raw_finish_seen,
                     "terminal": terminal,
                     "high_score_gate": high_score_gate,
+                    "compressed_summary_saved": compressed_saved,
                 },
                 source="real_capture",
             )
             return False, score
+        initial_snapshot = self._initial_snapshot_from_steps(reliable_steps)
         payload = {
             "version": 2,
             "kind": "internal_scored_run",
@@ -1446,9 +1463,11 @@ class HuahuaApp(tk.Tk):
             "score_breakdown": score_breakdown,
             "terminal": terminal,
             "high_score_gate": high_score_gate,
+            "initial_snapshot": initial_snapshot,
             "finish_seen": finish_seen,
             "steps": reliable_steps[-240:],
         }
+        payload = _with_initial_aliases(payload)
         payload = _with_state_action_result_metadata(payload)
         saved = record_high_score_trajectory(payload, source="real_capture")
         self._set_finish_diagnostic(
@@ -1461,7 +1480,7 @@ class HuahuaApp(tk.Tk):
         )
         record_observation(
             "run_session_finished",
-            {
+            _with_initial_aliases({
                 "session": self.real_session_id,
                 "reason": reason,
                 "internal_score": score,
@@ -1471,9 +1490,10 @@ class HuahuaApp(tk.Tk):
                 "saved": saved,
                 "terminal": terminal,
                 "high_score_gate": high_score_gate,
+                "initial_snapshot": initial_snapshot,
                 "raw_finish_seen": raw_finish_seen,
                 "finish_seen": finish_seen,
-            },
+            }),
             source="real_capture",
         )
         self.real_session_finished = True
@@ -1543,6 +1563,7 @@ class HuahuaApp(tk.Tk):
         step = self._stamp_real_step(step)
         self.last_quick_step_key = step_key
         self.last_real_capture_step = step
+        self._ensure_initial_snapshot(step)
         self.real_trajectory_steps.append(step)
         self.real_trajectory_steps = self.real_trajectory_steps[-80:]
         self.quick_capture_record_count += 1
@@ -1598,6 +1619,7 @@ class HuahuaApp(tk.Tk):
                 confirmed["inferred_action"]["confirmed_by_backpack"] = True
                 stamped = self._stamp_real_step(confirmed)
                 self.last_real_capture_step = stamped
+                self._ensure_initial_snapshot(stamped)
                 self.real_trajectory_steps.append(stamped)
                 self.real_trajectory_steps = self.real_trajectory_steps[-80:]
                 self.pending_tentative_step = None
@@ -1720,6 +1742,7 @@ class HuahuaApp(tk.Tk):
         self.last_real_capture_step = step
         step_key = _stable_payload_key(step)
         if step_key != self.last_real_step_key:
+            self._ensure_initial_snapshot(step)
             self.real_trajectory_steps.append(step)
             self.real_trajectory_steps = self.real_trajectory_steps[-60:]
             self.last_real_step_key = step_key
@@ -1739,6 +1762,7 @@ class HuahuaApp(tk.Tk):
             return False
         score = _internal_run_score(terminal)
         score_breakdown = _internal_score_breakdown(terminal)
+        initial_snapshot = self._initial_snapshot_from_steps(reliable_steps)
         payload = {
             "version": 2,
             "kind": "auto_capture_trajectory",
@@ -1752,9 +1776,11 @@ class HuahuaApp(tk.Tk):
             "score_breakdown": score_breakdown,
             "terminal": terminal,
             "high_score_gate": high_score_gate,
+            "initial_snapshot": initial_snapshot,
             "finish_seen": finish_seen,
             "steps": reliable_steps[-40:],
         }
+        payload = _with_initial_aliases(payload)
         payload = _with_state_action_result_metadata(payload)
         payload_key = _stable_payload_key(payload)
         if payload_key == self.last_auto_trajectory_key:
@@ -1763,6 +1789,73 @@ class HuahuaApp(tk.Tk):
         if saved:
             self.last_auto_trajectory_key = payload_key
         return saved
+
+    def _ensure_initial_snapshot(self, step: dict) -> None:
+        if self.real_initial_snapshot is not None:
+            return
+        if not _quality_is_trusted_for_trajectory(step.get("quality")):
+            return
+        self.real_initial_snapshot = _initial_snapshot_from_step(step)
+
+    def _initial_snapshot_from_steps(self, reliable_steps: list[dict]) -> dict | None:
+        if self.real_initial_snapshot is not None:
+            return self.real_initial_snapshot
+        if reliable_steps:
+            return _initial_snapshot_from_step(reliable_steps[0])
+        return None
+
+    def _record_compressed_run_summary(
+        self,
+        *,
+        reason: str,
+        skip_reason: str,
+        terminal: dict,
+        high_score_gate: dict,
+        score: float,
+        score_breakdown: dict,
+        reliable_steps: list[dict],
+        raw_finish_seen: bool,
+        finish_seen: bool,
+    ) -> bool:
+        initial_snapshot = self._initial_snapshot_from_steps(reliable_steps)
+        if not initial_snapshot:
+            return False
+        summary_kind = _compressed_summary_kind(terminal, high_score_gate)
+        payload = {
+            "version": 1,
+            "kind": summary_kind,
+            "weight": _compressed_summary_weight(summary_kind),
+            "session": self.real_session_id,
+            "reason": reason,
+            "skip_reason": skip_reason,
+            "started_at": self.real_session_started_at,
+            "finished_at": _trajectory_finished_at(self.real_session_started_at, reliable_steps),
+            "internal_score": score,
+            "score_model": "huahua-v2-treasure-equivalence",
+            "score_breakdown": score_breakdown,
+            "terminal": terminal,
+            "high_score_gate": high_score_gate,
+            "initial_snapshot": initial_snapshot,
+            "steps": len(self.real_trajectory_steps),
+            "reliable_steps": len(reliable_steps),
+            "raw_finish_seen": raw_finish_seen,
+            "finish_seen": finish_seen,
+        }
+        payload = _with_initial_aliases(payload)
+        payload_key = _stable_payload_key(
+            {
+                "session": self.real_session_id,
+                "kind": summary_kind,
+                "initial": initial_snapshot.get("signature"),
+                "terminal": terminal.get("known"),
+                "score": round(float(score or 0.0), 3),
+            }
+        )
+        if payload_key == self.last_compressed_summary_key:
+            return False
+        self.last_compressed_summary_key = payload_key
+        record_observation("compressed_run_summary", payload, source="real_capture")
+        return True
 
     def _export_learning_data(self) -> None:
         path = filedialog.asksaveasfilename(
@@ -3936,6 +4029,48 @@ def _compact_real_capture_step(
     }
 
 
+def _initial_snapshot_from_step(step: dict) -> dict:
+    board = step.get("board") if isinstance(step.get("board"), dict) else {}
+    tiles = step.get("tiles") if isinstance(step.get("tiles"), list) else []
+    current = step.get("current") if isinstance(step.get("current"), dict) else None
+    quality = step.get("quality") if isinstance(step.get("quality"), dict) else {}
+    snapshot = {
+        "schema": "huahua-initial-snapshot-v1",
+        "step_index": step.get("step_index"),
+        "t": step.get("t"),
+        "board": _learning_board_snapshot(step),
+        "tiles": tiles,
+        "board_known": _paint_collection_summary_from_compact(tiles),
+        "current": current,
+        "anchor": step.get("anchor"),
+        "pending": bool(step.get("pending")),
+        "backpack": step.get("backpack") or {},
+        "resources": step.get("resources") or {},
+        "quality": quality,
+        "signature": _stable_payload_key(
+            {
+                "board": board.get("states"),
+                "tiles": tiles,
+                "current": current,
+                "anchor": step.get("anchor"),
+                "pending": bool(step.get("pending")),
+            }
+        ),
+    }
+    return snapshot
+
+
+def _with_initial_aliases(payload: dict) -> dict:
+    initial_snapshot = payload.get("initial_snapshot")
+    if not isinstance(initial_snapshot, dict):
+        return payload
+    enriched = dict(payload)
+    board = initial_snapshot.get("board")
+    enriched["initial_board"] = board if isinstance(board, dict) else {}
+    enriched["initial_anchor"] = initial_snapshot.get("anchor")
+    return enriched
+
+
 def _compact_board_summary(scene: SceneObservation) -> dict:
     state_counts = Counter(tile.state.value for tile in scene.board.tiles)
     states = "".join(_tile_state_code(tile.state) for tile in scene.board.tiles)
@@ -4747,6 +4882,42 @@ def _merge_paint_summaries(*summaries: dict) -> dict:
 
 def _internal_run_score(terminal: dict) -> float:
     return round(_internal_score_breakdown(terminal)["total"], 3)
+
+
+def _compressed_summary_kind(terminal: dict, high_score_gate: dict) -> str:
+    if isinstance(high_score_gate, dict) and high_score_gate.get("passed") is True:
+        return "candidate_high_score"
+    known = terminal.get("known") if isinstance(terminal.get("known"), dict) else {}
+    if _summary_has_high_value(known):
+        return "candidate_low_weight"
+    if _summary_has_level6_cluster(known):
+        return "candidate_level6_cluster"
+    return "low_value_terminal"
+
+
+def _compressed_summary_weight(kind: str) -> float:
+    return {
+        "candidate_high_score": 0.75,
+        "candidate_low_weight": 0.45,
+        "candidate_level6_cluster": 0.30,
+        "low_value_terminal": 0.15,
+    }.get(kind, 0.1)
+
+
+def _summary_has_level6_cluster(summary: dict) -> bool:
+    levels = summary.get("levels") if isinstance(summary.get("levels"), dict) else {}
+    level6_or_higher = 0
+    for level_text, count in levels.items():
+        try:
+            level = int(level_text)
+            amount = int(count or 0)
+        except (TypeError, ValueError):
+            continue
+        if 6 <= level < 7:
+            level6_or_higher += amount
+    treasure6_plus = int(summary.get("treasure6", 0) or 0)
+    lv7 = int(summary.get("lv7", 0) or 0)
+    return treasure6_plus <= 0 and lv7 <= 0 and level6_or_higher >= 2
 
 
 def _internal_score_breakdown(terminal: dict) -> dict:

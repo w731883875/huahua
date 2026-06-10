@@ -131,17 +131,35 @@ Next step:
 
 ## Task 5: Add Top3 Hit Statistics
 
-Status: pending
+Status: completed
 
 Extend recommendation hit stats with Top3 hit counts/rates while preserving existing Top1 fields.
 
 Work performed:
 
+- Extended `_recommendation_hit_summary()` in `huahua_assistant/learning.py` with `top3`, `top3_rate`, and `top3_pct`.
+- Computed Top3 as the sum of `rank_1`, `rank_2`, and `rank_3` recommendation hits from existing real trajectory rank counters.
+- Preserved existing `top1`, `top1_rate`, `top1_pct`, `hit_rate`, `hit_pct`, and `rank_counts` fields.
+- Kept the change scoped to stats output; existing trajectory capture and rank counters did not need schema changes.
+
 Validation evidence:
+
+- `python -c "import subprocess; data=subprocess.check_output(['git','show',':huahua_assistant/learning.py']); compile(data.decode('utf-8'), 'staged huahua_assistant/learning.py', 'exec'); print('staged learning.py syntax OK')"`
+- `python -m py_compile huahua_assistant\learning.py`
+- Smoke test for `_recommendation_hit_summary()` confirmed `top3=rank_1+rank_2+rank_3`, `top3_rate`, `top3_pct`, and unchanged rank counts.
+- `python scripts\check_encoding.py .`
+- `git diff --cached --check`
+- Staged diff review confirmed only the Top3 summary fields were included.
+- Commit: `6836cd2 Add top3 recommendation hit stats`
 
 Remaining risk:
 
+- Existing historical stats files are rebuilt from raw logs when loaded, but any externally exported old bundle will not contain Top3 until stats are regenerated or exported again.
+- UI/report text still primarily displays Top1; Task 6 checkpoint will review whether to surface Top3 in the panel/report without mixing it into this task.
+
 Next step:
+
+- Task 6: Major Checkpoint 2.
 
 ## Task 6: Major Checkpoint 2
 

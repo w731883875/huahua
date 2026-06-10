@@ -163,17 +163,38 @@ Next step:
 
 ## Task 6: Major Checkpoint 2
 
-Status: pending
+Status: completed
 
 Review stats correctness, UI/report display, data compatibility, py_compile, encoding, and checklist sync after Tasks 4-5.
 
 Work performed:
 
+- Reviewed Task 4 and Task 5 commits:
+  - `757aa5b Add explicit candidate sample metadata`
+  - `6836cd2 Add top3 recommendation hit stats`
+- Confirmed candidate samples remain in `compressed_run_summary` observations and do not pollute `high_score_trajectories.jsonl`.
+- Confirmed Top3 stats are produced by `_recommendation_hit_summary()` as `top3`, `top3_rate`, and `top3_pct` while preserving Top1 fields.
+- Found and fixed the UI/report gap where imitation policy details still displayed Top1 only; the report line now displays Top1 and Top3.
+- Reviewed worktree drift and kept existing out-of-scope terrain/stats UI, generated cache files, build script, runtime, and workspace helper changes out of this checkpoint's code commit.
+
 Validation evidence:
+
+- `python -m py_compile huahua_assistant\app.py huahua_assistant\learning.py huahua_assistant\game_model.py`
+- `python scripts\check_encoding.py .`
+- `checkpoint task4 task5 stats smoke OK` smoke test covered `_compressed_summary_sample_metadata()`, `_recommendation_hit_summary()`, `_format_imitation_policy_detail_lines()`, and `load_learning_stats()`.
+- `git diff --check` passed with only the existing CRLF warning for `runtime/desktop_pet_position.json`.
+- Staged diff review confirmed the Task 6 code commit only changed the Top3 display line.
+- Commit: `c948dbe Show top3 recommendation hit stats`
 
 Remaining risk:
 
+- The worktree still contains pre-existing or out-of-scope uncommitted changes, including terrain/stats UI work, generated `__pycache__`, runtime position JSON, build scripts, and workspace encoding helpers.
+- Existing historical exported bundles need stats regeneration/export to include the new Top3 fields.
+- Runtime data volume is still low for some new stats paths; benefits depend on future real captured trajectories and summaries.
+
 Next step:
+
+- Task 7: Expert Stage Weighting / Selection Metadata.
 
 ## Task 7: Expert Stage Weighting / Selection Metadata
 

@@ -132,7 +132,7 @@ class HuahuaApp(tk.Tk):
         self.last_fast_events: tuple[FastVisionEvent, ...] = ()
         self.last_pet_state: PetBrainState | None = None
         self.tracker = VisionTracker()
-        self.detected_backpack_cache: dict[str, tuple[Paint, float]] = {}
+        self.detected_backpack_cache: dict[str, tuple[Paint, float, dict]] = {}
         self.backpack_session_key: str | None = None
         self.manual_correction_applied = False
         self.real_trajectory_steps: list[dict] = []
@@ -1513,6 +1513,7 @@ class HuahuaApp(tk.Tk):
             scene=scene,
             state=state,
             backpack=state.backpack,
+            backpack_details=self._backpack_cache_details(),
             recommendations=self.recommendations,
             brush_scenario=self.brush_scenario,
             resources=self._resource_state(),
@@ -1729,6 +1730,7 @@ class HuahuaApp(tk.Tk):
             scene=scene,
             state=self.current_state,
             backpack=backpack,
+            backpack_details=self._backpack_cache_details(),
             recommendations=self.recommendations,
             brush_scenario=self.brush_scenario,
             resources=self._resource_state(),
@@ -1923,7 +1925,7 @@ class HuahuaApp(tk.Tk):
             self.backpack_session_key = session_key
         if scene.backpack is None:
             return tuple(item[0] for item in self.detected_backpack_cache.values())
-        for observed in scene.backpack.paints:
+        for index, observed in enumerate(scene.backpack.paints):
             key = _observed_paint_key(observed)
             paint = Paint(
                 category=observed.category,
@@ -1932,10 +1934,19 @@ class HuahuaApp(tk.Tk):
                 is_treasure=observed.is_treasure,
             )
             confidence = observed.category_confidence * 0.55 + observed.level_confidence * 0.45
+            detail = _compact_observed_backpack_paint(observed, index=index)
             previous = self.detected_backpack_cache.get(key)
             if previous is None or confidence >= previous[1]:
-                self.detected_backpack_cache[key] = (paint, confidence)
+                self.detected_backpack_cache[key] = (paint, confidence, detail)
         return tuple(item[0] for item in self.detected_backpack_cache.values())
+
+    def _backpack_cache_details(self) -> list[dict]:
+        details: list[dict] = []
+        for index, item in enumerate(self.detected_backpack_cache.values()):
+            detail = dict(item[2])
+            detail["i"] = index
+            details.append(detail)
+        return details
 
     def _record_scene_observation(
         self,
@@ -3987,6 +3998,7 @@ def _compact_real_capture_step(
     scene: SceneObservation,
     state: PuzzleState,
     backpack: tuple[Paint, ...],
+    backpack_details: list[dict] | None = None,
     recommendations: list[PlacementRecommendation],
     brush_scenario: BrushChoiceScenario | None,
     resources: ResourceState,
@@ -4015,6 +4027,8 @@ def _compact_real_capture_step(
         "anchor": list(state.current_anchor) if state.current_anchor is not None else None,
         "pending": current_rule_is_pending(state),
         "backpack": _paint_collection_summary(backpack),
+        "backpack_visible": _compact_visible_backpack(scene),
+        "backpack_cumulative": _compact_cumulative_backpack(backpack, backpack_details),
         "brush": brush_payload,
         "active_affix": _compact_affix(state.active_affix),
         "resources": {
@@ -4058,6 +4072,61 @@ def _initial_snapshot_from_step(step: dict) -> dict:
         ),
     }
     return snapshot
+
+
+def _compact_visible_backpack(scene: SceneObservation) -> list[dict]:
+    if scene.backpack is None:
+        return []
+    return [
+        _compact_observed_backpack_paint(observed, index=index)
+        for index, observed in enumerate(scene.backpack.paints)
+    ]
+
+
+def _compact_observed_backpack_paint(observed, *, index: int) -> dict:
+    paint = Paint(
+        category=observed.category,
+        level=observed.level,
+        subtype=observed.subtype,
+        is_treasure=observed.is_treasure,
+    )
+    confidence = observed.category_confidence * 0.55 + observed.level_confidence * 0.45
+    payload = {
+        "i": index,
+        **_compact_paint(paint),
+        "slot": [observed.slot_rect.x, observed.slot_rect.y, observed.slot_rect.w, observed.slot_rect.h],
+        "fingerprint": observed.fingerprint,
+        "confidence": round(float(confidence), 3),
+        "category_confidence": round(float(observed.category_confidence), 3),
+        "level_confidence": round(float(observed.level_confidence), 3),
+    }
+    return payload
+
+
+def _compact_cumulative_backpack(backpack: tuple[Paint, ...], backpack_details: list[dict] | None = None) -> list[dict]:
+    available = [dict(item) for item in (backpack_details or []) if isinstance(item, dict)]
+    used: set[int] = set()
+    result: list[dict] = []
+    for index, paint in enumerate(backpack):
+        compact = _compact_paint(paint)
+        code = compact.get("code")
+        detail_index = next(
+            (
+                candidate_index
+                for candidate_index, detail in enumerate(available)
+                if candidate_index not in used and detail.get("code") == code
+            ),
+            None,
+        )
+        if detail_index is None:
+            result.append({"i": index, **compact})
+            continue
+        used.add(detail_index)
+        detail = dict(available[detail_index])
+        detail.update(compact)
+        detail["i"] = index
+        result.append(detail)
+    return result
 
 
 def _with_initial_aliases(payload: dict) -> dict:

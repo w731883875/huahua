@@ -3848,7 +3848,7 @@ def _format_imitation_policy_detail_lines(policy: dict) -> list[str]:
         f"- 样本：{samples}",
         f"- 阈值：{thresholds}",
         f"- 就绪：{ready}",
-        f"- 推荐命中：决策{hits.get('decisions', 0)} 命中{hits.get('hits', 0)} 命中率{float(hits.get('hit_pct', 0.0) or 0.0):.1f}% Top1={float(hits.get('top1_pct', 0.0) or 0.0):.1f}%",
+        f"- 推荐命中：决策{hits.get('decisions', 0)} 命中{hits.get('hits', 0)} 命中率{float(hits.get('hit_pct', 0.0) or 0.0):.1f}% Top1={float(hits.get('top1_pct', 0.0) or 0.0):.1f}% Top3={float(hits.get('top3_pct', 0.0) or 0.0):.1f}%",
         f"- 高频动作：{_format_distribution_summary(policy.get('top_actions'), limit=8)}",
         f"- 动作收益：{_format_action_delta_summary(policy.get('action_score_delta'), limit=8)}",
         f"- 高频落点：{_format_distribution_summary(policy.get('top_placement_cells'), limit=10)}",

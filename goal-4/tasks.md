@@ -98,17 +98,36 @@ Next step:
 
 ## Task 4: Make Candidate Sample Classification Explicit
 
-Status: pending
+Status: completed
 
 Strengthen `candidate_low_weight` / `candidate_level6_cluster` handling with explicit export/stat fields or a lightweight candidate event while avoiding high-score trajectory pollution.
 
 Work performed:
 
+- Kept candidate samples inside the existing `compressed_run_summary` observation path instead of writing them into `high_score_trajectories.jsonl`.
+- Added `_compressed_summary_sample_metadata()` in `huahua_assistant/app.py`.
+- Added explicit exported payload fields for compressed summaries: `training_weight`, `sample_class`, `sample_role`, `candidate_sample`, and `candidate_metadata`.
+- Classified `candidate_high_score`, `candidate_low_weight`, and `candidate_level6_cluster` as candidate samples with low/non-expert roles and explicit `use_for` / `exclude_from` metadata.
+- Preserved `weight` as a compatibility alias for existing consumers.
+
 Validation evidence:
+
+- `python -c "import subprocess; data=subprocess.check_output(['git','show',':huahua_assistant/app.py']); compile(data.decode('utf-8'), 'staged huahua_assistant/app.py', 'exec'); print('staged app.py syntax OK')"`
+- `python -m py_compile huahua_assistant\app.py`
+- Smoke test for `_compressed_summary_sample_metadata()` across `candidate_high_score`, `candidate_low_weight`, `candidate_level6_cluster`, and `low_value_terminal`.
+- `python scripts\check_encoding.py .`
+- `git diff --cached --check`
+- Staged diff review confirmed no terrain UI or special-action recommendation hunks were included.
+- Commit: `757aa5b Add explicit candidate sample metadata`
 
 Remaining risk:
 
+- Historical `compressed_run_summary` records do not have the new metadata fields; consumers should fall back to `kind` and `weight` for old data.
+- Dedicated aggregate candidate counters were not added in this task to avoid mixing in unrelated pending terrain/statistics work. The explicit fields are available in exported observations through the existing learning bundle export.
+
 Next step:
+
+- Task 5: Add Top3 Hit Statistics.
 
 ## Task 5: Add Top3 Hit Statistics
 

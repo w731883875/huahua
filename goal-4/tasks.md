@@ -62,17 +62,39 @@ Next step:
 
 ## Task 3: Major Checkpoint 1
 
-Status: pending
+Status: completed
 
 Review requirement drift, data compatibility, encoding, py_compile, stats rebuild safety, and checklist sync after Tasks 1-2.
 
 Work performed:
 
+- Reviewed the first two completed task commits and confirmed they are recorded:
+  - `0dfc295 Add initial aliases to trajectory payloads`
+  - `39dcb88 Add compact backpack details to trajectory steps`
+  - `2e88e3a Record goal task 2 completion`
+- Reviewed current worktree drift. `huahua_assistant/app.py` still has unrelated terrain/stats UI display changes left in the working tree; they were not included in Task 1 or Task 2 commits.
+- Confirmed `三层高分轨迹方案完成清单.md` marks top-level initial aliases and per-step backpack compact details complete, with remaining items still open.
+- Confirmed the next planned task remains candidate/low-weight trajectory classification, so the goal has not drifted into simulation or expert-filter work early.
+
 Validation evidence:
+
+- `python -m py_compile huahua_assistant\app.py huahua_assistant\learning.py huahua_assistant\game_model.py`
+- `python scripts\check_encoding.py .`
+- `load_learning_stats()` smoke test returned stats including `expert_sample_stage` and `terrain_prior`.
+- Compatibility smoke test for `_with_initial_aliases()`, `_compact_observed_backpack_paint()`, and `_compact_cumulative_backpack()`.
+- `rg -n "initial_board|initial_anchor|backpack_visible|backpack_cumulative|compressed_run_summary|candidate_low_weight|candidate_level6_cluster|expert_sample_stage|top20_threshold" huahua_assistant goal-4 "三层高分轨迹方案完成清单.md"`
+- `git diff --check` exited successfully; it reported only the existing CRLF warning for `runtime/desktop_pet_position.json`.
+- The first attempted stats smoke test used bash heredoc syntax and failed in PowerShell; rerun with a PowerShell here-string passed.
 
 Remaining risk:
 
+- The worktree remains dirty with pre-existing or out-of-scope changes, including `huahua_assistant/app.py` terrain/stats UI display changes and generated `__pycache__` files. These should not be treated as completed goal tasks until explicitly reviewed or committed under the right task.
+- Current runtime stats show no compressed summaries yet (`compressed_run_summaries: 0`) and no trajectory initial snapshots in existing historical data (`trajectory_initial_snapshots: 0`), so runtime benefits depend on future newly captured records.
+- `scripts/check_encoding.py` is available locally and was used for validation, but the repository still has several untracked workspace/encoding helper files from earlier work; this checkpoint does not claim ownership of those files.
+
 Next step:
+
+- Task 4: Make candidate sample classification explicit.
 
 ## Task 4: Make Candidate Sample Classification Explicit
 

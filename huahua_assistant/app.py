@@ -2139,10 +2139,15 @@ class HuahuaApp(tk.Tk):
             "known": combined_summary,
             "current": _compact_rule(state.current_rule) if state is not None else None,
             "score": _quality_proxy(combined_summary),
+            "proxy_score": {
+                "value": _quality_proxy(combined_summary),
+                "model": "huahua-v2-treasure-equivalence",
+                "breakdown": _internal_score_breakdown({"known": combined_summary}),
+            },
             "score_breakdown": _internal_score_breakdown({"known": combined_summary}),
             "recommendations": [
-                _compact_recommendation(rec)
-                for rec in (recommendations or [])[:3]
+                _compact_recommendation(rec, rank=rank)
+                for rank, rec in enumerate((recommendations or [])[:36], start=1)
             ],
         }
         event_key = _stable_payload_key(
@@ -4037,6 +4042,10 @@ def _compact_real_capture_step(
         "stage2": stage2,
     }
     brush_payload.update(brush_payload_codes(stage1, chosen, stage2))
+    candidate_payloads = [
+        _compact_recommendation(rec, rank=rank)
+        for rank, rec in enumerate(recommendations[:36], start=1)
+    ]
     return {
         "type": "capture",
         "board": _compact_board_summary(scene),
@@ -4056,7 +4065,8 @@ def _compact_real_capture_step(
         },
         "tiles": _compact_tile_paints(state),
         "quality": quality or {},
-        "top": [_compact_recommendation(rec) for rec in recommendations[:3]],
+        "top": candidate_payloads[:3],
+        "candidates": candidate_payloads,
     }
 
 
@@ -4222,17 +4232,28 @@ def _compact_affix(affix: AffixRule | None) -> dict | None:
     return payload
 
 
-def _compact_recommendation(rec: PlacementRecommendation) -> dict:
+def _compact_recommendation(rec: PlacementRecommendation, *, rank: int | None = None) -> dict:
+    paint_payload = _compact_paint(rec.paint) if rec.paint is not None else None
+    paint_id = paint_payload.get("code") if paint_payload is not None else "none"
     payload = {
         "r": rec.row,
         "c": rec.col,
-        "paint": _compact_paint(rec.paint) if rec.paint is not None else None,
+        "paint": paint_payload,
         "score": round(rec.score, 1),
         "complete": rec.completes_match,
+        "candidate_id": f"placement:{rec.row}:{rec.col}:{paint_id}",
+        "action_id": f"board.place:{rec.row}:{rec.col}",
+        "legal": True,
     }
+    if rank is not None:
+        payload["rank"] = int(rank)
     explanation = _compact_recommendation_explanation(rec)
     if explanation:
         payload["explanation"] = explanation
+    payload["policy_score"] = {
+        "value": round(rec.score, 1),
+        "components": dict(explanation.get("layers") or {}),
+    }
     return payload
 
 

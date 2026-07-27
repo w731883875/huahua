@@ -10,6 +10,11 @@ from typing import Any
 
 from .codes import affix_code, brush_code, canonical_affix_id
 from .config import config_value
+from .outcome_learning import (
+    build_outcome_risk_report,
+    normalize_observation_payload,
+    normalize_trajectory_payload,
+)
 
 
 RUNTIME_DIR = Path("runtime")
@@ -23,15 +28,18 @@ def record_observation(event_type: str, payload: dict[str, Any], *, source: str)
     if source != "real_capture":
         return
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    events = _load_events()
+    normalized_payload = normalize_observation_payload(event_type, _jsonable(payload), session_events=events)
     event = {
         "ts": time.time(),
         "event": event_type,
         "source": source,
-        "payload": _jsonable(payload),
+        "payload": normalized_payload,
     }
     with OBSERVATION_LOG.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
-    _write_stats(_load_events(), _load_corrections(), _load_trajectories())
+    events.append(event)
+    _write_stats(events, _load_corrections(), _load_trajectories())
 
 
 def record_correction(payload: dict[str, Any], *, source: str) -> None:
@@ -55,16 +63,24 @@ def record_high_score_trajectory(payload: dict[str, Any], *, source: str) -> boo
     if not _trajectory_payload_is_trusted(payload):
         return False
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-    payload_hash = _payload_hash(payload)
-    existing_hashes = {_payload_hash(event.get("payload") or {}) for event in _load_trajectories()}
-    if payload_hash in existing_hashes:
+    legacy_payload_hash = _payload_hash(payload)
+    normalized_payload = normalize_trajectory_payload(_jsonable(payload))
+    payload_hash = _payload_hash(normalized_payload)
+    existing_hashes: set[str] = set()
+    for existing in _load_trajectories():
+        existing_payload = existing.get("payload") or {}
+        existing_hashes.add(str(existing.get("payload_hash") or _payload_hash(existing_payload)))
+        existing_hashes.add(_payload_hash(existing_payload))
+        existing_hashes.add(_payload_hash(normalize_trajectory_payload(existing_payload)))
+    if payload_hash in existing_hashes or legacy_payload_hash in existing_hashes:
         return False
     event = {
         "ts": time.time(),
         "event": "high_score_trajectory",
         "source": source,
-        "payload": _jsonable(payload),
+        "payload": normalized_payload,
         "payload_hash": payload_hash,
+        "legacy_payload_hash": legacy_payload_hash,
     }
     with TRAJECTORY_LOG.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
@@ -131,7 +147,7 @@ def merge_learning_bundle(path: str | Path) -> dict[str, Any]:
 
 def load_learning_stats() -> dict[str, Any]:
     # Rebuild from raw events so old stat files cannot keep pre-filter data.
-    return _build_stats(_load_events(), _load_corrections(), _load_trajectories())
+    return _build_complete_stats(_load_events(), _load_corrections(), _load_trajectories())
 
 
 def _load_events() -> list[dict[str, Any]]:
@@ -213,9 +229,23 @@ def _write_stats(
     trajectories: list[dict[str, Any]] | None = None,
 ) -> None:
     STATS_PATH.write_text(
-        json.dumps(_build_stats(events, corrections, trajectories), ensure_ascii=False, indent=2, sort_keys=True),
+        json.dumps(_build_complete_stats(events, corrections, trajectories), ensure_ascii=False, indent=2, sort_keys=True),
         encoding="utf-8",
     )
+
+
+def _build_complete_stats(
+    events: list[dict[str, Any]],
+    corrections: list[dict[str, Any]] | None = None,
+    trajectories: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    stats = _build_stats(events, corrections, trajectories)
+    stats["outcome_risk"] = build_outcome_risk_report(
+        events,
+        trajectories or [],
+        min_samples=int(config_value("learning.outcome_min_samples", 20) or 20),
+    )
+    return stats
 
 
 def _build_stats(

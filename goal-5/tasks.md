@@ -257,17 +257,40 @@ Next step:
 
 ## Task 8: Add Outcome And Risk Learning Schema
 
-Status: pending
+Status: completed
 
 Version decision and run records to distinguish observed game outcomes from proxy scores, retain ordinary/failure summaries, log candidate sets and chosen actions, and compute stable/balanced/gamble risk metrics without premature labeling.
 
 Work performed:
 
+- Added `outcome_learning.py` with versioned `huahua-decision-v2`, `huahua-run-outcome-v2`, and `huahua-risk-summary-v1` contracts while preserving legacy payload fields.
+- Separated `observed_outcome`, `proxy_score`, and candidate-level `policy_score`; internal treasure-equivalence values never populate an actual observed score.
+- Recorded complete bounded placement candidate sets with canonical action/paint IDs, rank, legality, layered policy components, risk decomposition, actual choice, Top1/Top3 hits, transition deltas, resource state, and attribution trust gates.
+- Retained trusted high-value trajectories with full decision records and converted ordinary/failure terminal records into lightweight summaries with initial-map buckets, major decisions, resources, terminal distribution, failure reason, and recognition quality.
+- Added deduplicated stable/balanced/gamble risk reports with mean, median, population standard deviation, IQR, P10/P20/P80/P90, bottom-20% mean, high/low/failure rates, and force/refresh usage.
+- Required at least 20 comparable same-bucket/same-policy runs and explicit observed scores before trend or personalization readiness; proxy-only and legacy unclassified data remain observing with no style label.
+- Integrated normalization and risk reports into real-capture observation/trajectory writes and learning stats without rewriting existing runtime JSONL files.
+- Code commit: `4a804e9 Add outcome and risk learning schema`.
+
 Validation evidence:
+
+- Full suite passed: 64 tests; 11 focused outcome/risk tests cover score separation, full candidate normalization, attribution gates, trajectory/summary retention, percentiles, resource metrics, sample thresholds, proxy-only behavior, session deduplication, and isolated file writes.
+- Strict Python 3.12.10 environment check passed with all 11 locked distributions exact; encoding validation checked 62 project text files.
+- Read-only rebuild of current logs produced 7 deduplicated legacy runs. All remain `unclassified`, `proxy_score`, and `observing`; personalization is disabled and no style label is emitted.
+- Isolated PyInstaller build succeeded with a 75,788,621-byte EXE and SHA256 `C6EC8F9AC6B9085CE726260FB23AD413CE8715D275E5210923FD084165015D5C`; critical missing-module count was 0.
+- Runtime observation, trajectory, correction, position, and stats SHA256 values were unchanged across tests, read-only reports, and packaging.
+- `git diff --cached --check` passed and the Task 8 commit excluded pre-existing README, config, game-model, learning-stat extensions, runtime, script, cache, and workspace-helper changes.
 
 Remaining risk:
 
+- Historical runs have no explicit strategy mode or actual game score, so they are intentionally unclassified/proxy-only and cannot establish a personal trend.
+- Actual outcome score support is contract-ready but depends on future reliable recognition of a game-provided final score; terminal distributions remain observed facts without being relabeled as an actual score.
+- Full candidates are available for new captures; old logs retain only their historical Top3 fields and cannot be reconstructed into unseen alternatives.
+- Live GUI capture was not launched; Task 9 must re-audit privacy, compatibility, pet behavior, packaging, and rollback as an integrated checkpoint.
+
 Next step:
+
+- Task 9: run the third major checkpoint across real-data-only writes, privacy, legacy compatibility, outcome integrity, risk metrics, UI guidance, build, and rollback.
 
 ## Task 9: Major Checkpoint 3
 

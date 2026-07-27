@@ -405,17 +405,40 @@ Next step:
 
 ## Task 12: Major Checkpoint 4
 
-Status: pending
+Status: completed
 
 Review evaluation determinism, multi-user validation/security, consent defaults, data weighting, expert thresholds, policy compatibility, docs, tests, build, and rollback.
 
 Work performed:
 
+- Audited Task 10/11 against deterministic evaluation, score separation, consent timing, queue state, schema compatibility, privacy exclusions, event/bundle deduplication, quarantine rules, installation/session weighting, expert thresholds, package inclusion, rollback, and the passive-assistance boundary.
+- Found and fixed three checkpoint issues before release validation: local queueing now requires consent to still be enabled at enqueue time; normalized run event game/recognizer/policy versions must match the enclosing bundle; and privacy validation now also rejects generic path, note, title, username/user ID, and OCR-text fields.
+- Added consent-before-bundle and bundle-before-enqueue timestamp ordering, strict boolean consent parsing, bounded/clean handling of malformed path/JSON inputs, and regression coverage for the new gates.
+- Added `huahua_assistant.multi_user` as an explicit PyInstaller hidden import so the packaged application contains the privacy contract module even though sharing remains absent from the Tk UI and disabled by default.
+- Created detached clean worktrees from committed checkpoints to ensure pre-existing user edits could not hide missing files, line-ending issues, runtime writes, or package omissions.
+- Repeated tests, strict environment/encoding checks, fixed-seed simulation, two identical 100-seed evaluations, passive API scans, runtime hash checks, and two isolated PyInstaller builds; the second build verified the final hidden import.
+- Confirmed rollback isolation: `c7b08f0` contains batch evaluation, `68c94f8` contains the initial multi-user contract, `2873467` contains checkpoint hardening, and `7bee597` contains only package inclusion.
+
 Validation evidence:
+
+- Clean committed worktree at `2873467d18ba1a5f302956a1d41a7bdfb9ca9d09` passed all 79 tests in 2.411 seconds, strict Python 3.12.10 validation with all 11 lock packages exact, fixed-seed brush/refresh simulation, and encoding checks across 66 committed text files.
+- Two independent 100-seed reports with seeds 10-109 and the same revision produced identical report SHA256 `3a547caed9899e6612cd2d3a3d829a2652ac331a71c94c8aa54a68a867a654ed` and identical file SHA256 `B690AE4F3A80F07C1083B0FF764276782917E9FB750B3AA7C691072A0ACD5890`.
+- Formal runtime JSON/JSONL SHA256 comparison reported 0 changes after clean tests, environment/encoding checks, simulation, both batch reports, and packaging.
+- The final clean PyInstaller build at commit `7bee597c4a73b420beb1603d78bfb93ebb7d8e1d` produced a 75,788,596-byte `HuahuaAssistant.exe` with SHA256 `F2C459FD32A8232607EFB222CC279CEC65929404B57A42AF50B0D2D2103F1683`.
+- Final Analysis TOC contains `huahua_assistant.multi_user`; warning audit found 0 critical missing `cv2`, `mss`, `PIL`, `tkinter`, or `huahua_assistant` modules.
+- Static Python scan found 0 requests/urllib/httpx/aiohttp/socket clients and 0 pyautogui/pynput/SendInput/mouse_event/keybd_event input-injection APIs. Remote upload remains hard-coded false.
+- Dirty-worktree review confirmed the checkpoint commits excluded the user's existing README, app, config, game-model, learning, runtime-position, script, cache, and workspace-helper changes.
 
 Remaining risk:
 
+- The packaged GUI was not launched because it could steal focus. Live window capture, per-monitor DPI, click-through transparency, pointer alignment, and real recognition accuracy remain for the final visual/manual assessment.
+- Batch scores remain synthetic current-rule proxies. Generated states currently underrepresent late-game overwrite/downside decisions, and force opportunity cost beyond the current episode is not modeled.
+- Rotating installation pseudonyms preserve privacy but cannot prove that different pseudonyms are independent humans; a malicious participant can create multiple secrets. Expert readiness is an evaluation gate, not Sybil-resistant identity proof.
+- Bundles are integrity-hashed but unsigned. No server, authenticated transport, signed policy package, automatic strategy loading, or sharing UI exists; these absences are deliberate safety boundaries, not production multi-user readiness.
+
 Next step:
+
+- Task 13: perform the final end-to-end audit, update completion/user documentation, and only then produce the minimal prioritized screenshot gap list that existing workbook/PDF/runtime assets cannot resolve.
 
 ## Task 13: Final Review And Screenshot Gap Assessment
 

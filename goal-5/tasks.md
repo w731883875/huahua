@@ -67,17 +67,46 @@ Next step:
 
 ## Task 3: Major Checkpoint 1
 
-Status: pending
+Status: completed
 
 Review requirement drift, documentation accuracy, environment reproducibility, test health, dirty-worktree safety, build implications, and rollback before business logic changes.
 
 Work performed:
 
+- Reviewed the original request, Goal 5 plan, optimization design, Task 1/2 outputs, current code entry points, runtime data boundaries, and dirty worktree before business-logic changes.
+- Confirmed there is no requirement drift: passive assistance, Top1 pet guidance, risk modes, opt-in multi-user data, and screenshot-last sequencing remain intact.
+- Clarified in `桌宠辅助项目优化设计.md` that the old v2.1 PyQt5/PaddleOCR/SQLite document is a mechanism/legacy-plan reference, not the current implemented stack.
+- Added `requirements-lock.txt` for the exact Windows CPython 3.12 environment validated at this checkpoint and changed the development guide to prefer the lock over loose minimum ranges.
+- Extended strict environment validation to require the lock file and verify every direct/transitive locked distribution at its exact version.
+- Fixed the existing encoding checker to skip `.venv` and common test caches; added regression tests for encoding exclusions and lock parsing.
+- Audited passive/safe behavior: no input-injection or network/upload calls were found in application code, and three learning write entry points reject non-`real_capture` sources.
+- Built the application with PyInstaller into a unique system temporary directory so the project's existing `build/`, `dist/`, spec, exe, and runtime data were not overwritten.
+- Checkpoint fix commit: `1237f2e Harden checkpoint environment validation`.
+
 Validation evidence:
+
+- Strict environment check passed on Python 3.12.10 with all 11 lock packages matching exactly; `pip check` reported no broken requirements and lock dry-run found all packages satisfied.
+- Full suite passed: 20 tests in 0.048 seconds after checkpoint fixes.
+- Fixed-seed simulation still produced placement, brush, force, and refresh recommendations.
+- Encoding check inspected 56 project text files successfully after `.venv` exclusion; script/test AST parsing passed.
+- Temporary PyInstaller build succeeded with PyInstaller 6.21.0 and Python 3.12.10, producing a 75,738,817-byte `HuahuaAssistant.exe` with SHA256 `1122E82447B99104C85914D8654F965FE251DB71EABFE5FE66028E4F0FE96DCD`.
+- Build TOC contained pet asset evidence, and the warning audit found zero missing `cv2`, `mss`, `PIL`, `tkinter`, or `huahua_assistant` modules.
+- SHA256 values for all runtime JSON/JSONL files were unchanged across tests and the temporary build.
+- `git diff --check` reported no whitespace errors in task changes; only the pre-existing CRLF conversion warning for `runtime/desktop_pet_position.json` remains.
+- Dirty-worktree audit confirmed checkpoint commits excluded existing changes in README, spec, `app.py`, `config.py`, `game_model.py`, `learning.py`, runtime position, build/install scripts, caches, and workspace helpers.
 
 Remaining risk:
 
+- The temporary exe was inspected but not launched because doing so would open/steal focus from a GUI; live startup remains a later manual/runtime gate.
+- Live game capture, recognition accuracy, Tk click-through, and pet visibility have not yet been proven on the user's display configuration.
+- Task 4 overlaps `game_model.py`, which already has substantial pre-existing uncommitted changes; implementation must preserve and test those changes rather than replace the file.
+- Legacy install/build scripts still install loose `requirements.txt` ranges. The authoritative reproducible workflow is currently the explicit lock command in `开发与测试指南.md`.
+- Existing tracked Python 3.13 cache changes remain dirty and were intentionally left untouched.
+- The unique temporary checkpoint build directory remains under the system temp directory because recursive cleanup was rejected by the execution safety policy; it does not affect the project worktree.
+
 Next step:
+
+- Task 4: introduce canonical affix identities and aliases with backward-compatible legacy codes and logs.
 
 ## Task 4: Canonicalize Affix IDs And Recognition Aliases
 

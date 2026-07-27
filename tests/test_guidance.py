@@ -167,6 +167,37 @@ class RecommendationTargetStabilizerTests(unittest.TestCase):
         self.assertEqual((1250, 730), refreshed.screen_point)
         self.assertGreater(refreshed.expires_at, stable.expires_at)
 
+    def test_repeated_ui_render_of_same_frame_does_not_extend_ttl(self) -> None:
+        stabilizer = RecommendationTargetStabilizer()
+        context = ("window-a",)
+        stabilizer.update(
+            _proposal("f1"),
+            phase=GamePhase.BOARD_PLACE,
+            context_signature=context,
+            now=1.0,
+        )
+        stable = stabilizer.update(
+            _proposal("f2"),
+            phase=GamePhase.BOARD_PLACE,
+            context_signature=context,
+            now=1.31,
+        )
+        repeated = stabilizer.update(
+            _proposal("f2"),
+            phase=GamePhase.BOARD_PLACE,
+            context_signature=context,
+            now=2.5,
+        )
+        expired = stabilizer.update(
+            _proposal("f2"),
+            phase=GamePhase.BOARD_PLACE,
+            context_signature=context,
+            now=stable.expires_at + 0.01,
+        )
+
+        self.assertEqual(stable.expires_at, repeated.expires_at)
+        self.assertIsNone(expired)
+
     def test_low_confidence_context_change_and_expiry_hide_target(self) -> None:
         stabilizer = RecommendationTargetStabilizer()
         old_context = ("window-a",)

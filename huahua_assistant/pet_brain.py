@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass, replace
 
@@ -254,8 +255,12 @@ def _phase_evidence(app, frame_id: str) -> PhaseEvidence:
 def _finish_signals(app, events: tuple[FastVisionEvent, ...]) -> set[str]:
     signals: set[str] = set()
     scene = getattr(app, "current_scene", None)
+    snapshot = getattr(app, "last_fast_snapshot", None)
     if scene is not None and scene.region(RegionKind.FINISH_DRAWING) is not None:
         signals.add("finish_button")
+    terrain_counts = getattr(snapshot, "terrain_counts", None)
+    if _terrain_counts_show_terminal_map(terrain_counts):
+        signals.add("terminal_map")
     for event in events:
         if event.kind != "finish_candidate":
             continue
@@ -263,7 +268,8 @@ def _finish_signals(app, events: tuple[FastVisionEvent, ...]) -> set[str]:
         if reason == "finish_region":
             signals.add("finish_button")
         elif reason == "no_blank_tiles":
-            signals.add("terminal_map")
+            if _terrain_counts_show_terminal_map(event.detail.get("terrain_counts")):
+                signals.add("terminal_map")
         else:
             signals.add("finish_event")
     state = getattr(app, "current_state", None)
@@ -273,6 +279,20 @@ def _finish_signals(app, events: tuple[FastVisionEvent, ...]) -> set[str]:
     ):
         signals.add("rule_complete")
     return signals
+
+
+def _terrain_counts_show_terminal_map(terrain_counts) -> bool:
+    if not isinstance(terrain_counts, dict) or "blank" not in terrain_counts:
+        return False
+    blank_count = terrain_counts.get("blank")
+    if not isinstance(blank_count, (int, float)) or not math.isfinite(float(blank_count)):
+        return False
+    known_cells = 0
+    for value in terrain_counts.values():
+        if not isinstance(value, (int, float)) or not math.isfinite(float(value)) or value < 0:
+            continue
+        known_cells += int(value)
+    return float(blank_count) == 0.0 and known_cells >= 36
 
 
 def _target_proposal(app, evidence: PhaseEvidence) -> TargetProposal | None:
@@ -306,7 +326,7 @@ def _target_proposal(app, evidence: PhaseEvidence) -> TargetProposal | None:
         desired = _desired_backpack_paint(app)
         visible_index = _call_optional(app, "_visible_backpack_index_for_paint", desired)
         point = _call_optional(app, "_screen_point_for_backpack_slot", visible_index)
-        if desired is not None and isinstance(visible_index, int) and _valid_point(point):
+        if desired is not None and isinstance(visible_index, int) and _target_point_is_safe(app, point):
             backpack_confidence = float(getattr(getattr(scene, "backpack", None), "confidence", confidence))
             return TargetProposal(
                 key=f"backpack:{visible_index}",
@@ -324,7 +344,7 @@ def _target_proposal(app, evidence: PhaseEvidence) -> TargetProposal | None:
         row = getattr(rec, "row", None)
         col = getattr(rec, "col", None)
         point = _call_optional(app, "_screen_point_for_board_cell", row, col)
-        if isinstance(row, int) and isinstance(col, int) and _valid_point(point):
+        if isinstance(row, int) and isinstance(col, int) and _target_point_is_safe(app, point):
             return TargetProposal(
                 key=f"board:{row},{col}",
                 kind=TargetKind.BOARD,
@@ -432,7 +452,7 @@ def _desired_backpack_paint(app):
 
 def _capture_rect_point(app, rect, x_ratio: float, y_ratio: float) -> tuple[int, int] | None:
     point = _call_optional(app, "_screen_point_for_capture_rect", rect, x_ratio, y_ratio)
-    if not _valid_point(point):
+    if not _target_point_is_safe(app, point):
         return None
     return int(point[0]), int(point[1])
 
@@ -448,8 +468,75 @@ def _valid_point(point) -> bool:
     return (
         isinstance(point, (tuple, list))
         and len(point) == 2
-        and all(isinstance(value, (int, float)) for value in point)
+        and all(
+            isinstance(value, (int, float)) and math.isfinite(float(value))
+            for value in point
+        )
     )
+
+
+def _target_point_is_safe(app, point) -> bool:
+    if not _valid_point(point):
+        return False
+    x, y = float(point[0]), float(point[1])
+    window = getattr(app, "last_capture_window", None)
+    if window is not None:
+        left = getattr(window, "left", None)
+        top = getattr(window, "top", None)
+        width = getattr(window, "width", None)
+        height = getattr(window, "height", None)
+        bounds = (left, top, width, height)
+        if not all(
+            isinstance(value, (int, float)) and math.isfinite(float(value))
+            for value in bounds
+        ):
+            return False
+        if width <= 0 or height <= 0:
+            return False
+        if not (left <= x < left + width and top <= y < top + height):
+            return False
+    point_is_on_monitor = (
+        _windows_point_is_on_monitor(x, y)
+        if callable(getattr(app, "winfo_exists", None))
+        else None
+    )
+    if point_is_on_monitor is False:
+        return False
+    virtual_bounds = _virtual_screen_bounds(app) if point_is_on_monitor is None else None
+    if virtual_bounds is not None:
+        left, top, width, height = virtual_bounds
+        if width <= 0 or height <= 0:
+            return False
+        if not (left <= x < left + width and top <= y < top + height):
+            return False
+    return True
+
+
+def _windows_point_is_on_monitor(x: float, y: float) -> bool | None:
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        monitor_from_point = ctypes.windll.user32.MonitorFromPoint
+        monitor_from_point.argtypes = (wintypes.POINT, wintypes.DWORD)
+        monitor_from_point.restype = wintypes.HMONITOR
+        monitor = monitor_from_point(wintypes.POINT(int(x), int(y)), 0)
+    except (AttributeError, ImportError, OSError, TypeError, ValueError):
+        return None
+    return bool(monitor)
+
+
+def _virtual_screen_bounds(app) -> tuple[int, int, int, int] | None:
+    getters = tuple(
+        getattr(app, name, None)
+        for name in ("winfo_vrootx", "winfo_vrooty", "winfo_vrootwidth", "winfo_vrootheight")
+    )
+    if not all(callable(getter) for getter in getters):
+        return None
+    try:
+        return tuple(int(getter()) for getter in getters)
+    except Exception:
+        return None
 
 
 def _recommendation_reason(recommendation) -> str:

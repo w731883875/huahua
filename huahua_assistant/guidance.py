@@ -292,6 +292,8 @@ class RecommendationTargetStabilizer:
             return None
 
         if self._current is not None and _same_target(self._current, proposal):
+            if self._current.source_frame_id == proposal.source_frame_id:
+                return self._current
             self._current = replace(
                 self._current,
                 confidence=max(self._current.confidence, proposal.confidence),

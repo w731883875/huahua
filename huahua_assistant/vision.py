@@ -28,6 +28,8 @@ from .models import (
 
 
 BOARD_SIZE = 6
+MIN_CAPTURE_SIDE = 320
+MIN_BOARD_DETECTION_SCORE = 0.70
 
 
 class VisionTracker:
@@ -60,6 +62,8 @@ def analyze_frame(image: np.ndarray) -> BoardObservation | None:
 
 
 def analyze_scene(image: np.ndarray, previous_board_rect: Rect | None = None) -> SceneObservation | None:
+    if not _is_supported_scene_image(image):
+        return None
     if previous_board_rect is not None:
         scene = _analyze_scene_from_board_rect(image, previous_board_rect, fast=True)
         # A wrong-but-grid-like candidate can score well if it lands on the
@@ -81,7 +85,7 @@ def analyze_scene(image: np.ndarray, previous_board_rect: Rect | None = None) ->
         if best is None or score > best[0]:
             best = (score, rect)
 
-    if best is None or best[0] < 0.20:
+    if best is None or best[0] < MIN_BOARD_DETECTION_SCORE:
         return None
 
     rect = _choose_board_rect(image, best[1], best[0])
@@ -105,13 +109,25 @@ def analyze_scene_quick(
     previous_scene: SceneObservation | None = None,
     previous_board_rect: Rect | None = None,
 ) -> SceneObservation | None:
+    if not _is_supported_scene_image(image):
+        return None
     rect = previous_scene.board.rect if previous_scene is not None else previous_board_rect
     if rect is None:
         return analyze_scene(image)
     scene = _analyze_scene_from_board_rect(image, rect, fast=True, quick=True, previous_scene=previous_scene)
-    if scene is not None:
+    if scene is not None and scene.board.score >= MIN_BOARD_DETECTION_SCORE:
         return scene
     return None
+
+
+def _is_supported_scene_image(image: np.ndarray) -> bool:
+    return bool(
+        isinstance(image, np.ndarray)
+        and image.ndim == 3
+        and image.shape[2] == 3
+        and image.size
+        and min(image.shape[:2]) >= MIN_CAPTURE_SIDE
+    )
 
 
 def _analyze_scene_from_board_rect(
@@ -1128,9 +1144,17 @@ def _analyze_brush_options(
         stage1_options = ordered_options
         for option in ordered_options:
             stage1_scores[option] = max(stage1_scores.get(option, 0.0), 0.76)
-    keyword_scores = _brush_keyword_scores(stage2_crop, stage1_options)
-    stage2_scores = _brush_stage2_scores(keyword_scores, stage1_scores, stage1_options)
-    stage2_options = _detected_stage2_options(stage2_scores)
+    if len(ordered_options) >= 2:
+        # Two distinct brush-pattern cards prove this is stage 1. Running all
+        # affix templates against those descriptive cards creates convincing
+        # but false stage-2 matches.
+        keyword_scores: dict[str, float] = {}
+        stage2_scores: dict[str, float] = {}
+        stage2_options: tuple[str, ...] = ()
+    else:
+        keyword_scores = _brush_keyword_scores(stage2_crop, stage1_options)
+        stage2_scores = _brush_stage2_scores(keyword_scores, stage1_scores, stage1_options)
+        stage2_options = _detected_stage2_options(stage2_scores)
     chosen_stage1 = _infer_chosen_stage1(stage1_options, stage2_options)
     if selected_by_card is not None:
         chosen_stage1 = selected_by_card
@@ -1453,7 +1477,10 @@ def _classify_backpack_frame_shape(crop: np.ndarray) -> tuple[PaintCategory, flo
     diagonal_length = 0.0
     axial_length = 0.0
     if lines is not None:
-        for line in lines[:, 0, :]:
+        # OpenCV 4 commonly returns (N, 1, 4), while OpenCV 5 wheels may
+        # return (N, 4). Normalize both public representations.
+        normalized_lines = np.asarray(lines).reshape(-1, 4)
+        for line in normalized_lines:
             x1, y1, x2, y2 = line
             length = float(np.hypot(x2 - x1, y2 - y1))
             angle = abs(float(np.degrees(np.arctan2(y2 - y1, x2 - x1))))
@@ -2800,6 +2827,8 @@ def _classify_tile_for_board_score(tile_bgr: np.ndarray) -> TileState:
         core.shape[0] // 4 : core.shape[0] * 3 // 4,
         core.shape[1] // 4 : core.shape[1] * 3 // 4,
     ]
+    if center.size == 0:
+        center = core
     center_hsv = cv2.cvtColor(center, cv2.COLOR_BGR2HSV)
     center_blue = float(
         np.mean(
@@ -3049,6 +3078,8 @@ def classify_tile(tile_bgr: np.ndarray) -> tuple[TileState, float, dict[str, flo
         core.shape[0] // 4 : core.shape[0] * 3 // 4,
         core.shape[1] // 4 : core.shape[1] * 3 // 4,
     ]
+    if center.size == 0:
+        center = core
     center_hsv = cv2.cvtColor(center, cv2.COLOR_BGR2HSV)
     center_dark = float(np.mean(center_hsv[:, :, 2] < 70))
     center_blue = float(

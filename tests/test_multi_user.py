@@ -174,8 +174,9 @@ class MultiUserBundleTests(unittest.TestCase):
     def test_local_queue_is_validated_deduplicated_and_remote_disabled(self) -> None:
         bundle = _bundle([_decision("s1")])
         with tempfile.TemporaryDirectory() as directory:
-            first = enqueue_local_bundle(bundle, directory, enqueued_at=200.0)
-            second = enqueue_local_bundle(bundle, directory, enqueued_at=300.0)
+            consent = granted_consent(granted_at=100.0)
+            first = enqueue_local_bundle(bundle, directory, consent=consent, enqueued_at=200.0)
+            second = enqueue_local_bundle(bundle, directory, consent=consent, enqueued_at=300.0)
             envelope = validate_queue_envelope(Path(first["path"]).read_bytes())
 
         self.assertTrue(first["added"])
@@ -183,6 +184,33 @@ class MultiUserBundleTests(unittest.TestCase):
         self.assertEqual(QUEUE_SCHEMA, envelope["schema"])
         self.assertEqual("pending_local_only", envelope["state"])
         self.assertFalse(envelope["remote_upload_enabled"])
+
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(BundleValidationError):
+                enqueue_local_bundle(bundle, directory, consent=disabled_consent(), enqueued_at=200.0)
+
+    def test_consent_time_and_event_versions_must_match_bundle_contract(self) -> None:
+        with self.assertRaises(BundleValidationError):
+            create_multi_user_bundle(
+                [_decision("s1")],
+                consent=granted_consent(granted_at=102.0),
+                installation_secret="installation-secret-0001",
+                rotation_id="2026-07",
+                versions=VERSIONS,
+                created_at=101.0,
+            )
+
+        mismatched = dict(VERSIONS)
+        mismatched["policy"] = "different-policy"
+        with self.assertRaises(BundleValidationError):
+            create_multi_user_bundle(
+                [_run("s1")],
+                consent=granted_consent(granted_at=100.0),
+                installation_secret="installation-secret-0001",
+                rotation_id="2026-07",
+                versions=mismatched,
+                created_at=101.0,
+            )
 
 
 class MultiUserAggregateTests(unittest.TestCase):

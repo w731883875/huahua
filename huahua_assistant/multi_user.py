@@ -73,11 +73,17 @@ _PROHIBITED_KEY_PARTS = {
     "file_path",
     "image",
     "nickname",
+    "note",
+    "ocr_text",
     "password",
+    "path",
     "phone",
     "raw_text",
     "screenshot",
     "token",
+    "title",
+    "user_id",
+    "username",
     "window_title",
 }
 _RUN_PROJECTION = {
@@ -206,13 +212,15 @@ def validate_multi_user_bundle(bundle: Mapping[str, Any] | bytes | str) -> dict[
     _require_exact_keys(data, _BUNDLE_KEYS, "bundle")
     if data.get("schema") != BUNDLE_SCHEMA:
         raise BundleValidationError("incompatible bundle schema")
-    _validate_consent(data.get("consent"), require_enabled=True)
-    _validate_versions(data.get("versions"))
+    consent = _validate_consent(data.get("consent"), require_enabled=True)
+    versions = _validate_versions(data.get("versions"))
     installation = _require_mapping(data.get("installation"), "installation")
     _require_exact_keys(installation, {"pseudonym", "rotation_id"}, "installation")
     pseudonym = _hex_digest(installation.get("pseudonym"), "installation.pseudonym")
     _bounded_string(installation.get("rotation_id"), "installation.rotation_id", maximum=64)
-    _finite_timestamp(data.get("created_at"), "created_at")
+    created_at = _finite_timestamp(data.get("created_at"), "created_at")
+    if float(consent["granted_at"]) > created_at:
+        raise BundleValidationError("consent cannot be granted after bundle creation")
     _bounded_string(data.get("bundle_id"), "bundle_id", maximum=24, minimum=24)
     _hex_digest(data.get("content_sha256"), "content_sha256")
 
@@ -241,6 +249,11 @@ def validate_multi_user_bundle(bundle: Mapping[str, Any] | bytes | str) -> dict[
     seen_hashes: set[str] = set()
     for index, event in enumerate(events):
         _validate_bundle_event(event, index=index)
+        if event["kind"] != "recommendation_decision":
+            payload_versions = event["payload"]["versions"]
+            for key in ("game", "recognizer", "policy"):
+                if payload_versions.get(key) != versions[key]:
+                    raise BundleValidationError(f"event version {key!r} does not match bundle versions")
         event_id = str(event["event_id"])
         payload_hash = str(event["payload_sha256"])
         if event_id in seen_ids and seen_ids[event_id] != payload_hash:
@@ -266,14 +279,19 @@ def enqueue_local_bundle(
     bundle: Mapping[str, Any] | bytes | str,
     queue_directory: str | Path,
     *,
+    consent: Mapping[str, Any],
     enqueued_at: float | None = None,
 ) -> dict[str, Any]:
+    _validate_consent(consent, require_enabled=True)
     validated = validate_multi_user_bundle(bundle)
+    queued_at = _finite_timestamp(time.time() if enqueued_at is None else enqueued_at, "enqueued_at")
+    if queued_at < float(validated["created_at"]):
+        raise BundleValidationError("bundle cannot be enqueued before it was created")
     envelope = {
         "schema": QUEUE_SCHEMA,
         "state": "pending_local_only",
         "remote_upload_enabled": REMOTE_UPLOAD_ENABLED,
-        "enqueued_at": _finite_timestamp(time.time() if enqueued_at is None else enqueued_at, "enqueued_at"),
+        "enqueued_at": queued_at,
         "bundle_sha256": validated["content_sha256"],
         "bundle": validated,
     }
@@ -589,8 +607,12 @@ def _aggregate_accepted_events(events: Sequence[Mapping[str, Any]]) -> dict[str,
 def _load_bundle_input(item: Mapping[str, Any] | bytes | str | Path) -> dict[str, Any]:
     if isinstance(item, Path):
         raw: Mapping[str, Any] | bytes | str = item.read_bytes()
-    elif isinstance(item, str) and not item.lstrip().startswith("{") and len(item) < 1024 and Path(item).is_file():
-        raw = Path(item).read_bytes()
+    elif isinstance(item, str) and not item.lstrip().startswith("{") and len(item) < 1024:
+        try:
+            candidate = Path(item)
+            raw = candidate.read_bytes() if candidate.is_file() else item
+        except OSError as exc:
+            raise BundleValidationError("bundle input path is invalid or unreadable") from exc
     else:
         raw = item
     try:
@@ -666,7 +688,10 @@ def _validate_versions(value: Any) -> dict[str, str]:
 
 def _decode_bounded_json(value: Mapping[str, Any] | bytes | str, maximum: int, label: str) -> tuple[dict[str, Any], int]:
     if isinstance(value, Mapping):
-        encoded = _stable_json(value).encode("utf-8")
+        try:
+            encoded = _stable_json(value).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise BundleValidationError(f"{label} is not JSON-compatible") from exc
         data = dict(value)
     else:
         encoded = value.encode("utf-8") if isinstance(value, str) else bytes(value)

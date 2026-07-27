@@ -23,6 +23,7 @@ RUNTIME_PACKAGES = (
 REQUIRED_PROJECT_FILES = (
     "run_app.py",
     "requirements.txt",
+    "requirements-lock.txt",
     "huahua_assistant/app.py",
     "huahua_assistant/game_model.py",
     "huahua_assistant/vision.py",
@@ -39,6 +40,20 @@ def _version_at_least(value: str, minimum: str) -> bool:
     required = _version_tuple(minimum)
     width = max(len(current), len(required))
     return current + (0,) * (width - len(current)) >= required + (0,) * (width - len(required))
+
+
+def _parse_lock_lines(lines: list[str]) -> dict[str, str]:
+    locked: dict[str, str] = {}
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "==" not in line:
+            continue
+        distribution, version = line.split("==", 1)
+        distribution = distribution.strip()
+        version = version.strip()
+        if distribution and version:
+            locked[distribution] = version
+    return locked
 
 
 def environment_report(project_root: Path) -> dict:
@@ -68,11 +83,29 @@ def environment_report(project_root: Path) -> dict:
         relative: (project_root / relative).is_file()
         for relative in REQUIRED_PROJECT_FILES
     }
+    lock_path = project_root / "requirements-lock.txt"
+    lock_entries = _parse_lock_lines(lock_path.read_text(encoding="utf-8").splitlines()) if lock_path.is_file() else {}
+    locked_packages = []
+    for distribution, expected in lock_entries.items():
+        try:
+            installed = metadata.version(distribution)
+        except metadata.PackageNotFoundError:
+            installed = None
+        locked_packages.append(
+            {
+                "distribution": distribution,
+                "expected": expected,
+                "installed": installed,
+                "ok": installed == expected,
+            }
+        )
+    lock_ok = bool(locked_packages) and all(item["ok"] for item in locked_packages)
     ok = (
         python_supported
         and tkinter_found
         and all(item["ok"] for item in packages)
         and all(project_files.values())
+        and lock_ok
     )
     return {
         "ok": ok,
@@ -84,6 +117,11 @@ def environment_report(project_root: Path) -> dict:
         },
         "tkinter_found": tkinter_found,
         "packages": packages,
+        "lock": {
+            "path": str(lock_path),
+            "packages": locked_packages,
+            "ok": lock_ok,
+        },
         "project_files": project_files,
     }
 
@@ -100,6 +138,14 @@ def _print_text(report: dict) -> None:
             f"- {package['distribution']}: {installed} "
             f"(required >={package['minimum']}, module={package['module_found']}, ok={package['ok']})"
         )
+    lock = report["lock"]
+    print(f"Exact lock: {lock['ok']} ({len(lock['packages'])} packages)")
+    for package in lock["packages"]:
+        if not package["ok"]:
+            print(
+                f"- lock mismatch {package['distribution']}: "
+                f"installed={package['installed'] or 'missing'}, expected={package['expected']}"
+            )
     missing_files = [path for path, exists in report["project_files"].items() if not exists]
     print(f"Project files: {'ok' if not missing_files else 'missing ' + ', '.join(missing_files)}")
     print(f"Environment ready: {report['ok']}")

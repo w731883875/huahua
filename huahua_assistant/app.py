@@ -14,7 +14,16 @@ from tkinter import filedialog, messagebox
 
 from .capture import DEFAULT_WINDOW_TITLE, WindowInfo, capture_target, find_window, write_image
 from .config import config_value
-from .codes import affix_code, affix_display_from_code, brush_code, brush_payload_codes, compact_paint_with_code, compact_rule_with_code
+from .codes import (
+    affix_code,
+    affix_display_from_code,
+    brush_code,
+    brush_payload_codes,
+    canonical_affix_id,
+    compact_paint_with_code,
+    compact_rule_with_code,
+    resolve_affix,
+)
 from .fast_events import FastVisionEvent, detect_fast_events
 from .fast_vision import FastVisionSnapshot, snapshot_from_scene
 from .frame_pump import FramePump, default_auto_capture
@@ -1199,11 +1208,10 @@ class HuahuaApp(tk.Tk):
     def _merge_quick_brush_stage2(self, observation: BrushOptionsObservation | None) -> None:
         if observation is None or self.brush_scenario is None or self.selected_brush_type is None:
             return
-        affix_by_name = {affix.name: affix for affix in self.affix_catalog}
         stage2 = tuple(
-            affix_by_name[name]
+            affix
             for name in observation.stage2_options
-            if name in affix_by_name and affix_by_name[name].brush_type == self.selected_brush_type
+            if (affix := resolve_affix(name, self.selected_brush_type)) is not None
         )
         if not stage2:
             return
@@ -2033,6 +2041,7 @@ class HuahuaApp(tk.Tk):
                     "chosen_stage1_code": brush_code(brush.chosen_stage1),
                     "stage2_options": brush.stage2_options,
                     "stage2_codes": [code for item in brush.stage2_options if (code := affix_code(item))],
+                    "stage2_ids": [identity for item in brush.stage2_options if (identity := canonical_affix_id(item))],
                     "confidence": brush.confidence,
                     "stage1_scores": brush.stage1_scores,
                     "stage2_scores": brush.stage2_scores,
@@ -2231,11 +2240,10 @@ class HuahuaApp(tk.Tk):
         if observation is None:
             return
         stage1 = _brush_types_from_values(observation.stage1_options)
-        affix_by_name = {affix.name: affix for affix in self.affix_catalog}
         stage2 = tuple(
-            affix_by_name[name]
+            affix
             for name in observation.stage2_options
-            if name in affix_by_name
+            if (affix := resolve_affix(name)) is not None
         )
         chosen = _brush_type_from_value(observation.chosen_stage1)
         if chosen is None and stage2:
@@ -2560,8 +2568,11 @@ class HuahuaApp(tk.Tk):
             ]
         )
         stage2_names = corrected.get("stage2_options", [])
-        affix_by_name = {affix.name: affix for affix in self.affix_catalog}
-        stage2 = tuple(affix_by_name[name] for name in stage2_names if name in affix_by_name)
+        stage2 = tuple(
+            affix
+            for name in stage2_names
+            if (affix := resolve_affix(name)) is not None
+        )
         if not stage1 and not stage2:
             return
         chosen = stage2[0].brush_type if stage2 else stage1[0]
@@ -4190,6 +4201,7 @@ def _compact_affix(affix: AffixRule | None) -> dict | None:
     payload = {
         "name": affix.name,
         "code": affix_code(affix),
+        "canonical_affix_id": canonical_affix_id(affix),
         "brush": affix.brush_type.value,
         "brush_code": brush_code(affix.brush_type),
         "effect": affix.effect.value,

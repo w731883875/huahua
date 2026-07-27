@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum
 
 from .config import config_value
@@ -109,6 +109,13 @@ class AffixRule:
     count: int | None = None
     persistent_until_match: bool = False
     nearest: bool = False
+    canonical_affix_id: str = field(default="", compare=False)
+    aliases: tuple[str, ...] = field(default=(), compare=False)
+    legacy_codes: tuple[str, ...] = field(default=(), compare=False)
+
+    @property
+    def display_name(self) -> str:
+        return self.name
 
 
 @dataclass(frozen=True)
@@ -1414,7 +1421,7 @@ def _affix_reason(state: PuzzleState, affix: AffixRule, prior_score: float = 0.0
 
 
 def build_affix_catalog() -> tuple[AffixRule, ...]:
-    return (
+    legacy_catalog = (
         AffixRule(BrushType.TRANSFORM, "作用方向改为横向", AffixEffect.CHANGE_DIRECTION, direction=PaintDirection.HORIZONTAL),
         AffixRule(BrushType.TRANSFORM, "作用方向改为纵向", AffixEffect.CHANGE_DIRECTION, direction=PaintDirection.VERTICAL),
         AffixRule(BrushType.TRANSFORM, "作用方向改为对角斜向", AffixEffect.CHANGE_DIRECTION, direction=PaintDirection.DIAGONAL),
@@ -1470,6 +1477,99 @@ def build_affix_catalog() -> tuple[AffixRule, ...]:
         AffixRule(BrushType.SPREAD, "当前颜料可放置在虚空地块但失去自身内容", AffixEffect.ALLOW_PLACE_ON_VOID_LOSE_SELF, persistent_until_match=True),
         AffixRule(BrushType.SPREAD, "当前颜料可放置在已放置颜料地块但失去自身内容", AffixEffect.ALLOW_PLACE_ON_PAINT_LOSE_SELF, persistent_until_match=True),
         AffixRule(BrushType.SPREAD, "可放置于失色地块中", AffixEffect.ALLOW_PLACE_ON_FADED),
+    )
+    return _canonicalize_affix_catalog(legacy_catalog)
+
+
+_CANONICAL_AFFIX_ID_BY_LEGACY_CODE: dict[str, str] = {
+    "1-1": "transform.direction.horizontal",
+    "1-2": "transform.direction.vertical",
+    "1-3": "transform.direction.diagonal",
+    "1-4": "transform.direction.adjacent",
+    "1-5": "transform.direction.global",
+    "1-6": "transform.target.other_type",
+    "1-7": "transform.match_required.minus_2",
+    "1-8": "transform.match_required.minus_1",
+    "1-9": "transform.current_level.random",
+    "1-11": "transform.current_direction.random",
+    "1-12": "transform.current_content.random",
+    "1-13": "transform.current_rule.reroll",
+    "1-15": "transform.randomize_scope.any",
+    "1-16": "transform.randomize_scope.gameplay",
+    "1-17": "transform.randomize_scope.monster",
+    "2-1": "stack.scope.add_random.match_plus_2",
+    "2-2": "stack.upgrade_scope.random_1.lv1",
+    "2-3": "stack.upgrade_scope.random_2.lv1",
+    "2-4": "stack.upgrade_scope.all.lv1",
+    "2-5": "stack.upgrade_scope.all.lv2",
+    "2-8": "stack.upgrade_scope.same_paint.lv1",
+    "2-9": "stack.upgrade_scope.same_paint.lv2",
+    "2-10": "stack.upgrade_self.lv1",
+    "2-11": "stack.upgrade_self.lv2",
+    "2-12": "stack.upgrade_self.lv3",
+    "2-13": "stack.upgrade_global.gameplay.lv1",
+    "2-14": "stack.upgrade_global.gameplay.lv2",
+    "2-15": "stack.upgrade_global.monster.lv1",
+    "2-16": "stack.upgrade_global.monster.lv2",
+    "2-17": "stack.upgrade_global.same_paint.lv1",
+    "2-18": "stack.upgrade_global.same_paint.lv2",
+    "2-19": "stack.copy_self_to_scope",
+    "2-20": "stack.randomize_scope.gameplay",
+    "2-21": "stack.randomize_scope.monster",
+    "2-23": "stack.randomize_scope.any",
+    "3-1": "spread.clear_scope.blocked.horizontal.random_1",
+    "3-2": "spread.clear_scope.blocked.vertical.random_1",
+    "3-3": "spread.clear_scope.blocked.adjacent.random_1",
+    "3-4": "spread.clear_scope.blocked.diagonal.random_1",
+    "3-5": "spread.clear_scope.blocked.nearest_1",
+    "3-7": "spread.clear_scope.blocked.all",
+    "3-8": "spread.clear_global.blocked.random_1",
+    "3-9": "spread.clear_global.faded.random_1",
+    "3-10": "spread.clear_global.void.random_1_or_2",
+    "3-11": "spread.place_on.blocked",
+    "3-12": "spread.place_on.void.lose_self",
+    "3-13": "spread.place_on.paint.lose_self",
+    "3-14": "spread.place_on.faded",
+}
+
+
+def _canonicalize_affix_catalog(legacy_catalog: tuple[AffixRule, ...]) -> tuple[AffixRule, ...]:
+    counters: dict[BrushType, int] = {brush_type: 0 for brush_type in BrushType}
+    canonical: dict[tuple[object, ...], AffixRule] = {}
+    for affix in legacy_catalog:
+        counters[affix.brush_type] += 1
+        legacy_code = f"{BRUSH_TYPE_ORDER.index(affix.brush_type) + 1}-{counters[affix.brush_type]}"
+        key = _affix_semantic_key(affix)
+        existing = canonical.get(key)
+        if existing is None:
+            canonical[key] = replace(
+                affix,
+                canonical_affix_id=_CANONICAL_AFFIX_ID_BY_LEGACY_CODE[legacy_code],
+                legacy_codes=(legacy_code,),
+            )
+            continue
+        aliases = existing.aliases
+        if affix.name != existing.name and affix.name not in aliases:
+            aliases += (affix.name,)
+        canonical[key] = replace(
+            existing,
+            aliases=aliases,
+            legacy_codes=existing.legacy_codes + (legacy_code,),
+        )
+    return tuple(canonical.values())
+
+
+def _affix_semantic_key(affix: AffixRule) -> tuple[object, ...]:
+    return (
+        affix.brush_type,
+        affix.effect,
+        affix.direction,
+        affix.target_object,
+        affix.delta,
+        affix.amount,
+        affix.count,
+        affix.persistent_until_match,
+        affix.nearest,
     )
 
 
@@ -2297,26 +2397,19 @@ def _affix_policy_prior_score(stats: dict | None, affix: AffixRule) -> float:
     samples = (stats.get("policy_prior_samples") or {}).get("affixes", 0)
     if samples < int(config_value("learning.affix_min_samples", 20)):
         return 0.0
+    affix_ids = stats.get("trajectory_affix_ids") or {}
     affix_codes = stats.get("trajectory_affix_codes") or {}
     affixes = stats.get("trajectory_affixes") or {}
     code = _affix_policy_code(affix)
-    count = affix_codes.get(code, affixes.get(affix.name, 0)) if code else affixes.get(affix.name, 0)
+    count = affix_ids.get(affix.canonical_affix_id)
+    if count is None:
+        count = affix_codes.get(code, affixes.get(affix.name, 0)) if code else affixes.get(affix.name, 0)
     ratio = count / max(1, samples)
     return min(float(config_value("learning.affix_max_bonus", 150.0)), ratio * 360.0)
 
 
 def _affix_policy_code(affix: AffixRule) -> str | None:
-    counters: dict[BrushType, int] = {brush_type: 0 for brush_type in BrushType}
-    brush_codes = {
-        BrushType.TRANSFORM: "1",
-        BrushType.STACK: "2",
-        BrushType.SPREAD: "3",
-    }
-    for item in build_affix_catalog():
-        counters[item.brush_type] += 1
-        if item.brush_type == affix.brush_type and item.name == affix.name:
-            return f"{brush_codes[item.brush_type]}-{counters[item.brush_type]}"
-    return None
+    return affix.legacy_codes[0] if affix.legacy_codes else None
 
 
 def _cell_zone_for_policy(row: int, col: int) -> str:

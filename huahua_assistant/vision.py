@@ -1798,10 +1798,13 @@ def _brush_stage2_scores(
     for affix in build_affix_catalog():
         if allowed_types and affix.brush_type.value not in allowed_types:
             continue
-        score = _affix_name_score(affix.name, keyword_scores)
+        score = max(
+            _affix_name_score(alias, keyword_scores)
+            for alias in (affix.display_name, *affix.aliases)
+        )
         score += min(0.08, stage1_scores.get(affix.brush_type.value, 0.0) * 0.10)
         if score > 0.10:
-            scored[affix.name] = float(np.clip(score, 0.0, 1.0))
+            scored[affix.display_name] = float(np.clip(score, 0.0, 1.0))
     return scored
 
 
@@ -1867,7 +1870,8 @@ def _brush_affix_keywords(stage1_options: tuple[str, ...] = ()) -> tuple[str, ..
     for affix in build_affix_catalog():
         if allowed_types and affix.brush_type.value not in allowed_types:
             continue
-        tokens.extend(_affix_tokens(affix.name))
+        for alias in (affix.display_name, *affix.aliases):
+            tokens.extend(_affix_tokens(alias))
     return tuple(dict.fromkeys(tokens or _brush_affix_token_keywords()))
 
 

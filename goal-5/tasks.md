@@ -110,17 +110,38 @@ Next step:
 
 ## Task 4: Canonicalize Affix IDs And Recognition Aliases
 
-Status: pending
+Status: completed
 
 Separate canonical affix rules from OCR/template aliases so equivalent workbook descriptions aggregate under one stable code while old logs and exported bundles remain readable.
 
 Work performed:
 
+- Extended `AffixRule` with a stable `canonical_affix_id`, a compatibility `display_name`, recognition aliases, and all historical `1-n`/`2-n`/`3-n` codes.
+- Canonicalized the 55 legacy text entries into 48 semantic rules by full effect parameters. Seven duplicate long/short descriptions remain available as aliases and all 55 historical codes remain resolvable.
+- Pinned all 48 canonical identities in an explicit registry instead of deriving them from implementation names; `stack.upgrade_scope.random_1.lv1` now remains stable across internal enum/field refactors.
+- Added canonical lookup helpers that accept canonical IDs, legacy codes, display names, aliases, normalized punctuation/spacing, and optional brush-type qualification.
+- Kept existing `stage2_codes` fields and added `stage2_ids` plus `canonical_affix_id` to new structured records; no runtime JSONL migration or rewrite is required.
+- Updated brush recognition to score every known alias but emit only the canonical display name, preventing duplicate semantic candidates.
+- Updated learning statistics and policy priors to aggregate by canonical identity first while retaining legacy name/code counters for existing reports and exports.
+
 Validation evidence:
+
+- Full suite passed: 26 tests, including all 55 legacy-code round trips, unique and explicitly pinned canonical identities, normalized OCR alias lookup, known long/short alias merging, payload compatibility, and legacy-event aggregation.
+- Strict environment verification passed on Python 3.12.10 with all 11 locked packages matching exactly.
+- Fixed-seed simulation with brush and refresh recommendations completed successfully after catalog canonicalization.
+- Read-only rebuild of current runtime logs produced 295 real events and 4 trusted trajectories; 4 observed affix entries normalized to canonical IDs while policy-affix samples remained 0, so no experience prior was enabled prematurely.
+- `python scripts\check_encoding.py .` checked 56 project text files successfully; package and test compile checks passed.
+- `git diff --check` found no whitespace errors in task changes; only the pre-existing runtime CRLF warning remains.
 
 Remaining risk:
 
+- Canonical grouping is based on the currently modeled effect parameters. If future workbook evidence proves two identical parameter sets have distinct hidden behavior, they must receive separate explicit identities.
+- Alias recognition remains heuristic and has not been measured against a representative live screenshot regression set; this stays deferred to the final screenshot-gap audit.
+- Existing runtime records contain no trusted affix-choice decisions, so compatibility is proven structurally but experience scoring remains intentionally inactive.
+
 Next step:
+
+- Task 5: add the explicit game-phase state machine and stable `RecommendationTarget` model with confidence, hysteresis, and expiry.
 
 ## Task 5: Add Stable Game Phase And Recommendation Target Model
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 
+from huahua_assistant.codes import canonical_affix_id
 from huahua_assistant.learning import (
     _build_stats,
     _dedupe_events,
@@ -60,6 +61,33 @@ class LearningTrustBaselineTests(unittest.TestCase):
         self.assertEqual(1, stats["total_events"])
         self.assertEqual(1, stats["event_counts"]["future_event"])
         self.assertEqual(0, stats["trajectories"])
+
+    def test_legacy_affix_aliases_aggregate_under_canonical_identity(self) -> None:
+        events = [
+            {
+                "source": "real_capture",
+                "event": "brush_options",
+                "payload": {
+                    "stage2_options": ["范围内随机1个颜料提升1级"],
+                    "stage2_codes": ["2-2"],
+                },
+            },
+            {
+                "source": "real_capture",
+                "event": "brush_options",
+                "payload": {
+                    "stage2_options": ["对调色范围内的随机1个颜料额外提升1级"],
+                    "stage2_codes": ["2-6"],
+                },
+            },
+        ]
+
+        stats = _build_stats(events, corrections=[], trajectories=[])
+        identity = canonical_affix_id("2-2")
+
+        self.assertIsNotNone(identity)
+        self.assertEqual({identity: 2}, stats["affix_id_seen"])
+        self.assertEqual(2, stats["affix_id_seen_total"])
 
 
 if __name__ == "__main__":

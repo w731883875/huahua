@@ -8,7 +8,7 @@ from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
 
-from .codes import affix_code, brush_code
+from .codes import affix_code, brush_code, canonical_affix_id
 from .config import config_value
 
 
@@ -233,6 +233,7 @@ def _build_stats(
     event_counts = Counter(event.get("event", "unknown") for event in events)
     affix_seen = Counter()
     affix_code_seen = Counter()
+    affix_id_seen = Counter()
     stage1_seen = Counter()
     stage1_code_seen = Counter()
     unknown_stage1_seen = Counter()
@@ -265,6 +266,7 @@ def _build_stats(
     trajectory_brush_codes = Counter()
     trajectory_affixes = Counter()
     trajectory_affix_codes = Counter()
+    trajectory_affix_ids = Counter()
     high_score_gate_reasons = Counter()
     high_score_gate_primary = Counter()
     trajectory_scores: list[float] = []
@@ -279,6 +281,7 @@ def _build_stats(
     imitation_brush_choice_codes = Counter()
     imitation_affix_choices = Counter()
     imitation_affix_choice_codes = Counter()
+    imitation_affix_choice_ids = Counter()
     treasure_count = 0
     quick_steps = 0
     quick_actions = Counter()
@@ -309,6 +312,12 @@ def _build_stats(
                     _append_unknown_affix_sample(unknown_affix_samples, item_text, payload, event)
             for item in payload.get("stage2_codes") or []:
                 affix_code_seen[str(item)] += 1
+            for identity in _normalized_affix_ids(
+                names=payload.get("stage2_options"),
+                codes=payload.get("stage2_codes"),
+                identities=payload.get("stage2_ids"),
+            ):
+                affix_id_seen[identity] += 1
         elif event_type == "current_paint":
             key = "|".join(
                 str(payload.get(name))
@@ -441,6 +450,12 @@ def _build_stats(
                 trajectory_affixes[str(affix_name)] += 1
             for code in brush.get("stage2_codes") or []:
                 trajectory_affix_codes[str(code)] += 1
+            for identity in _normalized_affix_ids(
+                names=brush.get("stage2"),
+                codes=brush.get("stage2_codes"),
+                identities=brush.get("stage2_ids"),
+            ):
+                trajectory_affix_ids[identity] += 1
             if step.get("brush_type"):
                 trajectory_brushes[str(step.get("brush_type"))] += 1
             if step.get("brush_code"):
@@ -459,12 +474,19 @@ def _build_stats(
             active_affix = step.get("active_affix") if isinstance(step.get("active_affix"), dict) else {}
             chosen_affix = active_affix.get("name") or step.get("affix")
             chosen_affix_code = active_affix.get("code") or step.get("affix_code")
-            chosen_affix_key = str(chosen_affix_code or chosen_affix or "")
+            chosen_affix_id = (
+                active_affix.get("canonical_affix_id")
+                or step.get("canonical_affix_id")
+                or canonical_affix_id(chosen_affix_code or chosen_affix)
+            )
+            chosen_affix_key = str(chosen_affix_id or chosen_affix_code or chosen_affix or "")
             if chosen_affix_key and chosen_affix_key != previous_affix_choice:
                 if chosen_affix:
                     imitation_affix_choices[str(chosen_affix)] += 1
                 if chosen_affix_code:
                     imitation_affix_choice_codes[str(chosen_affix_code)] += 1
+                if chosen_affix_id:
+                    imitation_affix_choice_ids[str(chosen_affix_id)] += 1
                 previous_affix_choice = chosen_affix_key
             chosen_recommendation = step.get("chosen_recommendation")
             if isinstance(chosen_recommendation, dict):
@@ -509,7 +531,11 @@ def _build_stats(
     policy_prior_samples = {
         "placements": sum(placement_cells.values()),
         "brushes": max(sum(trajectory_brushes.values()), sum(trajectory_brush_codes.values())),
-        "affixes": max(sum(trajectory_affixes.values()), sum(trajectory_affix_codes.values())),
+        "affixes": max(
+            sum(trajectory_affix_ids.values()),
+            sum(trajectory_affixes.values()),
+            sum(trajectory_affix_codes.values()),
+        ),
     }
     imitation_policy = _imitation_policy_summary(
         trajectory_count=len(trajectories),
@@ -524,6 +550,7 @@ def _build_stats(
         brush_choice_codes=imitation_brush_choice_codes,
         affix_choices=imitation_affix_choices,
         affix_choice_codes=imitation_affix_choice_codes,
+        affix_choice_ids=imitation_affix_choice_ids,
         recommendation_hits=imitation_recommendation_hits,
         recommendation_shorts=imitation_recommendation_shorts,
         recommendation_tags=imitation_recommendation_tags,
@@ -542,10 +569,13 @@ def _build_stats(
         "unknown_stage1_seen_pct": _counter_percentages(unknown_stage1_seen),
         "affix_seen": dict(affix_seen),
         "affix_code_seen": dict(affix_code_seen),
+        "affix_id_seen": dict(affix_id_seen),
         "affix_seen_total": sum(affix_seen.values()),
         "affix_code_seen_total": sum(affix_code_seen.values()),
+        "affix_id_seen_total": sum(affix_id_seen.values()),
         "affix_seen_pct": _counter_percentages(affix_seen),
         "affix_code_seen_pct": _counter_percentages(affix_code_seen),
+        "affix_id_seen_pct": _counter_percentages(affix_id_seen),
         "unknown_affix_seen": dict(unknown_affix_seen),
         "unknown_affix_seen_total": sum(unknown_affix_seen.values()),
         "unknown_affix_seen_pct": _counter_percentages(unknown_affix_seen),
@@ -557,6 +587,7 @@ def _build_stats(
             "stage1_codes": _counter_distribution(stage1_code_seen),
             "stage2": _counter_distribution(affix_seen),
             "stage2_codes": _counter_distribution(affix_code_seen),
+            "stage2_ids": _counter_distribution(affix_id_seen),
             "unknown_stage1": _counter_distribution(unknown_stage1_seen),
             "unknown_stage2": _counter_distribution(unknown_affix_seen),
         },
@@ -591,6 +622,7 @@ def _build_stats(
         "trajectory_brush_codes": dict(trajectory_brush_codes),
         "trajectory_affixes": dict(trajectory_affixes),
         "trajectory_affix_codes": dict(trajectory_affix_codes),
+        "trajectory_affix_ids": dict(trajectory_affix_ids),
         "high_score_gate_primary": dict(high_score_gate_primary),
         "high_score_gate_reasons": dict(high_score_gate_reasons),
         "policy_prior_samples": policy_prior_samples,
@@ -663,6 +695,25 @@ def _unknown_text(value: Any) -> str | None:
     if not text or text.casefold() in {"none", "null", "unknown", "?"}:
         return None
     return text
+
+
+def _normalized_affix_ids(
+    *,
+    names: Any = None,
+    codes: Any = None,
+    identities: Any = None,
+) -> tuple[str, ...]:
+    for values in (identities, codes, names):
+        if not isinstance(values, (list, tuple)) or not values:
+            continue
+        normalized = tuple(
+            identity
+            for value in values
+            if (identity := canonical_affix_id(str(value))) is not None
+        )
+        if normalized:
+            return normalized
+    return ()
 
 
 def _append_unknown_affix_sample(
@@ -741,6 +792,7 @@ def _imitation_policy_summary(
     brush_choice_codes: Counter,
     affix_choices: Counter,
     affix_choice_codes: Counter,
+    affix_choice_ids: Counter,
     recommendation_hits: Counter,
     recommendation_shorts: Counter,
     recommendation_tags: Counter,
@@ -750,7 +802,11 @@ def _imitation_policy_summary(
         "actions": int(sum(action_counts.values())),
         "placements": int(sum(placement_cells.values())),
         "brushes": int(max(sum(brush_choices.values()), sum(brush_choice_codes.values()))),
-        "affixes": int(max(sum(affix_choices.values()), sum(affix_choice_codes.values()))),
+        "affixes": int(max(
+            sum(affix_choice_ids.values()),
+            sum(affix_choices.values()),
+            sum(affix_choice_codes.values()),
+        )),
         "recommendation_decisions": int(recommendation_hits.get("decisions", 0)),
     }
     thresholds = {
@@ -777,6 +833,7 @@ def _imitation_policy_summary(
         "top_brush_codes": _counter_distribution(brush_choice_codes),
         "top_affix_choices": _counter_distribution(affix_choices),
         "top_affix_codes": _counter_distribution(affix_choice_codes),
+        "top_affix_ids": _counter_distribution(affix_choice_ids),
         "recommendation_hits": _recommendation_hit_summary(recommendation_hits),
         "recommendation_shorts": _counter_distribution(recommendation_shorts),
         "recommendation_tags": _counter_distribution(recommendation_tags),

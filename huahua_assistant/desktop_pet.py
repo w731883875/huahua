@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import math
 import sys
 import time
 import tkinter as tk
@@ -20,7 +21,9 @@ from .game_model import (
     recommend_affixes,
     recommend_brush_types,
 )
+from .guidance import RecommendationTarget, TargetKind
 from .models import Rect, SceneObservation
+from .pet_layout import PetGuidancePlacement, choose_pet_guidance_placement, pointer_geometry
 from .pet_brain import evaluate_pet_state
 
 
@@ -31,6 +34,8 @@ PET_IDLE_ASSET = "qnb.png"
 PET_ACTIVE_ASSET = "maonang.png"
 PET_TARGET_HEIGHT = 190
 PET_SCREEN_MARGIN = 18
+PET_TARGET_GAP = 30
+PET_POINTER_SIZE = 76
 PET_POSITION_PATH = Path("runtime/desktop_pet_position.json")
 
 
@@ -91,7 +96,7 @@ class DesktopPetMarkerLayer:
         top = int(marker.y - marker.size / 2)
         try:
             window.deiconify()
-            window.geometry(f"{marker.size}x{marker.size}+{left}+{top}")
+            _place_window(window, marker.size, marker.size, left, top)
             window.attributes("-topmost", True)
         except tk.TclError:
             return
@@ -183,15 +188,20 @@ class DesktopPetActor:
         self.window: tk.Toplevel | None = None
         self.label: tk.Label | None = None
         self.bubble_label: tk.Label | None = None
+        self.pointer_window: tk.Toplevel | None = None
+        self.pointer_canvas: tk.Canvas | None = None
         self.photo: ImageTk.PhotoImage | None = None
         self.photo_asset_name: str | None = None
         self.wndprocs: dict[int, tuple[int, object]] = {}
+        self.pointer_wndprocs: dict[int, tuple[int, object]] = {}
         self.active = False
         self.visible = False
-        self.draggable = True
+        self.draggable = False
+        self.guidance_active = False
         self.manual_position: tuple[int, int] | None = _load_pet_position()
         self.drag_offset: tuple[int, int] | None = None
         self.last_render_key: tuple | None = None
+        self.last_pointer_key: tuple | None = None
 
     def show(self, *, active: bool = False, window_info=None, pet_state=None) -> None:
         self.active = active
@@ -200,7 +210,8 @@ class DesktopPetActor:
         self._load_image(active)
         if self.window is None or self.label is None or self.bubble_label is None or self.photo is None:
             return
-        message = _pet_state_message(pet_state, active)
+        target = _active_recommendation_target(pet_state)
+        message = _pet_state_message(pet_state, active, target)
         bubble_bg, bubble_fg = _pet_state_palette(pet_state)
         self.bubble_label.configure(text=message, bg=bubble_bg, fg=bubble_fg)
         self.bubble_label.update_idletasks()
@@ -210,10 +221,23 @@ class DesktopPetActor:
         bubble_height = int(self.bubble_label.winfo_reqheight())
         width = max(image_width, bubble_width)
         height = image_height + bubble_height + 4
-        if self.manual_position is None:
-            left, top = _pet_position(self.root, width, height, window_info)
+        placement = None if self.draggable else _target_pet_placement(self.root, target, width, height)
+        self.guidance_active = placement is not None
+        if placement is not None and target is not None:
+            left, top = placement.left, placement.top
+            self._show_pointer(target, placement)
         else:
-            left, top = _clamp_pet_position(self.root, self.manual_position[0], self.manual_position[1], width, height)
+            self._hide_pointer()
+            if self.manual_position is None:
+                left, top = _pet_position(self.root, width, height, window_info)
+            else:
+                left, top = _clamp_pet_position(
+                    self.root,
+                    self.manual_position[0],
+                    self.manual_position[1],
+                    width,
+                    height,
+                )
         render_key = (
             bool(active),
             message,
@@ -224,14 +248,16 @@ class DesktopPetActor:
             top,
             width,
             height,
-            bool(self.visible),
+            getattr(target, "key", None) if placement is not None else None,
+            getattr(target, "screen_point", None) if placement is not None else None,
+            getattr(placement, "side", None),
         )
         if self.last_render_key == render_key:
             self._apply_input_mode()
             return
         try:
             self.label.configure(image=self.photo)
-            self.window.geometry(f"{width}x{height}+{left}+{top}")
+            _place_window(self.window, width, height, left, top)
             self.window.deiconify()
             self.window.lift()
             self.window.attributes("-topmost", True)
@@ -246,17 +272,18 @@ class DesktopPetActor:
         self._apply_input_mode()
 
     def hide(self) -> int:
+        hidden = self._hide_pointer()
         if self.window is None:
-            return 0
+            return hidden
         try:
             if self.window.state() != "withdrawn":
                 self.window.withdraw()
                 self.visible = False
                 self.last_render_key = None
-                return 1
+                return hidden + 1
         except tk.TclError:
             pass
-        return 0
+        return hidden
 
     def hide_for_capture(self, settle_ms: int = CAPTURE_HIDE_SETTLE_MS) -> None:
         hidden = self.hide()
@@ -265,6 +292,7 @@ class DesktopPetActor:
 
     def destroy(self) -> None:
         _restore_window_procs(self.wndprocs)
+        _restore_window_procs(self.pointer_wndprocs)
         if self.window is not None:
             try:
                 self.window.destroy()
@@ -273,11 +301,20 @@ class DesktopPetActor:
         self.window = None
         self.label = None
         self.bubble_label = None
+        if self.pointer_window is not None:
+            try:
+                self.pointer_window.destroy()
+            except tk.TclError:
+                pass
+        self.pointer_window = None
+        self.pointer_canvas = None
         self.photo = None
         self.photo_asset_name = None
         self.drag_offset = None
         self.last_render_key = None
+        self.last_pointer_key = None
         self.visible = False
+        self.guidance_active = False
 
     def _ensure_window(self) -> bool:
         if self.window is not None and self.window.winfo_exists():
@@ -331,6 +368,92 @@ class DesktopPetActor:
             _make_desktop_pet_window_interactive(self.window, self.wndprocs)
         else:
             _make_desktop_pet_window_clickthrough(self.window, self.wndprocs)
+
+    def _show_pointer(
+        self,
+        target: RecommendationTarget,
+        placement: PetGuidancePlacement,
+    ) -> None:
+        if not self._ensure_pointer_window() or self.pointer_window is None or self.pointer_canvas is None:
+            return
+        left = int(target.screen_point[0] - PET_POINTER_SIZE / 2)
+        top = int(target.screen_point[1] - PET_POINTER_SIZE / 2)
+        render_key = (target.key, target.kind, target.screen_point, placement.side)
+        try:
+            pointer_visible = self.pointer_window.state() != "withdrawn"
+        except tk.TclError:
+            pointer_visible = False
+        if self.last_pointer_key == render_key and pointer_visible:
+            _make_clickthrough_widgets(
+                (self.pointer_window, self.pointer_canvas),
+                self.pointer_wndprocs,
+            )
+            return
+        line, head = pointer_geometry(placement.side, PET_POINTER_SIZE)
+        outline, accent = _target_pointer_colors(target.kind)
+        try:
+            self.pointer_canvas.delete("all")
+            self.pointer_canvas.create_line(*line, fill=outline, width=4)
+            self.pointer_canvas.create_polygon(*head, fill=outline, outline=accent, width=1)
+            radius = 10
+            center = PET_POINTER_SIZE // 2
+            self.pointer_canvas.create_oval(
+                center - radius,
+                center - radius,
+                center + radius,
+                center + radius,
+                outline=accent,
+                width=2,
+            )
+            self.pointer_window.deiconify()
+            _place_window(self.pointer_window, PET_POINTER_SIZE, PET_POINTER_SIZE, left, top)
+            self.pointer_window.lift()
+            self.pointer_window.attributes("-topmost", True)
+            _make_clickthrough_widgets(
+                (self.pointer_window, self.pointer_canvas),
+                self.pointer_wndprocs,
+            )
+            self.last_pointer_key = render_key
+        except tk.TclError:
+            return
+
+    def _ensure_pointer_window(self) -> bool:
+        if self.pointer_window is not None and self.pointer_window.winfo_exists():
+            return True
+        try:
+            window = tk.Toplevel(self.root)
+            window.title("Huahua Target Pointer")
+            window.overrideredirect(True)
+            window.attributes("-topmost", True)
+            window.configure(bg=TRANSPARENT_COLOR)
+            try:
+                window.attributes("-transparentcolor", TRANSPARENT_COLOR)
+            except tk.TclError:
+                pass
+            canvas = tk.Canvas(
+                window,
+                bg=TRANSPARENT_COLOR,
+                width=PET_POINTER_SIZE,
+                height=PET_POINTER_SIZE,
+                highlightthickness=0,
+            )
+            canvas.pack(fill=tk.BOTH, expand=True)
+            self.pointer_window = window
+            self.pointer_canvas = canvas
+            return True
+        except tk.TclError:
+            return False
+
+    def _hide_pointer(self) -> int:
+        if self.pointer_window is None:
+            return 0
+        try:
+            if self.pointer_window.state() != "withdrawn":
+                self.pointer_window.withdraw()
+                return 1
+        except tk.TclError:
+            pass
+        return 0
 
     def _start_drag(self, event: tk.Event) -> str | None:
         if not self.draggable or self.window is None:
@@ -486,18 +609,15 @@ def _legacy_install_desktop_pet_markers(app_cls: type) -> None:
 
 def _build_markers(app) -> list[PetMarker]:
     scene: SceneObservation | None = getattr(app, "current_scene", None)
-    state: PuzzleState | None = getattr(app, "current_state", None)
     window = getattr(app, "last_capture_window", None)
-    if scene is None or state is None or window is None:
+    target = _active_recommendation_target(getattr(app, "last_pet_state", None))
+    if scene is None or window is None or target is None:
         return []
     if _coordinate_markers_are_unsafe(app):
         return []
-
-    markers: list[PetMarker] = []
-    markers.extend(_board_markers(app, scene))
-    markers.extend(_backpack_markers(app, scene))
-    markers.extend(_brush_markers(app, scene, state))
-    return markers[:5]
+    if target.kind == TargetKind.BOARD:
+        return _board_markers(app, scene)
+    return []
 
 
 def _coordinate_markers_are_unsafe(app) -> bool:
@@ -847,6 +967,90 @@ def _virtual_screen(root: tk.Tk) -> tuple[int, int, int, int]:
         return 0, 0, int(root.winfo_screenwidth()), int(root.winfo_screenheight())
 
 
+def _target_pet_placement(
+    root: tk.Tk,
+    target: RecommendationTarget | None,
+    width: int,
+    height: int,
+) -> PetGuidancePlacement | None:
+    if target is None:
+        return None
+    bounds = _screen_bounds_for_target(root, target.screen_point)
+    return choose_pet_guidance_placement(
+        target.screen_point,
+        (width, height),
+        bounds,
+        gap=PET_TARGET_GAP,
+    )
+
+
+def _screen_bounds_for_target(root: tk.Tk, point: tuple[int, int]) -> tuple[int, int, int, int]:
+    monitor_bounds = _windows_monitor_bounds(point)
+    return monitor_bounds if monitor_bounds is not None else _virtual_screen(root)
+
+
+def _windows_monitor_bounds(point: tuple[int, int]) -> tuple[int, int, int, int] | None:
+    class MonitorInfo(ctypes.Structure):
+        _fields_ = (
+            ("cbSize", wintypes.DWORD),
+            ("rcMonitor", wintypes.RECT),
+            ("rcWork", wintypes.RECT),
+            ("dwFlags", wintypes.DWORD),
+        )
+
+    try:
+        user32 = ctypes.windll.user32
+        monitor_from_point = user32.MonitorFromPoint
+        monitor_from_point.argtypes = (wintypes.POINT, wintypes.DWORD)
+        monitor_from_point.restype = wintypes.HMONITOR
+        monitor = monitor_from_point(wintypes.POINT(int(point[0]), int(point[1])), 0)
+        if not monitor:
+            return None
+        info = MonitorInfo()
+        info.cbSize = ctypes.sizeof(MonitorInfo)
+        user32.GetMonitorInfoW.argtypes = (wintypes.HMONITOR, ctypes.POINTER(MonitorInfo))
+        user32.GetMonitorInfoW.restype = wintypes.BOOL
+        if not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+            return None
+        rect = info.rcMonitor
+        return rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def _place_window(window: tk.Toplevel, width: int, height: int, left: int, top: int) -> None:
+    window.geometry(f"{int(width)}x{int(height)}")
+    try:
+        hwnd = int(window.winfo_id())
+        user32 = ctypes.windll.user32
+        SWP_NOZORDER = 0x0004
+        SWP_NOACTIVATE = 0x0010
+        set_window_pos = user32.SetWindowPos
+        set_window_pos.argtypes = (
+            wintypes.HWND,
+            wintypes.HWND,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            wintypes.UINT,
+        )
+        set_window_pos.restype = wintypes.BOOL
+        positioned = set_window_pos(
+            hwnd,
+            0,
+            int(left),
+            int(top),
+            int(width),
+            int(height),
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        )
+        if not positioned:
+            raise OSError("SetWindowPos failed")
+    except Exception:
+        window.geometry(f"{int(width)}x{int(height)}{int(left):+d}{int(top):+d}")
+
+
 def _clamp(value: int, low: int, high: int) -> int:
     if high < low:
         return low
@@ -856,9 +1060,9 @@ def _clamp(value: int, low: int, high: int) -> int:
 def _board_markers(app, scene: SceneObservation) -> list[PetMarker]:
     markers: list[PetMarker] = []
     recommendations = list(getattr(app, "recommendations", []) or [])
-    for index, rec in enumerate(recommendations[:2], start=1):
+    for index, rec in enumerate(recommendations[1:3], start=2):
         point = app._screen_point_for_board_cell(rec.row, rec.col)
-        if point is None:
+        if not _marker_point_is_safe(app, point):
             continue
         markers.append(
             PetMarker(
@@ -873,6 +1077,38 @@ def _board_markers(app, scene: SceneObservation) -> list[PetMarker]:
             )
         )
     return markers
+
+
+def _marker_point_is_safe(app, point) -> bool:
+    if not (
+        isinstance(point, (tuple, list))
+        and len(point) == 2
+        and all(isinstance(value, (int, float)) and math.isfinite(float(value)) for value in point)
+    ):
+        return False
+    x, y = float(point[0]), float(point[1])
+    window = getattr(app, "last_capture_window", None)
+    bounds = (
+        getattr(window, "left", None),
+        getattr(window, "top", None),
+        getattr(window, "width", None),
+        getattr(window, "height", None),
+    )
+    if not all(isinstance(value, (int, float)) and math.isfinite(float(value)) for value in bounds):
+        return False
+    left, top, width, height = bounds
+    if width <= 0 or height <= 0 or not (left <= x < left + width and top <= y < top + height):
+        return False
+    screen_left, screen_top, screen_width, screen_height = _screen_bounds_for_target(
+        app,
+        (int(x), int(y)),
+    )
+    return (
+        screen_width > 0
+        and screen_height > 0
+        and screen_left <= x < screen_left + screen_width
+        and screen_top <= y < screen_top + screen_height
+    )
 
 
 def _backpack_markers(app, _scene: SceneObservation) -> list[PetMarker]:
@@ -1060,12 +1296,37 @@ def _marker_colors(kind: str, priority: int) -> tuple[str, str, str, str]:
     return "#162f43", "#64e6ff", "#214e68", "#e8fbff"
 
 
+def _target_pointer_colors(kind: TargetKind) -> tuple[str, str]:
+    if kind == TargetKind.FINISH:
+        return "#dfffdc", "#65f074"
+    if kind in {TargetKind.BRUSH_STAGE1, TargetKind.BRUSH_STAGE2}:
+        return "#fff0ff", "#ff8cff"
+    if kind == TargetKind.BACKPACK:
+        return "#e9fdff", "#64e6ff"
+    return "#fff8d7", "#ffd84d"
+
+
 def _pet_state_is_active(pet_state) -> bool:
     mode = getattr(pet_state, "mode", "observing") if pet_state is not None else "observing"
     return mode not in {"observing"}
 
 
-def _pet_state_message(pet_state, active: bool) -> str:
+def _active_recommendation_target(pet_state, *, now: float | None = None) -> RecommendationTarget | None:
+    target = getattr(pet_state, "recommendation_target", None)
+    if not isinstance(target, RecommendationTarget):
+        return None
+    current_time = time.monotonic() if now is None else float(now)
+    return None if target.is_expired(current_time) else target
+
+
+def _pet_state_message(
+    pet_state,
+    active: bool,
+    target: RecommendationTarget | None = None,
+) -> str:
+    reason = str(getattr(target, "reason_short", "") or "").strip()
+    if reason:
+        return reason[:12]
     message = str(getattr(pet_state, "message", "") or "").strip()
     if message:
         return message[:12]
@@ -1123,7 +1384,7 @@ def install_desktop_pet_markers(app_cls: type) -> None:
         try:
             pet_state = evaluate_pet_state(self)
             setattr(self, "last_pet_state", pet_state)
-            active = _pet_state_is_active(pet_state) or bool(getattr(self, "recommendations", None) or getattr(self, "install_plan", None))
+            active = _pet_state_is_active(pet_state)
             if hasattr(self, "desktop_pet_drag_var"):
                 actor(self).set_draggable(bool(self.desktop_pet_drag_var.get()))
             actor(self).show(active=active, window_info=getattr(self, "last_capture_window", None), pet_state=pet_state)
@@ -1135,7 +1396,7 @@ def install_desktop_pet_markers(app_cls: type) -> None:
             return
 
     def toggle_pet_drag(self) -> None:
-        enabled = bool(getattr(self, "desktop_pet_drag_var", tk.BooleanVar(value=True)).get())
+        enabled = bool(getattr(self, "desktop_pet_drag_var", tk.BooleanVar(value=False)).get())
         actor(self).set_draggable(enabled)
         show_actor(self)
         if enabled:
@@ -1148,7 +1409,7 @@ def install_desktop_pet_markers(app_cls: type) -> None:
     def install_drag_toggle(self) -> None:
         if hasattr(self, "desktop_pet_drag_var"):
             return
-        self.desktop_pet_drag_var = tk.BooleanVar(value=True)
+        self.desktop_pet_drag_var = tk.BooleanVar(value=False)
         toolbar = _find_toolbar(self)
         if toolbar is None:
             return
@@ -1220,6 +1481,7 @@ def install_desktop_pet_markers(app_cls: type) -> None:
                 existing_layer.hide()
             show_actor(self)
             return
+        show_actor(self)
         markers = _build_markers(self)
         if markers:
             pet_layer = layer(self)
@@ -1227,7 +1489,6 @@ def install_desktop_pet_markers(app_cls: type) -> None:
             pet_layer.render(markers)
         else:
             layer(self).hide()
-        show_actor(self)
         if getattr(self, "overlay_after_id", None) is None:
             self.overlay_after_id = self.after(560, self._overlay_tick)
 

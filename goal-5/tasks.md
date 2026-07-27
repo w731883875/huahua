@@ -294,17 +294,40 @@ Next step:
 
 ## Task 9: Major Checkpoint 3
 
-Status: pending
+Status: completed
 
 Review real-data-only boundaries, privacy, legacy JSONL compatibility, target/pet behavior, outcome integrity, risk metrics, tests, build, and rollback.
 
 Work performed:
 
+- Audited real-capture-only write gates, observation/correction/trajectory paths, passive-assistance boundaries, legacy JSONL compatibility, outcome/proxy/policy separation, risk readiness, target/pet tests, package inputs, and rollback isolation after Task 8.
+- Confirmed application, script, and test Python sources contain no HTTP/socket client or mouse/keyboard injection APIs; learning writes remain guarded by `source == "real_capture"`.
+- Read-only rebuilt legacy statistics and verified 7 deduplicated runs remain unclassified/proxy-only/observing with no style label or personalization readiness.
+- Created a detached clean worktree from committed code so user working-tree changes could not mask missing files or checkout behavior.
+- Found that a clean Windows checkout converted all text to CRLF because the existing LF policy files were untracked. Added `.gitattributes` and `.editorconfig`, and made both required by the strict environment checker.
+- Repeated the entire clean-worktree verification after the fix, including tests, environment, encoding, simulation, packaging, warning scan, and runtime hash comparison.
+- Checkpoint fix commit: `d76320f Pin repository text encoding`.
+
 Validation evidence:
+
+- Clean committed worktree passed all 64 tests in 0.234 seconds and strict Python 3.12.10 verification with all 11 locked distributions exact.
+- Clean checkout encoding validation checked 60 text files successfully under global Git `core.autocrlf=true`, proving repository attributes control line endings reproducibly.
+- Fixed-seed simulation (`--seed 42 --brush --refresh`) produced board, install, placement, brush, force, and refresh recommendations.
+- Clean-worktree PyInstaller build produced a 75,767,584-byte EXE with SHA256 `FCEB1438EEC8CA4C4CDE683DB124F2B45720E7C66583EC35D5E59F90DEDAEDBE`; critical missing-module count was 0.
+- Runtime hash comparison in the clean worktree reported 0 changes across all tracked runtime files.
+- Static scan found no network/upload or input-injection API use. Existing writes are limited to local learning JSON/JSONL, exported user-selected bundles, debug images, and saved pet position.
+- Task 8 commit and checkpoint diff checks passed; pre-existing user changes in README, app learning UI/terrain work, config, game model, runtime position, scripts, caches, and helpers remain outside checkpoint commits.
 
 Remaining risk:
 
+- Live GUI/EXE behavior, game capture, DPI scaling, color-key transparency, and physical pointer alignment remain unverified because launching the GUI would steal focus; these stay in the final visual gate.
+- Historical logs still cannot provide actual game score, strategy mode, or unseen candidates. Compatibility is safe, but those missing facts must not be inferred.
+- Temporary detached verification worktrees/builds remain under the system temporary directory and Git worktree metadata; they do not affect the project worktree or runtime data.
+- Task 10 must make batch comparisons reproducible across identical seed sets and configuration/code snapshots rather than relying on single-run simulation output.
+
 Next step:
+
+- Task 10: add deterministic batch policy/resource evaluation with distribution, Top1/Top3, force, and refresh comparisons.
 
 ## Task 10: Add Reproducible Batch And Resource Evaluation
 

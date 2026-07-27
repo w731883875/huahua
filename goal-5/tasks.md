@@ -218,17 +218,42 @@ Next step:
 
 ## Task 7: Implement Top1 Desktop-Pet Teleport Guidance
 
-Status: pending
+Status: completed
 
 Make the desktop-pet actor move beside the stable Top1 board/backpack/brush/finish target, point precisely without covering the click area, remain click-through during play, and retain lightweight Top2/Top3 markers.
 
 Work performed:
 
+- Added `pet_layout.py` with a pure, deterministic placement policy: keep a 30-pixel gap from the click point, try above/right/left/below in order, clamp on the perpendicular axis, stay fully inside the target monitor, and refuse movement when no non-covering placement fits.
+- Made `DesktopPetActor` consume only live structured `RecommendationTarget` values. A stable target temporarily overrides the saved manual position; expiry, instability, explicit drag mode, or an impossible layout removes the pointer and restores the normal saved/observation position.
+- Added a dedicated transparent Top1 pointer window whose arrow tip and target ring are centered on the real click coordinate. Actor and pointer windows use exact Win32 `SetWindowPos` coordinates, including negative-coordinate monitors, with a Tk geometry fallback.
+- Added separate render keys for actor and pointer so the same stable target does not repeatedly move or redraw either window. The target's short structured reason is shown in the pet bubble.
+- Changed desktop-pet dragging to default off, so game operation is click-through by default. Explicitly enabling drag temporarily suspends target teleport/pointer behavior, makes the pet interactive, and retains the existing saved-position workflow.
+- Reworked coordinate markers so Top1 is represented only by the pet/pointer and stable board phases retain lightweight Top2/Top3 markers. Markers are suppressed for expired/unstable targets, non-board phases without structured alternatives, malformed window data, and off-window/off-screen points.
+- Kept the existing capture safety path: capture, quick capture, and auto-follow hide the pet, Top1 pointer, and Top2/Top3 markers together before pixels are acquired, then restore from the latest stable state.
+- Code commit: `935d5ca Guide desktop pet to stable top target`.
+
 Validation evidence:
+
+- Full suite passed: 53 tests in 0.132 seconds; 33 focused layout/guidance/pet tests passed independently.
+- New tests cover placement priority and 30-pixel separation, target non-coverage, negative monitor coordinates, impossible layouts, exact pointer tip geometry, expiry at render time, saved-position override, no repeated movement/redraw, default click-through, explicit drag behavior, capture hiding of both pet and pointer, stable Top2/Top3 ranking, and off-screen marker rejection.
+- Real Win32 monitor probing returned `(0, 0, 1536, 864)` for the current display and no monitor for `(-100000, -100000)`, confirming the target-monitor boundary path without opening a GUI.
+- Strict environment validation passed on Python 3.12.10 with all 11 locked packages exact; encoding validation checked 60 text files, and AST/core imports passed for 28 Python files.
+- Fixed-seed brush/refresh simulation exited 0, and a passive scan found no network or mouse/keyboard injection APIs.
+- Isolated PyInstaller build succeeded in `C:\Users\m'm'm'm'm'm'm'm'm'm'\AppData\Local\Temp\huahua-goal5-task7-6a61399e37f24d2c9622d1ca285b56b8`; the EXE is 75,767,597 bytes with SHA256 `93C445593799AFC55B16D69770B4AC76684966CB32896A7450DB7B6C1A96B04E`. Critical missing-module count was 0 and `huahua_assistant.pet_layout` appeared in the Analysis TOC.
+- SHA256 values for corrected observations, desktop-pet position, trajectories, observations, and stats stayed unchanged through tests and build.
+- `git diff --cached --check` passed, and the code commit contains only `desktop_pet.py`, `pet_layout.py`, and their dedicated test file; pre-existing dirty files remain uncommitted.
 
 Remaining risk:
 
+- The GUI/EXE was not launched because doing so could steal focus. Real per-monitor DPI scaling, Tk color-key transparency, topmost ordering, click-through styles, and visual arrow alignment still need a later live/manual visual gate and the final screenshot audit.
+- Only board placement currently has a ranked alternative list, so Top2/Top3 markers are shown only for stable board targets. Backpack, brush, and finish phases correctly show Top1 but need structured alternative targets before meaningful Top2/Top3 markers can exist.
+- The Win32 placement path is verified at the API and pure-layout levels. If Win32 positioning fails at runtime, Tk geometry fallback remains, but exact negative-coordinate behavior of that fallback is platform dependent.
+- Explicit drag mode intentionally suspends automatic teleport until drag is turned off; this preserves a usable manual-position control while keeping normal gameplay click-through by default.
+
 Next step:
+
+- Task 8: version decision/run records, separate observed outcomes from proxy/policy scores, retain ordinary/failure summaries, and compute the three risk-mode metric sets without enabling premature personalization.
 
 ## Task 8: Add Outcome And Risk Learning Schema
 

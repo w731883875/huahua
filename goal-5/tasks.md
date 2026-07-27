@@ -367,17 +367,41 @@ Next step:
 
 ## Task 11: Add Privacy-Ready Multi-User Data Contract
 
-Status: pending
+Status: completed
 
 Implement a versioned, validated, deduplicated, opt-in data bundle/upload queue contract plus a local reference aggregator; keep remote upload disabled and exclude screenshots by default.
 
 Work performed:
 
+- Added `huahua_assistant/multi_user.py` with versioned `huahua-multi-user-bundle-v1`, `huahua-local-upload-queue-v1`, and `huahua-multi-user-aggregate-v1` contracts.
+- Kept sharing opt-in: disabled consent cannot create a bundle, the exact consent version and grant time are required, local queue state is always `pending_local_only`, and `REMOTE_UPLOAD_ENABLED` is hard-coded false. No server endpoint or network client was added.
+- Added rotating installation pseudonyms derived from a minimum 16-byte local secret and rotation ID. Raw secrets are never serialized; changing the rotation ID prevents permanent cross-period identifiers.
+- Whitelisted only real-capture recommendation decisions, run outcomes, compressed/failure summaries, and trusted high-score trajectories. Inputs are normalized to the Task 8 decision/run schemas and raw trajectory steps are replaced with structured decision records or bounded summaries.
+- Added strict top-level bundle/event/payload schemas, UTF-8 JSON parsing, finite-number checks, prohibited privacy fields, nesting/container/string limits, a 2 MiB bundle limit, 128 KiB event limit, and 500-event limit. Screenshot, window-title, account/chat, clipboard, token, raw OCR text, and file-path fields cannot enter a valid payload.
+- Added event ID plus payload SHA256 deduplication, bundle content hashes, queue-to-bundle hash binding, duplicate bundle rejection, ID-conflict isolation, impossible-coordinate/transition checks, anomalous score isolation, repeated-state isolation, and a 100-session-per-installation cap.
+- Added a pure local aggregator that weights installations equally, sessions equally within each installation, and decisions equally within each session instead of summing raw steps. It emits an expert-readiness gate requiring at least five installations and twenty sessions but never auto-loads a policy.
+- Made queue and aggregate writes atomic. All input bundles validate before aggregate output replacement, so one invalid input cannot partially pollute an existing result or the formal learning logs.
+- Added the runnable offline `scripts/aggregate_multi_user.py` reference aggregator and documented privacy boundaries, schemas, integrity limits, weighting, and local usage in `多用户数据契约.md`.
+
 Validation evidence:
+
+- Full suite passed: 78 tests in 1.978 seconds. Ten dedicated multi-user tests cover explicit consent, rotating pseudonyms, screenshot exclusion, non-real/untrusted rejection, unknown/prohibited fields, oversized data, tampered hashes, queue deduplication, remote-disable state, equal installation/session weighting, ID conflicts, anomalous scores, atomic failure, and installation flooding.
+- The weighting regression proves two decisions from one installation and one decision from another produce a weighted Top1 rate of 0.75 rather than the raw-step rate of 0.6667.
+- A 101-session single-installation bundle accepts only 100 sessions and quarantines the excess with `installation_session_rate_limit`.
+- Strict Python 3.12.10 verification passed with all 11 locked distributions exact; encoding validation checked 68 project text files, and the offline aggregator CLI help path ran successfully from the repository root.
+- Static scan of the new module/script found no requests, urllib, httpx, or socket APIs. Remote upload is declared false in both bundle privacy metadata and queue envelopes and is enforced by validation.
+- SHA256 comparison of every formal runtime JSON/JSONL file before and after the full suite and checks found 0 changes.
 
 Remaining risk:
 
+- Bundle hashes prove integrity and deduplication, not sender authenticity. There is no production server, transport authentication, or signed policy distribution in this task; untrusted external files must continue through quarantine and independent review.
+- Explicit consent and secret lifecycle are available as library contracts but are not wired into the current Tk UI. This avoids silently enabling sharing; a future UI must present the exact categories and persist revocation without weakening the default-off gate.
+- The legacy `huahua-learning-bundle-v1` export/merge UI remains a local backup workflow and intentionally is not accepted as a multi-user bundle. It has weaker validation and must not be repurposed as an upload path.
+- Expert readiness only permits later evaluation. The local aggregate is not a production strategy package and is never loaded automatically by the recommendation engine.
+
 Next step:
+
+- Task 12: run the fourth major checkpoint across deterministic evaluation, multi-user validation/security, consent defaults, weighting, expert gates, compatibility, documentation, packaging, and rollback.
 
 ## Task 12: Major Checkpoint 4
 

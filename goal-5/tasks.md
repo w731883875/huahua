@@ -442,14 +442,36 @@ Next step:
 
 ## Task 13: Final Review And Screenshot Gap Assessment
 
-Status: pending
+Status: completed
 
 Perform the largest end-to-end review, fix remaining high-risk issues, update user-facing documentation and completion records, and only then produce a minimal prioritized screenshot capture list for recognition cases that existing assets cannot resolve.
 
 Work performed:
 
+- Audited all existing workbook, PDF, runtime crop, full-game, backpack, brush, current-paint, terminal, and non-game fixtures before requesting any new screenshots.
+- Fixed OpenCV 5 `HoughLinesP` shape compatibility, empty/tiny crop safety, minimum scene dimensions, the 0.70 full/quick board threshold, non-game desktop rejection, and stage-1 brush cards leaking false stage-2 affixes.
+- Added focused regressions for OpenCV 4/5 line shapes, one-pixel candidates, invalid channels, partial panels, low-score boards, stage-1/stage-2 separation, and tracked desktop/active/terminal frames.
+- Re-ran the complete functional, environment, encoding, deterministic evaluation, passive-boundary, runtime-integrity, and packaging gates.
+- Added `最终验收与截图清单.md` with the final acceptance matrix, reproducible evidence, existing-asset audit, remaining risks, and a conditional 5-7 image P0 list plus one non-blocking P1 sample.
+- Updated `桌宠辅助项目优化设计.md` to record completion while keeping live visual calibration risks explicit.
+
 Validation evidence:
+
+- Full suite passed: 85 tests in 14.922 seconds. Strict Python 3.12.10 verification passed with all 11 locked distributions exact; encoding checks passed 69 files during regression and 70 files after adding the final acceptance document.
+- Fixed-seed simulation `20260727` completed with board, install-plan, brush, refresh, and force recommendations.
+- Two independent 100-seed reports for seeds 10-109 had identical report SHA256 `485fc8c879202326008d3c647664adc9ba3131da0d780f72d81fa8e26fd483c8` and identical file SHA256 `6B64047AC24664CFC206108F0F05529D1E1302C2D0D4207E75D5C68DF0965B01`.
+- Formal runtime JSON/JSONL SHA256 comparison reported 0 changes after tests, environment/encoding checks, simulation, and both batch evaluations.
+- Static Python scan found 0 network-client API matches and 0 mouse/keyboard input-injection API matches.
+- A detached clean build from `10b8482d9be6f89f18fc2232472c7fa7670c23ec` produced a 75,790,268-byte EXE with SHA256 `8A8C1B4F3DB394E1DF4193BD0CD2C5FCC4F3F7C0FE2E770AF5270E7C76586BD9`.
+- Final Analysis TOC contains `vision`, `multi_user`, `guidance`, `pet_layout`, and `outcome_learning`; critical missing-module count for OpenCV, MSS, Pillow, Tk, and project modules is 0.
 
 Remaining risk:
 
+- Live cross-resolution/DPI recognition accuracy remains heuristic. The final P0 list needs at least five full-window screenshots and at most seven when the pending-paint sample does not also cover vertical or diagonal rules.
+- The packaged GUI was not brought to the foreground against a live game, so focus behavior, per-monitor DPI, click-through transparency, and real pointer alignment still require manual visual confirmation.
+- Batch scores remain current-rule simulation proxies rather than observed complete-game outcomes; generated states underrepresent late-game downside and future resource opportunity cost.
+- Multi-user bundles are unsigned and remote upload remains disabled. No production server, authenticated transport, automatic strategy loading, or sharing UI was introduced.
+
 Next step:
+
+- The implementation goal is complete. Collect only the P0 screenshots in `最终验收与截图清单.md` during normal play, then add them as a versioned visual regression set before changing recognition thresholds.

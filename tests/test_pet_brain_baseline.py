@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from huahua_assistant.fast_events import FastVisionEvent
+from huahua_assistant.guidance import GamePhase, TargetKind
+from huahua_assistant.models import Rect
 from huahua_assistant.pet_brain import evaluate_pet_state
 
 
@@ -91,6 +94,52 @@ class PetBrainTargetBaselineTests(unittest.TestCase):
 
         self.assertEqual("recommend_board_cell", state.mode)
         self.assertEqual("board", state.target)
+
+    def test_structured_board_target_is_released_after_stable_capture_frames(self) -> None:
+        def snapshot():
+            return SimpleNamespace(
+                board_signature="board-a",
+                board_score=0.91,
+                reliable=True,
+                brush=None,
+                board_rect=Rect(100, 100, 600, 600),
+            )
+
+        scene = SimpleNamespace(
+            brush_options=None,
+            backpack=None,
+            region=lambda _kind: None,
+        )
+        recommendation = SimpleNamespace(
+            row=2,
+            col=3,
+            paint=None,
+            reason="宝箱到7",
+            explanation=None,
+        )
+        app = _app(
+            last_fast_snapshot=snapshot(),
+            last_capture_quality={"ok": True, "score": 0.91},
+            current_scene=scene,
+            current_state=SimpleNamespace(current_rule=None, current_rule_pending=False),
+            recommendations=[recommendation],
+            last_capture_window=SimpleNamespace(left=0, top=0, width=1920, height=1080),
+            last_capture_size=(1920, 1080),
+            _screen_point_for_board_cell=lambda row, col: (1200 + col, 700 + row),
+        )
+
+        with patch("huahua_assistant.pet_brain.time.monotonic", return_value=10.0):
+            first = evaluate_pet_state(app)
+        app.last_fast_snapshot = snapshot()
+        with patch("huahua_assistant.pet_brain.time.monotonic", return_value=10.31):
+            second = evaluate_pet_state(app)
+
+        self.assertEqual(GamePhase.UNSTABLE, first.phase)
+        self.assertIsNone(first.recommendation_target)
+        self.assertEqual(GamePhase.BOARD_PLACE, second.phase)
+        self.assertIsNotNone(second.recommendation_target)
+        self.assertEqual(TargetKind.BOARD, second.recommendation_target.kind)
+        self.assertEqual((1203, 702), second.recommendation_target.screen_point)
 
 
 if __name__ == "__main__":

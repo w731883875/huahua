@@ -32,17 +32,38 @@ Next step:
 
 ## Task 2: Establish Test And Environment Baseline
 
-Status: pending
+Status: completed
 
 Add a lightweight automated test foundation for rule catalogs, learning trust gates, recommendation target behavior, and compatibility helpers; document a reproducible Python environment without overwriting the user's runtime data.
 
 Work performed:
 
+- Added a standard-library `unittest` suite covering rule catalog/legacy-code round trips, compact payload compatibility, real-only learning trust gates, deduplication, legacy trajectory readability, pet target precedence, and unstable-capture freezing.
+- Added `scripts/check_environment.py` with strict and report-only modes, JSON output, supported Python checks, Tk detection, dependency minimums, and required-project-file checks. The checker does not import the heavy packages or read/write runtime learning data.
+- Added `开发与测试指南.md` with a reproducible Python 3.12/3.13 virtual-environment workflow, test commands, strict environment verification, source/build consistency, and runtime data safety rules.
+- Added a minimal `.gitignore` for `.venv`, Python caches, and test coverage artifacts without ignoring runtime data or screenshots.
+- Created `.venv` with Python 3.12 and installed the existing `requirements.txt`; the environment is local and ignored by Git.
+- Code commit: `1d40bd8 Add test and environment baseline`.
+
 Validation evidence:
+
+- `.\.venv\Scripts\python.exe -B scripts\check_environment.py` passed with Python 3.12.10, Tk, NumPy 2.5.1, OpenCV 5.0.0.93, MSS 10.2.0, Pillow 12.3.0, and PyInstaller 6.21.0.
+- `.\.venv\Scripts\python.exe -B -m unittest discover -s tests -v` ran 18 tests successfully in 0.037 seconds.
+- Core imports succeeded for OpenCV, NumPy, MSS, Pillow, `HuahuaApp`, and the desktop-pet patch.
+- `.\.venv\Scripts\python.exe -B -m huahua_assistant simulate --seed 42 --brush --refresh` completed and produced board, install, placement, brush, force, and refresh recommendations.
+- The global Python diagnostic intentionally returned strict exit code 1 when dependencies were missing; `--report-only` returned 0. This proves the checker distinguishes reporting from enforcement.
+- AST checks passed for all new Python files, and `python scripts\check_encoding.py .` checked 54 text files successfully.
+- `git diff --cached --check` passed before the code commit.
 
 Remaining risk:
 
+- Tests characterize pure decision/data behavior; they do not yet prove live Windows capture, Tk click-through, desktop-pet movement, or recognition accuracy.
+- OpenCV 5 satisfies the declared lower bound but is newer than the previously used 4.x line; full visual regression and packaging checks remain necessary.
+- Existing tracked `__pycache__` changes and other dirty files predate this task and were intentionally not modified or committed.
+
 Next step:
+
+- Task 3: run the first major checkpoint before changing affix identities and business logic.
 
 ## Task 3: Major Checkpoint 1
 

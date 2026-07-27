@@ -331,17 +331,39 @@ Next step:
 
 ## Task 10: Add Reproducible Batch And Resource Evaluation
 
-Status: pending
+Status: completed
 
 Implement deterministic batch simulation reports for rule policies, Top1/Top3 behavior, score distributions, downside metrics, and force/refresh A/B comparisons using fixed seeds and configuration snapshots.
 
 Work performed:
 
+- Added `huahua_assistant/batch_evaluation.py` with the versioned `huahua-batch-evaluation-v1` report contract. Reports are explicitly labelled `simulation_proxy`, set `observed_outcome` to null, and never write observations, trajectories, learning statistics, or other runtime data.
+- Added deterministic current-rule episode replay for stable, balanced, and gamble ranking modes. Each step enumerates the complete legal candidate set, applies every candidate to a cloned state for the realized proxy oracle, and records per-step Top1/Top3 behavior without crossing into an uncontrolled next-rule episode.
+- Added total/scored runs, current-match success, proxy high-score rate, mean, median, population standard deviation, P10/P20/P80/P90, and bottom-20% mean for every policy mode.
+- Added force use/keep, refresh stage-1 use/keep, and refresh stage-2 use/keep paired comparisons. Every branch starts from the same state; all random branches use stable seeds derived from the same top-level seed, and stage-2 refresh preserves the selected brush type.
+- Embedded the exact seed list/hash, complete active configuration snapshot/hash, package version, relevant-source hash, optional revision, formulas, thresholds, and report hash so results can be compared without guessing evaluation inputs.
+- Added the `batch-evaluate` CLI with seed range, run count, output path, and revision options, plus usage and interpretation guidance in `开发与测试指南.md`.
+- Added focused tests for repeatability, score-type separation, seed validation, complete per-policy/per-resource coverage, and JSON CLI output.
+
 Validation evidence:
+
+- Full suite passed: 68 tests in 1.699 seconds; the 4 dedicated batch tests passed independently and include byte-equivalent report data across repeated runs.
+- Strict Python 3.12.10 environment verification passed with all 11 locked distributions exact; encoding validation checked 64 project text files.
+- A 100-seed report completed successfully with report SHA256 `d49747d5ee8b81a7d86ca9ad831a9a7662b4d8e72af39d7d658b002f294a603d`.
+- Across 100 seeds, each policy completed 100/100 current-rule episodes and generated 321 decisions. Balanced/gamble Top1 and Top3 realized-proxy hit rates were 0.439252 and 0.909657; stable Top1 and Top3 were 0.439252 and 0.894081. Proxy high-score rate was 0.32 and mean episode proxy was 1764.182857.
+- All three resource reports contained the same 100 top-level seeds. Force use won 1.0 of paired initial-state comparisons; stage-1 refresh use/keep/tie rates were 0.19/0.25/0.56; stage-2 rates were 0.43/0.37/0.20.
+- SHA256 comparison of every formal runtime JSON/JSONL file before and after full tests, environment/encoding checks, and the 100-seed evaluation found 0 changes.
 
 Remaining risk:
 
+- These are deterministic rule-model proxies for one current-rule episode, not observed game scores or complete-game counterfactual outcomes. They must not be imported as real learning data or used alone to claim a production policy improvement.
+- The generated initial states currently lead all three modes to the same selected episode paths in most samples, so their score distributions are identical even where lower-ranked Top3 ordering differs. More representative late-game state generation is required before mode comparisons can expose overwrite/downside tradeoffs reliably.
+- Force use wins every generated opening-state pair under the current single-episode proxy because future resource opportunity cost is outside the episode boundary. The report exposes this limitation rather than treating the result as evidence that force should always be used.
+- `revision` is optional for source archives without Git context. `package_version` and the relevant-source SHA256 remain mandatory and always populated.
+
 Next step:
+
+- Task 11: implement the opt-in, validated, deduplicated, screenshot-free multi-user bundle/queue contract and local reference aggregator with remote upload disabled.
 
 ## Task 11: Add Privacy-Ready Multi-User Data Contract
 

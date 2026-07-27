@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
+from .batch_evaluation import build_batch_evaluation_report
 from .capture import DEFAULT_WINDOW_TITLE, capture_target, list_visible_windows, read_image, write_image
 from .game_model import (
     BrushType,
@@ -55,6 +57,15 @@ def main() -> None:
     simulate.add_argument("--refresh", action="store_true", help="Enable Lv5 pet affix refresh evaluation.")
     simulate.add_argument("--force-used", type=int, default=0, choices=[0, 1, 2, 3])
 
+    batch = subparsers.add_parser(
+        "batch-evaluate",
+        help="Run deterministic policy and paired resource proxy evaluation.",
+    )
+    batch.add_argument("--start-seed", type=int, default=0)
+    batch.add_argument("--runs", type=int, default=100)
+    batch.add_argument("--output", type=Path, default=None)
+    batch.add_argument("--code-revision", default=None)
+
     brush_order = subparsers.add_parser("brush-order", help="Normalize stage-1 brush option order.")
     brush_order.add_argument("options", nargs="+", choices=[item.value for item in BrushType])
 
@@ -100,6 +111,23 @@ def main() -> None:
             refresh_available=args.refresh,
             force_used=args.force_used,
         )
+        return
+
+    if args.command == "batch-evaluate":
+        if args.runs <= 0:
+            parser.error("--runs must be greater than zero")
+        report = build_batch_evaluation_report(
+            range(args.start_seed, args.start_seed + args.runs),
+            code_revision=args.code_revision,
+        )
+        rendered = json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True)
+        if args.output is None:
+            print(rendered)
+        else:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(rendered + "\n", encoding="utf-8")
+            print(f"Batch evaluation: {args.output}")
+            print(f"Report SHA256: {report['report_sha256']}")
         return
 
     if args.command == "brush-order":

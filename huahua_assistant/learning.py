@@ -145,9 +145,29 @@ def merge_learning_bundle(path: str | Path) -> dict[str, Any]:
     }
 
 
+_LEARNING_STATS_CACHE_SIGNATURE: tuple[tuple[bool, int, int], ...] | None = None
+_LEARNING_STATS_CACHE: dict[str, Any] | None = None
+
+
 def load_learning_stats() -> dict[str, Any]:
-    # Rebuild from raw events so old stat files cannot keep pre-filter data.
-    return _build_complete_stats(_load_events(), _load_corrections(), _load_trajectories())
+    # Rebuild only when a source log changes. Re-parsing all JSONL files for
+    # every realtime frame consumed most of the 500 ms response budget.
+    global _LEARNING_STATS_CACHE_SIGNATURE, _LEARNING_STATS_CACHE
+    paths = (OBSERVATION_LOG, CORRECTION_LOG, TRAJECTORY_LOG)
+    signature: list[tuple[bool, int, int]] = []
+    for path in paths:
+        try:
+            stat = path.stat()
+            signature.append((True, int(stat.st_size), int(stat.st_mtime_ns)))
+        except OSError:
+            signature.append((False, 0, 0))
+    frozen_signature = tuple(signature)
+    if _LEARNING_STATS_CACHE is not None and frozen_signature == _LEARNING_STATS_CACHE_SIGNATURE:
+        return _LEARNING_STATS_CACHE
+    stats = _build_complete_stats(_load_events(), _load_corrections(), _load_trajectories())
+    _LEARNING_STATS_CACHE_SIGNATURE = frozen_signature
+    _LEARNING_STATS_CACHE = stats
+    return stats
 
 
 def _load_events() -> list[dict[str, Any]]:
@@ -324,6 +344,23 @@ def _build_stats(
     high_value_seen = 0
     high_value_best_score = 0.0
     high_value_counts = Counter()
+    compressed_run_summaries = 0
+    compressed_summary_kinds = Counter()
+    compressed_summary_skip_reasons = Counter()
+    compressed_summary_scores: list[float] = []
+    compressed_summary_weight_total = 0.0
+    compressed_summary_weighted_score = 0.0
+    compressed_initial_terrain = Counter()
+    compressed_initial_open_cells = Counter()
+    compressed_initial_signatures = Counter()
+    compressed_terrain_buckets = Counter()
+    compressed_terrain_bucket_scores: dict[str, list[float]] = {}
+    compressed_terminal_counts = Counter()
+    trajectory_initial_snapshots = 0
+    trajectory_initial_terrain = Counter()
+    trajectory_initial_open_cells = Counter()
+    trajectory_terrain_buckets = Counter()
+    trajectory_terrain_bucket_scores: dict[str, list[float]] = {}
 
     for event in events:
         payload = event.get("payload") or {}
@@ -410,6 +447,36 @@ def _build_stats(
                 high_value_shorts=high_value_recommendation_shorts,
                 high_value_tags=high_value_recommendation_tags,
             )
+        elif event_type == "compressed_run_summary":
+            compressed_run_summaries += 1
+            kind = str(payload.get("kind") or "unknown")
+            compressed_summary_kinds[kind] += 1
+            skip_reason = payload.get("skip_reason") or payload.get("reason")
+            if skip_reason:
+                compressed_summary_skip_reasons[str(skip_reason)] += 1
+            score = payload.get("internal_score")
+            if isinstance(score, (int, float)):
+                score_value = float(score)
+                compressed_summary_scores.append(score_value)
+                weight = payload.get("weight")
+                if isinstance(weight, (int, float)) and weight > 0:
+                    compressed_summary_weight_total += float(weight)
+                    compressed_summary_weighted_score += score_value * float(weight)
+            initial_snapshot = payload.get("initial_snapshot") if isinstance(payload.get("initial_snapshot"), dict) else {}
+            _accumulate_initial_terrain(
+                initial_snapshot,
+                terrain=compressed_initial_terrain,
+                open_cells=compressed_initial_open_cells,
+                signatures=compressed_initial_signatures,
+            )
+            bucket = _terrain_bucket_key(initial_snapshot)
+            compressed_terrain_buckets[bucket] += 1
+            if isinstance(score, (int, float)):
+                compressed_terrain_bucket_scores.setdefault(bucket, []).append(float(score))
+            terminal = payload.get("terminal") if isinstance(payload.get("terminal"), dict) else {}
+            known = terminal.get("known") if isinstance(terminal.get("known"), dict) else {}
+            for key in ("total", "lv7", "gameplay7", "monster7", "treasure5", "treasure6", "treasure7", "max_treasure"):
+                compressed_terminal_counts[key] += _safe_int(known.get(key))
 
     for event in corrections:
         payload = event.get("payload") or {}
@@ -424,6 +491,19 @@ def _build_stats(
 
     for event in trajectories:
         payload = event.get("payload") or {}
+        initial_snapshot = payload.get("initial_snapshot") if isinstance(payload.get("initial_snapshot"), dict) else {}
+        if initial_snapshot:
+            trajectory_initial_snapshots += 1
+            _accumulate_initial_terrain(
+                initial_snapshot,
+                terrain=trajectory_initial_terrain,
+                open_cells=trajectory_initial_open_cells,
+            )
+            bucket = _terrain_bucket_key(initial_snapshot)
+            trajectory_terrain_buckets[bucket] += 1
+            final_score = payload.get("internal_score", payload.get("final_score"))
+            if isinstance(final_score, (int, float)):
+                trajectory_terrain_bucket_scores.setdefault(bucket, []).append(float(final_score))
         gate = payload.get("high_score_gate") if isinstance(payload.get("high_score_gate"), dict) else {}
         primary_reason = gate.get("primary_reason") or payload.get("reason")
         if primary_reason:
@@ -585,6 +665,25 @@ def _build_stats(
         recommendation_shorts=imitation_recommendation_shorts,
         recommendation_tags=imitation_recommendation_tags,
     )
+    expert_sample_stage = _expert_sample_stage(
+        trajectory_count=len(trajectories),
+        trajectory_scores=trajectory_scores,
+        high_score_gate_reasons=high_score_gate_reasons,
+        compressed_count=compressed_run_summaries,
+    )
+    terrain_prior = _terrain_prior_summary(
+        high_terrain=trajectory_initial_terrain,
+        high_open_cells=trajectory_initial_open_cells,
+        high_samples=trajectory_initial_snapshots,
+        compressed_terrain=compressed_initial_terrain,
+        compressed_open_cells=compressed_initial_open_cells,
+        compressed_samples=compressed_run_summaries,
+        compressed_scores=compressed_summary_scores,
+        high_buckets=trajectory_terrain_buckets,
+        high_bucket_scores=trajectory_terrain_bucket_scores,
+        compressed_buckets=compressed_terrain_buckets,
+        compressed_bucket_scores=compressed_terrain_bucket_scores,
+    )
     return {
         "total_events": len(events),
         "event_counts": dict(event_counts),
@@ -659,6 +758,8 @@ def _build_stats(
         "imitation_samples": imitation_policy["samples"],
         "imitation_ready": imitation_policy["ready"],
         "imitation_policy": imitation_policy,
+        "expert_sample_stage": expert_sample_stage,
+        "terrain_prior": terrain_prior,
         "trajectory_best_score": max(trajectory_scores) if trajectory_scores else None,
         "trajectory_avg_score": (sum(trajectory_scores) / len(trajectory_scores)) if trajectory_scores else None,
         "treasure_ratio": treasure_count / total_backpack if total_backpack else 0.0,
@@ -674,6 +775,24 @@ def _build_stats(
         "high_value_seen": high_value_seen,
         "high_value_best_score": high_value_best_score if high_value_seen else None,
         "high_value_counts": dict(high_value_counts),
+        "trajectory_initial_snapshots": trajectory_initial_snapshots,
+        "trajectory_initial_terrain": _terrain_counter_summary(trajectory_initial_terrain, trajectory_initial_snapshots),
+        "trajectory_initial_open_cells": _counter_distribution(trajectory_initial_open_cells),
+        "compressed_run_summaries": compressed_run_summaries,
+        "compressed_summary_kinds": dict(compressed_summary_kinds),
+        "compressed_summary_kind_pct": _counter_distribution(compressed_summary_kinds),
+        "compressed_summary_skip_reasons": dict(compressed_summary_skip_reasons),
+        "compressed_summary_avg_score": (
+            sum(compressed_summary_scores) / len(compressed_summary_scores)
+        ) if compressed_summary_scores else None,
+        "compressed_summary_weighted_avg_score": (
+            compressed_summary_weighted_score / compressed_summary_weight_total
+        ) if compressed_summary_weight_total else None,
+        "compressed_summary_best_score": max(compressed_summary_scores) if compressed_summary_scores else None,
+        "compressed_initial_terrain": _terrain_counter_summary(compressed_initial_terrain, compressed_run_summaries),
+        "compressed_initial_open_cells": _counter_distribution(compressed_initial_open_cells),
+        "compressed_initial_signatures": _counter_distribution(compressed_initial_signatures),
+        "compressed_terminal_counts": dict(compressed_terminal_counts),
     }
 
 
@@ -718,6 +837,245 @@ def _counter_distribution(counter: Counter) -> dict[str, Any]:
         "total": int(total),
         "items": items,
     }
+
+
+def _accumulate_initial_terrain(
+    snapshot: dict[str, Any],
+    *,
+    terrain: Counter,
+    open_cells: Counter | None = None,
+    signatures: Counter | None = None,
+) -> None:
+    if not isinstance(snapshot, dict):
+        return
+    board = snapshot.get("board") if isinstance(snapshot.get("board"), dict) else {}
+    values = {
+        "blank": _safe_int(board.get("blank")),
+        "blocked": _safe_int(board.get("blocked")),
+        "void": _safe_int(board.get("void")),
+        "faded": _safe_int(board.get("faded")),
+        "paint": _safe_int(board.get("paint")),
+    }
+    values["known_cells"] = sum(values.values())
+    values["open_cells"] = values["blank"] + values["paint"]
+    for key, value in values.items():
+        terrain[key] += value
+    if open_cells is not None:
+        open_cells[str(values["open_cells"])] += 1
+    if signatures is not None and snapshot.get("signature"):
+        signatures[str(snapshot.get("signature"))] += 1
+
+
+def _terrain_counter_summary(counter: Counter, samples: int) -> dict[str, Any]:
+    sample_count = int(samples or 0)
+    totals = {str(key): int(value) for key, value in counter.items()}
+    averages = {
+        str(key): round(float(value) / float(sample_count), 3)
+        for key, value in counter.items()
+        if sample_count > 0
+    }
+    return {
+        "samples": sample_count,
+        "totals": totals,
+        "avg": averages,
+    }
+
+
+def _expert_sample_stage(
+    *,
+    trajectory_count: int,
+    trajectory_scores: list[float],
+    high_score_gate_reasons: Counter,
+    compressed_count: int,
+) -> dict[str, Any]:
+    treasure7 = int(high_score_gate_reasons.get("treasure7_plus", 0))
+    many_lv7 = int(high_score_gate_reasons.get("many_level7", 0))
+    treasure6 = int(high_score_gate_reasons.get("treasure6_plus", 0))
+    lv7 = int(high_score_gate_reasons.get("level7_paint", 0))
+    stage = 0
+    label = "样本不足"
+    if treasure6 > 0 or lv7 > 0:
+        stage = 1
+        label = "阶段1：6级箱子/任意7级颜料"
+    if treasure7 > 0 or many_lv7 > 0 or (treasure6 > 0 and lv7 >= 2):
+        stage = 2
+        label = "阶段2：7级箱子/多个7级/6级箱子+多个7级"
+    if trajectory_count >= 80 and trajectory_scores:
+        stage = 3
+        label = "阶段3：可筛选前20%专家样本"
+    sorted_scores = sorted((float(score) for score in trajectory_scores), reverse=True)
+    top20_count = max(1, int(len(sorted_scores) * 0.2)) if sorted_scores else 0
+    top20_threshold = sorted_scores[top20_count - 1] if top20_count else None
+    return {
+        "stage": stage,
+        "label": label,
+        "trajectory_count": int(trajectory_count),
+        "compressed_count": int(compressed_count),
+        "top20_threshold": round(top20_threshold, 3) if top20_threshold is not None else None,
+        "ready_for_prior": stage >= 1,
+        "ready_for_expert_filter": stage >= 3,
+    }
+
+
+def _terrain_prior_summary(
+    *,
+    high_terrain: Counter,
+    high_open_cells: Counter,
+    high_samples: int,
+    high_buckets: Counter,
+    high_bucket_scores: dict[str, list[float]],
+    compressed_terrain: Counter,
+    compressed_open_cells: Counter,
+    compressed_samples: int,
+    compressed_scores: list[float],
+    compressed_buckets: Counter,
+    compressed_bucket_scores: dict[str, list[float]],
+) -> dict[str, Any]:
+    high_avg = _terrain_avg(high_terrain, high_samples)
+    compressed_avg = _terrain_avg(compressed_terrain, compressed_samples)
+    open_bias = _open_cell_bias(high_open_cells, compressed_open_cells)
+    enough_samples = high_samples >= _config_int("learning.terrain_min_samples", 20)
+    if compressed_samples >= _config_int("learning.terrain_min_samples", 20):
+        enough_samples = True
+    deltas = {
+        key: round(float(high_avg.get(key, 0.0)) - float(compressed_avg.get(key, 0.0)), 3)
+        for key in {"blank", "paint", "blocked", "void", "faded", "open_cells"}
+    }
+    return {
+        "samples": {
+            "high": int(high_samples),
+            "compressed": int(compressed_samples),
+        },
+        "ready": bool(enough_samples and (high_samples > 0 or compressed_samples > 0)),
+        "high_avg": high_avg,
+        "compressed_avg": compressed_avg,
+        "delta_high_minus_compressed": deltas,
+        "open_cell_bias": open_bias,
+        "terrain_buckets": _terrain_bucket_summary(
+            high_buckets=high_buckets,
+            high_bucket_scores=high_bucket_scores,
+            compressed_buckets=compressed_buckets,
+            compressed_bucket_scores=compressed_bucket_scores,
+        ),
+        "compressed_avg_score": round(sum(compressed_scores) / len(compressed_scores), 3) if compressed_scores else None,
+    }
+
+
+def _terrain_avg(counter: Counter, samples: int) -> dict[str, float]:
+    if samples <= 0:
+        return {}
+    return {
+        str(key): round(float(value) / float(samples), 3)
+        for key, value in counter.items()
+    }
+
+
+def _open_cell_bias(high_open_cells: Counter, compressed_open_cells: Counter) -> dict[str, Any]:
+    keys = sorted({*high_open_cells.keys(), *compressed_open_cells.keys()}, key=lambda item: int(item) if str(item).isdigit() else 0)
+    high_total = sum(high_open_cells.values())
+    compressed_total = sum(compressed_open_cells.values())
+    items: list[dict[str, Any]] = []
+    for key in keys:
+        high_rate = float(high_open_cells.get(key, 0)) / float(high_total) if high_total else 0.0
+        compressed_rate = float(compressed_open_cells.get(key, 0)) / float(compressed_total) if compressed_total else 0.0
+        items.append(
+            {
+                "key": str(key),
+                "high_count": int(high_open_cells.get(key, 0)),
+                "compressed_count": int(compressed_open_cells.get(key, 0)),
+                "bias": round(high_rate - compressed_rate, 6),
+                "bias_pct": round((high_rate - compressed_rate) * 100.0, 3),
+            }
+        )
+    items.sort(key=lambda item: (item["bias"], item["high_count"]), reverse=True)
+    return {"items": items, "high_total": int(high_total), "compressed_total": int(compressed_total)}
+
+
+def _terrain_bucket_key(snapshot: dict[str, Any]) -> str:
+    board = snapshot.get("board") if isinstance(snapshot.get("board"), dict) else {}
+    blank = _safe_int(board.get("blank"))
+    paint = _safe_int(board.get("paint"))
+    blocked = _safe_int(board.get("blocked"))
+    void = _safe_int(board.get("void"))
+    states = str(board.get("states") or "")
+    open_cells = blank + paint
+    center_open = _center_open_count(states)
+    return "|".join(
+        (
+            f"open:{_bucket_range(open_cells, (16, 22))}",
+            f"block:{_bucket_range(blocked, (4, 8))}",
+            f"void:{_bucket_range(void, (8, 13))}",
+            f"center:{_bucket_range(center_open, (1, 3))}",
+        )
+    )
+
+
+def _center_open_count(states: str) -> int:
+    if len(states) < 36:
+        return 0
+    count = 0
+    for index in (14, 15, 20, 21):
+        if states[index] in {"B", "P"}:
+            count += 1
+    return count
+
+
+def _bucket_range(value: int, cuts: tuple[int, int]) -> str:
+    low, high = cuts
+    if value <= low:
+        return "low"
+    if value <= high:
+        return "mid"
+    return "high"
+
+
+def _terrain_bucket_summary(
+    *,
+    high_buckets: Counter,
+    high_bucket_scores: dict[str, list[float]],
+    compressed_buckets: Counter,
+    compressed_bucket_scores: dict[str, list[float]],
+) -> dict[str, Any]:
+    keys = set(high_buckets) | set(compressed_buckets)
+    items: list[dict[str, Any]] = []
+    for key in keys:
+        high_count = int(high_buckets.get(key, 0))
+        compressed_count = int(compressed_buckets.get(key, 0))
+        total = high_count + compressed_count
+        success_rate = float(high_count) / float(total) if total else 0.0
+        high_avg = _avg(high_bucket_scores.get(key, []))
+        compressed_avg = _avg(compressed_bucket_scores.get(key, []))
+        score_gap = None
+        if high_avg is not None and compressed_avg is not None:
+            score_gap = round(high_avg - compressed_avg, 3)
+        items.append(
+            {
+                "key": str(key),
+                "high": high_count,
+                "compressed": compressed_count,
+                "total": total,
+                "success_rate": round(success_rate, 6),
+                "success_pct": round(success_rate * 100.0, 3),
+                "high_avg_score": high_avg,
+                "compressed_avg_score": compressed_avg,
+                "score_gap": score_gap,
+            }
+        )
+    items.sort(key=lambda item: (item["success_rate"], item["high"], item.get("score_gap") or 0.0), reverse=True)
+    return {"items": items, "total": int(sum(item["total"] for item in items))}
+
+
+def _avg(values: list[float]) -> float | None:
+    if not values:
+        return None
+    return round(sum(values) / len(values), 3)
+
+
+def _safe_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _unknown_text(value: Any) -> str | None:

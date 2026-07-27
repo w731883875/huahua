@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from huahua_assistant.fast_events import FastVisionEvent
 from huahua_assistant.guidance import GamePhase, TargetKind
-from huahua_assistant.models import Rect
+from huahua_assistant.models import Rect, RegionKind
 from huahua_assistant import pet_brain
 from huahua_assistant.pet_brain import evaluate_pet_state
 
@@ -30,6 +30,47 @@ def _app(**overrides):
 
 
 class PetBrainTargetBaselineTests(unittest.TestCase):
+    def test_start_button_target_is_released_after_stable_frames(self) -> None:
+        def snapshot():
+            return SimpleNamespace(
+                board_signature="start-board",
+                board_score=0.82,
+                reliable=True,
+                brush=None,
+                board_rect=Rect(590, 225, 522, 522),
+            )
+
+        start_region = SimpleNamespace(rect=Rect(1210, 760, 250, 88), confidence=0.92)
+        scene = SimpleNamespace(
+            brush_options=None,
+            backpack=None,
+            region=lambda kind: start_region if kind == RegionKind.START_DRAWING else None,
+        )
+        app = _app(
+            last_fast_snapshot=snapshot(),
+            last_capture_quality={"ok": True, "score": 0.82},
+            current_scene=scene,
+            current_state=SimpleNamespace(current_rule=None, current_rule_pending=False),
+            last_capture_window=SimpleNamespace(left=0, top=0, width=1689, height=886),
+            last_capture_size=(1689, 886),
+            _screen_point_for_capture_rect=lambda rect, x_ratio, y_ratio: (
+                int(rect.x + rect.w * x_ratio),
+                int(rect.y + rect.h * y_ratio),
+            ),
+        )
+
+        with patch("huahua_assistant.pet_brain.time.monotonic", return_value=40.0):
+            first = evaluate_pet_state(app)
+        app.last_fast_snapshot = snapshot()
+        with patch("huahua_assistant.pet_brain.time.monotonic", return_value=40.31):
+            second = evaluate_pet_state(app)
+
+        self.assertEqual(GamePhase.UNSTABLE, first.phase)
+        self.assertEqual(GamePhase.INITIAL_MAP, second.phase)
+        self.assertIsNotNone(second.recommendation_target)
+        self.assertEqual(TargetKind.START, second.recommendation_target.kind)
+        self.assertEqual((1335, 804), second.recommendation_target.screen_point)
+
     def test_unstable_capture_freezes_all_action_targets(self) -> None:
         app = _app(
             last_capture_quality={"ok": False, "reason": "board_score_low"},
@@ -157,7 +198,7 @@ class PetBrainTargetBaselineTests(unittest.TestCase):
         scene = SimpleNamespace(
             brush_options=None,
             backpack=None,
-            region=lambda _kind: finish_region,
+            region=lambda kind: finish_region if kind == RegionKind.FINISH_DRAWING else None,
         )
         app = _app(
             last_fast_snapshot=snapshot(),
@@ -208,7 +249,7 @@ class PetBrainTargetBaselineTests(unittest.TestCase):
             current_scene=SimpleNamespace(
                 brush_options=None,
                 backpack=None,
-                region=lambda _kind: finish_region,
+                region=lambda kind: finish_region if kind == RegionKind.FINISH_DRAWING else None,
             ),
             current_state=SimpleNamespace(current_rule=None, current_rule_pending=False),
             last_capture_window=SimpleNamespace(left=0, top=0, width=1920, height=1080),

@@ -1,0 +1,436 @@
+{
+  "affix_appearance_rates": {
+    "stage1": {
+      "items": [],
+      "total": 0
+    },
+    "stage1_codes": {
+      "items": [],
+      "total": 0
+    },
+    "stage2": {
+      "items": [],
+      "total": 0
+    },
+    "stage2_codes": {
+      "items": [],
+      "total": 0
+    },
+    "stage2_ids": {
+      "items": [],
+      "total": 0
+    },
+    "unknown_stage1": {
+      "items": [],
+      "total": 0
+    },
+    "unknown_stage2": {
+      "items": [],
+      "total": 0
+    }
+  },
+  "affix_code_seen": {},
+  "affix_code_seen_pct": {},
+  "affix_code_seen_total": 0,
+  "affix_id_seen": {},
+  "affix_id_seen_pct": {},
+  "affix_id_seen_total": 0,
+  "affix_seen": {},
+  "affix_seen_pct": {},
+  "affix_seen_total": 0,
+  "backpack_categories": {
+    "gameplay": 4,
+    "monster": 5
+  },
+  "backpack_levels": {
+    "1": 2,
+    "3": 3,
+    "7": 4
+  },
+  "compressed_initial_open_cells": {
+    "items": [],
+    "total": 0
+  },
+  "compressed_initial_signatures": {
+    "items": [],
+    "total": 0
+  },
+  "compressed_initial_terrain": {
+    "avg": {},
+    "samples": 0,
+    "totals": {}
+  },
+  "compressed_run_summaries": 0,
+  "compressed_summary_avg_score": null,
+  "compressed_summary_best_score": null,
+  "compressed_summary_kind_pct": {
+    "items": [],
+    "total": 0
+  },
+  "compressed_summary_kinds": {},
+  "compressed_summary_skip_reasons": {},
+  "compressed_summary_weighted_avg_score": null,
+  "compressed_terminal_counts": {},
+  "correction_fields": {},
+  "correction_samples": {},
+  "corrections": 0,
+  "current_paint_code_seen": {
+    "I:M3:U:U:3:1": 1
+  },
+  "current_paint_seen": {
+    "monster|3|unknown|unknown|3|1": 1
+  },
+  "event_counts": {
+    "backpack_capture": 1,
+    "capture_quality": 1,
+    "capture_step_ignored": 1,
+    "current_paint": 1
+  },
+  "expert_sample_stage": {
+    "compressed_count": 0,
+    "label": "样本不足",
+    "ready_for_expert_filter": false,
+    "ready_for_prior": false,
+    "stage": 0,
+    "top20_threshold": null,
+    "trajectory_count": 0
+  },
+  "field_accuracy": {},
+  "finished_avg_score": null,
+  "finished_best_score": null,
+  "finished_runs": 0,
+  "finished_skipped": 0,
+  "forced_events": 0,
+  "high_score_gate_primary": {},
+  "high_score_gate_reasons": {},
+  "high_value_best_score": null,
+  "high_value_counts": {},
+  "high_value_recommendation_shorts": {},
+  "high_value_recommendation_tags": {},
+  "high_value_seen": 0,
+  "imitation_policy": {
+    "action_score_delta": {
+      "items": [],
+      "total": 0
+    },
+    "ready": {
+      "actions": false,
+      "affixes": false,
+      "brushes": false,
+      "placements": false,
+      "recommendations": false
+    },
+    "recommendation_hits": {
+      "decisions": 0,
+      "hit_pct": 0.0,
+      "hit_rate": 0.0,
+      "hits": 0,
+      "misses": 0,
+      "rank_counts": {},
+      "top1": 0,
+      "top1_pct": 0.0,
+      "top1_rate": 0.0,
+      "top3": 0,
+      "top3_pct": 0.0,
+      "top3_rate": 0.0
+    },
+    "recommendation_shorts": {
+      "items": [],
+      "total": 0
+    },
+    "recommendation_tags": {
+      "items": [],
+      "total": 0
+    },
+    "samples": {
+      "actions": 0,
+      "affixes": 0,
+      "brushes": 0,
+      "placements": 0,
+      "recommendation_decisions": 0,
+      "trajectories": 0
+    },
+    "score": {
+      "avg": null,
+      "best": null
+    },
+    "thresholds": {
+      "actions": 30,
+      "affixes": 20,
+      "brushes": 20,
+      "placements": 30
+    },
+    "top_action_codes": {
+      "items": [],
+      "total": 0
+    },
+    "top_actions": {
+      "items": [],
+      "total": 0
+    },
+    "top_affix_choices": {
+      "items": [],
+      "total": 0
+    },
+    "top_affix_codes": {
+      "items": [],
+      "total": 0
+    },
+    "top_affix_ids": {
+      "items": [],
+      "total": 0
+    },
+    "top_brush_choices": {
+      "items": [],
+      "total": 0
+    },
+    "top_brush_codes": {
+      "items": [],
+      "total": 0
+    },
+    "top_placement_cells": {
+      "items": [],
+      "total": 0
+    },
+    "top_placement_zones": {
+      "items": [],
+      "total": 0
+    }
+  },
+  "imitation_ready": {
+    "actions": false,
+    "affixes": false,
+    "brushes": false,
+    "placements": false,
+    "recommendations": false
+  },
+  "imitation_samples": {
+    "actions": 0,
+    "affixes": 0,
+    "brushes": 0,
+    "placements": 0,
+    "recommendation_decisions": 0,
+    "trajectories": 0
+  },
+  "inferred_action_codes": {},
+  "inferred_action_details": {},
+  "inferred_actions": {},
+  "new_affix_candidates": [],
+  "outcome_risk": {
+    "deduplicated_sessions": 0,
+    "minimum_comparable_runs": 20,
+    "modes": {
+      "balanced": {
+        "comparable_groups": {},
+        "largest_comparable_group": 0,
+        "metric_basis": "unavailable",
+        "metrics": {
+          "bottom_20_mean": null,
+          "failure_or_low_value_rate": null,
+          "failure_rate": null,
+          "force_used_mean": null,
+          "high_score_rate": null,
+          "iqr": null,
+          "low_value_rate": null,
+          "mean": null,
+          "median": null,
+          "p10": null,
+          "p20": null,
+          "p80": null,
+          "p90": null,
+          "refresh_used_mean": null,
+          "stddev": null
+        },
+        "minimum_samples": 20,
+        "outcome_status": "unavailable",
+        "personalization_ready": false,
+        "samples": 0,
+        "scored_samples": 0,
+        "status": "observing",
+        "style_label": null,
+        "trend_visible": false
+      },
+      "gamble": {
+        "comparable_groups": {},
+        "largest_comparable_group": 0,
+        "metric_basis": "unavailable",
+        "metrics": {
+          "bottom_20_mean": null,
+          "failure_or_low_value_rate": null,
+          "failure_rate": null,
+          "force_used_mean": null,
+          "high_score_rate": null,
+          "iqr": null,
+          "low_value_rate": null,
+          "mean": null,
+          "median": null,
+          "p10": null,
+          "p20": null,
+          "p80": null,
+          "p90": null,
+          "refresh_used_mean": null,
+          "stddev": null
+        },
+        "minimum_samples": 20,
+        "outcome_status": "unavailable",
+        "personalization_ready": false,
+        "samples": 0,
+        "scored_samples": 0,
+        "status": "observing",
+        "style_label": null,
+        "trend_visible": false
+      },
+      "stable": {
+        "comparable_groups": {},
+        "largest_comparable_group": 0,
+        "metric_basis": "unavailable",
+        "metrics": {
+          "bottom_20_mean": null,
+          "failure_or_low_value_rate": null,
+          "failure_rate": null,
+          "force_used_mean": null,
+          "high_score_rate": null,
+          "iqr": null,
+          "low_value_rate": null,
+          "mean": null,
+          "median": null,
+          "p10": null,
+          "p20": null,
+          "p80": null,
+          "p90": null,
+          "refresh_used_mean": null,
+          "stddev": null
+        },
+        "minimum_samples": 20,
+        "outcome_status": "unavailable",
+        "personalization_ready": false,
+        "samples": 0,
+        "scored_samples": 0,
+        "status": "observing",
+        "style_label": null,
+        "trend_visible": false
+      }
+    },
+    "personalization_ready": false,
+    "runs_total": 0,
+    "schema": "huahua-risk-summary-v1",
+    "style_label": null,
+    "unclassified": {
+      "comparable_groups": {},
+      "largest_comparable_group": 0,
+      "metric_basis": "unavailable",
+      "metrics": {
+        "bottom_20_mean": null,
+        "failure_or_low_value_rate": null,
+        "failure_rate": null,
+        "force_used_mean": null,
+        "high_score_rate": null,
+        "iqr": null,
+        "low_value_rate": null,
+        "mean": null,
+        "median": null,
+        "p10": null,
+        "p20": null,
+        "p80": null,
+        "p90": null,
+        "refresh_used_mean": null,
+        "stddev": null
+      },
+      "minimum_samples": 20,
+      "outcome_status": "unavailable",
+      "personalization_ready": false,
+      "samples": 0,
+      "scored_samples": 0,
+      "status": "observing",
+      "style_label": null,
+      "trend_visible": false
+    },
+    "unclassified_runs": 0
+  },
+  "placement_cells": {},
+  "placement_zones": {},
+  "policy_prior_samples": {
+    "affixes": 0,
+    "brushes": 0,
+    "placements": 0
+  },
+  "quick_capture_actions": {},
+  "quick_capture_avg_elapsed": null,
+  "quick_capture_ignored": 0,
+  "quick_capture_steps": 0,
+  "recommendation_cells": {},
+  "recommendation_shorts": {},
+  "recommendation_tags": {},
+  "refresh_events": {},
+  "risky_fields": [],
+  "rule_anomalies": {},
+  "rule_anomaly_severity": {},
+  "rule_mismatches": {},
+  "stage1_code_seen": {},
+  "stage1_code_seen_pct": {},
+  "stage1_code_seen_total": 0,
+  "stage1_seen": {},
+  "stage1_seen_pct": {},
+  "stage1_seen_total": 0,
+  "terrain_prior": {
+    "compressed_avg": {},
+    "compressed_avg_score": null,
+    "delta_high_minus_compressed": {
+      "blank": 0.0,
+      "blocked": 0.0,
+      "faded": 0.0,
+      "open_cells": 0.0,
+      "paint": 0.0,
+      "void": 0.0
+    },
+    "high_avg": {},
+    "open_cell_bias": {
+      "compressed_total": 0,
+      "high_total": 0,
+      "items": []
+    },
+    "ready": false,
+    "samples": {
+      "compressed": 0,
+      "high": 0
+    },
+    "terrain_buckets": {
+      "items": [],
+      "total": 0
+    }
+  },
+  "total_events": 4,
+  "trajectories": 0,
+  "trajectory_actions": {},
+  "trajectory_affix_codes": {},
+  "trajectory_affix_ids": {},
+  "trajectory_affixes": {},
+  "trajectory_avg_score": null,
+  "trajectory_best_score": null,
+  "trajectory_brush_codes": {},
+  "trajectory_brushes": {},
+  "trajectory_initial_open_cells": {
+    "items": [],
+    "total": 0
+  },
+  "trajectory_initial_snapshots": 0,
+  "trajectory_initial_terrain": {
+    "avg": {},
+    "samples": 0,
+    "totals": {}
+  },
+  "trajectory_step_ignored": 1,
+  "treasure_ratio": 0.1111111111111111,
+  "unknown_affix_appearance_rates": {
+    "items": [],
+    "total": 0
+  },
+  "unknown_affix_samples": {},
+  "unknown_affix_seen": {},
+  "unknown_affix_seen_pct": {},
+  "unknown_affix_seen_total": 0,
+  "unknown_stage1_seen": {},
+  "unknown_stage1_seen_pct": {},
+  "unknown_stage1_seen_total": 0,
+  "upgrade_events": 0
+}

@@ -16,6 +16,7 @@ class GamePhase(str, Enum):
 
 
 class TargetKind(str, Enum):
+    START = "start"
     BOARD = "board"
     BACKPACK = "backpack"
     BRUSH_STAGE1 = "brush_stage1"
@@ -39,6 +40,7 @@ class PhaseEvidence:
     affix_selected: bool = False
     backpack_target: bool = False
     board_target: bool = False
+    start_visible: bool = False
     finish_signals: frozenset[str] = frozenset()
 
 
@@ -379,6 +381,8 @@ def _phase_from_evidence(
         return GamePhase.UNSTABLE, "board_confidence_low"
     if len(evidence.finish_signals) >= 2:
         return GamePhase.FINISH_READY, ""
+    if evidence.start_visible:
+        return GamePhase.INITIAL_MAP, ""
     if evidence.current_rule_pending or evidence.brush_visible:
         if not evidence.brush_type_selected and not evidence.brush_stage2_visible:
             if evidence.brush_visible:
@@ -406,11 +410,14 @@ def _phase_stability_key(phase: GamePhase, evidence: PhaseEvidence) -> tuple[obj
         evidence.affix_selected,
         evidence.backpack_target,
         evidence.board_target,
+        evidence.start_visible,
         tuple(sorted(evidence.finish_signals)),
     )
 
 
 def _target_matches_phase(kind: TargetKind, phase: GamePhase) -> bool:
+    if kind == TargetKind.START:
+        return phase == GamePhase.INITIAL_MAP
     if kind == TargetKind.BOARD:
         return phase in {GamePhase.INITIAL_MAP, GamePhase.BOARD_PLACE}
     return {

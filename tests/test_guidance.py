@@ -41,6 +41,20 @@ def _proposal(frame_id: str, **overrides) -> TargetProposal:
 
 
 class GamePhaseStateMachineTests(unittest.TestCase):
+    def test_start_button_stabilizes_as_initial_map(self) -> None:
+        machine = GamePhaseStateMachine()
+
+        pending = machine.update(
+            _evidence("f1", board_target=False, start_visible=True)
+        )
+        stable = machine.update(
+            _evidence("f2", board_target=False, start_visible=True)
+        )
+
+        self.assertEqual(GamePhase.INITIAL_MAP, pending.observed_phase)
+        self.assertEqual(GamePhase.INITIAL_MAP, stable.phase)
+        self.assertTrue(stable.stable)
+
     def test_phase_and_key_fields_require_two_distinct_frames(self) -> None:
         machine = GamePhaseStateMachine()
 
@@ -117,6 +131,26 @@ class GamePhaseStateMachineTests(unittest.TestCase):
 
 
 class RecommendationTargetStabilizerTests(unittest.TestCase):
+    def test_start_target_is_accepted_on_initial_map(self) -> None:
+        stabilizer = RecommendationTargetStabilizer()
+        context = ("window-a",)
+        first = stabilizer.update(
+            _proposal("f1", key="start_drawing", kind=TargetKind.START),
+            phase=GamePhase.INITIAL_MAP,
+            context_signature=context,
+            now=1.0,
+        )
+        second = stabilizer.update(
+            _proposal("f2", key="start_drawing", kind=TargetKind.START),
+            phase=GamePhase.INITIAL_MAP,
+            context_signature=context,
+            now=1.31,
+        )
+
+        self.assertIsNone(first)
+        self.assertIsNotNone(second)
+        self.assertEqual(TargetKind.START, second.kind)
+
     def test_target_requires_two_frames_and_300ms_then_serializes_contract(self) -> None:
         stabilizer = RecommendationTargetStabilizer()
         context = (100, 100, 1920, 1080, 1.0)

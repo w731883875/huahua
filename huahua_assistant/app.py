@@ -64,6 +64,7 @@ from .learning import (
     record_observation,
 )
 from .models import BoardObservation, BrushOptionsObservation, PaintCategory, PaintDirection, PaintObject, Rect, RegionKind, SceneObservation, TileState
+from .outcome_learning import decision_records_from_steps
 from .pet_brain import PetBrainState, evaluate_pet_state
 from .vision import VisionTracker, analyze_and_save_debug
 
@@ -127,7 +128,7 @@ class HuahuaApp(tk.Tk):
         self.force_used_var = tk.IntVar(value=0)
         self.refresh_used_var = tk.IntVar(value=0)
         self.auto_follow_var = tk.BooleanVar(value=False)
-        self.auto_follow_interval_var = tk.IntVar(value=500)
+        self.auto_follow_interval_var = tk.IntVar(value=100)
         self.overlay_var = tk.BooleanVar(value=False)
         self.overlay_window: tk.Toplevel | None = None
         self.overlay_canvas: tk.Canvas | None = None
@@ -214,9 +215,9 @@ class HuahuaApp(tk.Tk):
 
         tk.Spinbox(
             toolbar,
-            from_=300,
+            from_=100,
             to=5000,
-            increment=100,
+            increment=50,
             width=5,
             textvariable=self.auto_follow_interval_var,
         ).pack(side=tk.LEFT, padx=(3, 0))
@@ -728,7 +729,7 @@ class HuahuaApp(tk.Tk):
             return
         if self.auto_follow_after_id is not None:
             self.after_cancel(self.auto_follow_after_id)
-        interval = delay_ms if delay_ms is not None else max(300, int(self.auto_follow_interval_var.get() or 1000))
+        interval = delay_ms if delay_ms is not None else 40
         self.auto_follow_after_id = self.after(interval, self._auto_follow_tick)
 
     def _start_auto_follow_pump(self) -> None:
@@ -736,11 +737,11 @@ class HuahuaApp(tk.Tk):
             self.auto_follow_pump = FramePump(
                 capture_func=default_auto_capture,
                 analyze_func=self.tracker.analyze_quick,
-                needs_full_refresh=self._needs_stage2_brush_refresh,
-                full_analyze_func=self.tracker.analyze,
+                needs_full_refresh=lambda: False,
+                full_analyze_func=self.tracker.analyze_realtime,
                 maybe_save_frame=self._maybe_save_auto_frame,
             )
-        interval_ms = max(200, int(self.auto_follow_interval_var.get() or 500))
+        interval_ms = max(100, int(self.auto_follow_interval_var.get() or 100))
         self.auto_follow_pump.start(interval=interval_ms / 1000.0)
 
     def _stop_auto_follow_pump(self, *, wait: bool = False) -> None:
@@ -822,17 +823,24 @@ class HuahuaApp(tk.Tk):
 
     def _capture_worker(self) -> None:
         try:
-            time.sleep(0.35)
+            time.sleep(0.04)
             started_at = time.perf_counter()
             capture = capture_target(
                 DEFAULT_WINDOW_TITLE,
                 fallback_to_screen=True,
                 fallback_if_target_uncaptureable=False,
-                activate=False,
+                activate=True,
+                activation_delay=0.02,
             )
             frame = capture.image
             write_image("runtime/capture.png", frame)
-            scene, debug_path = analyze_and_save_debug(frame, self.debug_path, tracker=self.tracker, save_crops=False)
+            scene, debug_path = analyze_and_save_debug(
+                frame,
+                self.debug_path,
+                tracker=self.tracker,
+                save_crops=False,
+                realtime=True,
+            )
             elapsed = time.perf_counter() - started_at
         except Exception as exc:
             self.after(0, lambda: self._show_error(exc))
@@ -843,14 +851,15 @@ class HuahuaApp(tk.Tk):
 
     def _quick_capture_worker(self) -> None:
         try:
-            time.sleep(0.18)
+            time.sleep(0.03)
             started_at = time.perf_counter()
             capture_started_at = time.perf_counter()
             capture = capture_target(
                 DEFAULT_WINDOW_TITLE,
                 fallback_to_screen=True,
                 fallback_if_target_uncaptureable=False,
-                activate=False,
+                activate=True,
+                activation_delay=0.02,
             )
             capture_elapsed = time.perf_counter() - capture_started_at
             frame = capture.image
@@ -865,7 +874,7 @@ class HuahuaApp(tk.Tk):
             full_refresh_elapsed = 0.0
             if self._needs_stage2_brush_refresh():
                 full_started_at = time.perf_counter()
-                scene = self.tracker.analyze(frame)
+                scene = self.tracker.analyze_realtime(frame)
                 full_refresh_elapsed = time.perf_counter() - full_started_at
             elapsed = time.perf_counter() - started_at
             perf = _fast_capture_perf(capture_elapsed, analysis_elapsed, write_elapsed, full_refresh_elapsed)
@@ -937,7 +946,11 @@ class HuahuaApp(tk.Tk):
         self._clear_brush_choice()
         self._apply_detected_brush_options(scene.brush_options)
         recommendation_started_at = time.perf_counter()
-        self.recommendations = recommend_placements(self.current_state, learning_stats=load_learning_stats())
+        self.recommendations = recommend_placements(
+            self.current_state,
+            include_lookahead=False,
+            learning_stats=load_learning_stats(),
+        )
         self.install_plan = recommend_install_plan(self.current_state)
         recommendation_elapsed = time.perf_counter() - recommendation_started_at
         self._update_fast_snapshot(snapshot_from_scene(scene))
@@ -1075,7 +1088,11 @@ class HuahuaApp(tk.Tk):
         self.last_rule_anomalies = []
         self._merge_quick_brush_stage2(scene.brush_options)
         recommendation_started_at = time.perf_counter()
-        self.recommendations = recommend_placements(self.current_state, learning_stats=load_learning_stats())
+        self.recommendations = recommend_placements(
+            self.current_state,
+            include_lookahead=False,
+            learning_stats=load_learning_stats(),
+        )
         self.install_plan = recommend_install_plan(self.current_state)
         recommendation_elapsed = time.perf_counter() - recommendation_started_at
         quick_quality = _quick_capture_quality(scene, elapsed, capture_perf, capture_source=capture_source)
@@ -1852,6 +1869,10 @@ class HuahuaApp(tk.Tk):
             "terminal": terminal,
             "high_score_gate": high_score_gate,
             "initial_snapshot": initial_snapshot,
+            "decision_records": decision_records_from_steps(
+                reliable_steps[-40:],
+                session=self.real_session_id,
+            ),
             "steps": len(self.real_trajectory_steps),
             "reliable_steps": len(reliable_steps),
             "raw_finish_seen": raw_finish_seen,
@@ -3252,6 +3273,7 @@ class HuahuaApp(tk.Tk):
             RegionKind.BACKPACK: "背包",
             RegionKind.BRUSH_OPTIONS: "笔触选项",
             RegionKind.CONFIRM_BUTTON: "确认按钮",
+            RegionKind.START_DRAWING: "开始绘制",
             RegionKind.FINISH_DRAWING: "完成绘制",
             RegionKind.FORCE_COMPLETE: "强制完成",
             RegionKind.REFRESH_AFFIX: "刷新词缀",
@@ -3333,6 +3355,7 @@ class HuahuaApp(tk.Tk):
                 note = "存在 block 级规则异常，本次截图不会进入高分轨迹；建议复查识别或补充规则。"
             self.region_text.insert(tk.END, f"{note}\n\n")
         self._write_learning_stats()
+        self._write_current_terrain_bucket_hint()
         self._write_backpack()
         self._write_install_plan()
         self._write_recommendations()
@@ -3424,6 +3447,7 @@ class HuahuaApp(tk.Tk):
                 f"说明={note}\n\n",
             )
         self._write_backpack()
+        self._write_current_terrain_bucket_hint()
         self._write_install_plan()
         self._write_recommendations()
         self._write_brush_recommendations()
@@ -3496,6 +3520,16 @@ class HuahuaApp(tk.Tk):
             self.region_text.insert(tk.END, f"{index}. {_paint_display_label(paint)}\n")
         self.region_text.insert(tk.END, "\n")
 
+    def _write_current_terrain_bucket_hint(self) -> None:
+        if self.current_state is None:
+            return
+        stats = load_learning_stats()
+        hint = _current_terrain_bucket_hint(self.current_state, stats)
+        if not hint:
+            return
+        self.region_text.insert(tk.END, "当前地图分桶\n")
+        self.region_text.insert(tk.END, f"{hint}\n\n")
+
     def _write_learning_stats(self) -> None:
         stats = load_learning_stats()
         if not stats:
@@ -3518,6 +3552,13 @@ class HuahuaApp(tk.Tk):
         finished_best = stats.get("finished_best_score")
         high_value_seen = stats.get("high_value_seen", 0)
         high_value_counts = stats.get("high_value_counts") or {}
+        compressed_count = stats.get("compressed_run_summaries", 0)
+        compressed_kinds = stats.get("compressed_summary_kinds") or {}
+        compressed_avg = stats.get("compressed_summary_avg_score")
+        compressed_weighted_avg = stats.get("compressed_summary_weighted_avg_score")
+        compressed_best = stats.get("compressed_summary_best_score")
+        expert_stage = stats.get("expert_sample_stage") if isinstance(stats.get("expert_sample_stage"), dict) else {}
+        terrain_prior = stats.get("terrain_prior") if isinstance(stats.get("terrain_prior"), dict) else {}
         inferred_actions = stats.get("inferred_actions") or {}
         inferred_codes = stats.get("inferred_action_codes") or {}
         refresh_events = stats.get("refresh_events") or {}
@@ -3554,6 +3595,13 @@ class HuahuaApp(tk.Tk):
         best_score_text = f"{best_score:.0f}" if isinstance(best_score, (int, float)) else "-"
         quick_avg_text = f"{quick_avg:.2f}s" if isinstance(quick_avg, (int, float)) else "-"
         finished_best_text = f"{finished_best:.0f}" if isinstance(finished_best, (int, float)) else "-"
+        compressed_kind_text = _format_count_summary(compressed_kinds, limit=3)
+        compressed_avg_text = f"{compressed_avg:.0f}" if isinstance(compressed_avg, (int, float)) else "-"
+        compressed_weighted_text = f"{compressed_weighted_avg:.0f}" if isinstance(compressed_weighted_avg, (int, float)) else "-"
+        compressed_best_text = f"{compressed_best:.0f}" if isinstance(compressed_best, (int, float)) else "-"
+        compressed_terrain_text = _format_terrain_avg(stats.get("compressed_initial_terrain"))
+        expert_stage_text = expert_stage.get("label") or "样本不足"
+        terrain_prior_text = _format_terrain_prior(terrain_prior)
         self.region_text.insert(
             tk.END,
             "学习记录\n"
@@ -3568,6 +3616,10 @@ class HuahuaApp(tk.Tk):
             f"未知/新词条={unknown_text}\n"
             f"高频纠错={correction_text}\n"
             f"高价值轨迹={trajectories} 最佳={best_score_text}\n"
+            f"专家样本={expert_stage_text}\n"
+            f"压缩摘要={compressed_count} 类型={compressed_kind_text} 均分={compressed_avg_text} 加权={compressed_weighted_text} 最佳={compressed_best_text}\n"
+            f"摘要初始地形={compressed_terrain_text}\n"
+            f"地形先验={terrain_prior_text}\n"
             f"推断动作={action_text}\n"
             f"动作短码={code_text} 强制={stats.get('forced_events', 0)} 刷新={refresh_events} 升级事件={stats.get('upgrade_events', 0)}\n"
             f"推荐语义={rec_short_text} 标签={rec_tag_text} 高价值标签={high_value_tag_text}\n"
@@ -3635,7 +3687,13 @@ class HuahuaApp(tk.Tk):
         if self.current_state is None:
             return
         resources = self._resource_state()
-        actions = recommend_special_actions(self.current_state, resources, self.brush_scenario)
+        learning_stats = load_learning_stats() if self.current_scene is not None else None
+        actions = recommend_special_actions(
+            self.current_state,
+            resources,
+            self.brush_scenario,
+            learning_stats=learning_stats,
+        )
         self.region_text.insert(tk.END, "特殊动作\n")
         self.region_text.insert(
             tk.END,
@@ -3713,6 +3771,7 @@ def _format_correction_stats(stats: dict) -> str:
         f"快速获取样本：{quick_steps} 平均耗时={quick_avg_text} 低质忽略={ignored_quick} 信任拦截={ignored_trajectory}",
         f"已结束局数：{stats.get('finished_runs', 0)} 跳过结算={stats.get('finished_skipped', 0)} 最佳内部评分={finished_best_text}",
         f"高价值识别：{stats.get('high_value_seen', 0)} 明细={stats.get('high_value_counts', {})}",
+        f"普通/失败局压缩摘要：{stats.get('compressed_run_summaries', 0)} 条 类型={_format_count_summary(stats.get('compressed_summary_kinds') or {}, limit=6)}",
         "",
         "字段准确率",
     ]
@@ -3736,6 +3795,7 @@ def _format_correction_stats(stats: dict) -> str:
                 f"准确率{accuracy:.0%} 错误率{error_rate:.0%}{risk}"
             )
     lines.extend(_format_learning_stats_detail_lines(stats))
+    lines.extend(_format_terrain_bucket_analysis_lines(stats))
     lines.extend(_format_imitation_policy_detail_lines(stats.get("imitation_policy") or {}))
     lines.extend(
         [
@@ -3744,6 +3804,7 @@ def _format_correction_stats(stats: dict) -> str:
             f"经验规则不一致：{sum((stats.get('rule_mismatches') or {}).values())}",
             f"宝箱识别占比：{stats.get('treasure_ratio', 0.0):.1%}",
             f"真实高分轨迹：{stats.get('trajectories', 0)} 条",
+            f"高分轨迹初始快照：{stats.get('trajectory_initial_snapshots', 0)} 条",
             f"快速获取动作：{stats.get('quick_capture_actions', {})}",
             "",
             "说明：这里只统计真实 Capture 后保存的纠错；模拟模式不会进入统计。",
@@ -3760,11 +3821,30 @@ def _format_learning_stats_detail_lines(stats: dict) -> list[str]:
     stage2_codes = _format_distribution_summary(appearance_rates.get("stage2_codes"), limit=8)
     unknown_stage1 = _format_distribution_summary(appearance_rates.get("unknown_stage1"), limit=5)
     unknown_stage2 = _format_distribution_summary(appearance_rates.get("unknown_stage2"), limit=5)
+    compressed_avg = stats.get("compressed_summary_avg_score")
+    compressed_weighted = stats.get("compressed_summary_weighted_avg_score")
+    compressed_best = stats.get("compressed_summary_best_score")
+    compressed_avg_text = f"{compressed_avg:.0f}" if isinstance(compressed_avg, (int, float)) else "-"
+    compressed_weighted_text = f"{compressed_weighted:.0f}" if isinstance(compressed_weighted, (int, float)) else "-"
+    compressed_best_text = f"{compressed_best:.0f}" if isinstance(compressed_best, (int, float)) else "-"
+    expert_stage = stats.get("expert_sample_stage") if isinstance(stats.get("expert_sample_stage"), dict) else {}
+    terrain_prior = stats.get("terrain_prior") if isinstance(stats.get("terrain_prior"), dict) else {}
     return [
         "",
         "高分轨迹门槛",
         f"- 主门槛：{_format_count_summary(stats.get('high_score_gate_primary') or {}, limit=8)}",
         f"- 命中原因：{_format_count_summary(stats.get('high_score_gate_reasons') or {}, limit=10)}",
+        f"- 专家阶段：{expert_stage.get('label') or '样本不足'} Top20门槛={expert_stage.get('top20_threshold') or '-'}",
+        f"- 初始快照：{stats.get('trajectory_initial_snapshots', 0)} 条 地形均值={_format_terrain_avg(stats.get('trajectory_initial_terrain'))}",
+        f"- 地形先验：{_format_terrain_prior(terrain_prior)}",
+        f"- 地形分桶：{_format_terrain_buckets(terrain_prior, limit=5)}",
+        "",
+        "普通/失败局压缩摘要",
+        f"- 样本：{stats.get('compressed_run_summaries', 0)} 条 类型={_format_count_summary(stats.get('compressed_summary_kinds') or {}, limit=8)}",
+        f"- 分数：均分={compressed_avg_text} 加权均分={compressed_weighted_text} 最佳={compressed_best_text}",
+        f"- 初始地形：{_format_terrain_avg(stats.get('compressed_initial_terrain'))}",
+        f"- 初始可用格：{_format_distribution_summary(stats.get('compressed_initial_open_cells'), limit=8)}",
+        f"- 终局统计：{stats.get('compressed_terminal_counts') or {}}",
         "",
         "词条出现概率（真实识别）",
         f"- 一阶段名称：{stage1}",
@@ -3809,6 +3889,185 @@ def _format_distribution_summary(distribution, *, limit: int) -> str:
         pct_text = f"{float(pct):.1f}%" if isinstance(pct, (int, float)) else "-"
         parts.append(f"{key}x{count}({pct_text})")
     return ", ".join(parts) if parts else "-"
+
+
+def _format_terrain_avg(summary) -> str:
+    if not isinstance(summary, dict):
+        return "-"
+    samples = int(summary.get("samples", 0) or 0)
+    avg = summary.get("avg") if isinstance(summary.get("avg"), dict) else {}
+    if samples <= 0 or not avg:
+        return "-"
+    labels = (
+        ("blank", "空白"),
+        ("paint", "颜料"),
+        ("blocked", "阻挡"),
+        ("void", "虚空"),
+        ("faded", "失色"),
+        ("open_cells", "可用"),
+    )
+    parts: list[str] = []
+    for key, label in labels:
+        value = avg.get(key)
+        if isinstance(value, (int, float)):
+            parts.append(f"{label}{float(value):.1f}")
+    return f"样本{samples} " + " ".join(parts) if parts else f"样本{samples}"
+
+
+def _format_terrain_prior(prior) -> str:
+    if not isinstance(prior, dict) or not prior:
+        return "-"
+    samples = prior.get("samples") if isinstance(prior.get("samples"), dict) else {}
+    ready = "可用" if prior.get("ready") is True else "样本不足"
+    deltas = prior.get("delta_high_minus_compressed") if isinstance(prior.get("delta_high_minus_compressed"), dict) else {}
+    open_delta = deltas.get("open_cells")
+    blocked_delta = deltas.get("blocked")
+    open_text = f"开放差{float(open_delta):+.1f}" if isinstance(open_delta, (int, float)) else "开放差-"
+    blocked_text = f"阻挡差{float(blocked_delta):+.1f}" if isinstance(blocked_delta, (int, float)) else "阻挡差-"
+    return f"{ready} 高分{samples.get('high', 0)} 压缩{samples.get('compressed', 0)} {open_text} {blocked_text}"
+
+
+def _format_terrain_buckets(prior, *, limit: int) -> str:
+    if not isinstance(prior, dict):
+        return "-"
+    buckets = prior.get("terrain_buckets") if isinstance(prior.get("terrain_buckets"), dict) else {}
+    items = buckets.get("items") if isinstance(buckets.get("items"), list) else []
+    if not items:
+        return "-"
+    parts: list[str] = []
+    for item in items[:limit]:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key", "-"))
+        total = int(item.get("total", 0) or 0)
+        high = int(item.get("high", 0) or 0)
+        pct = item.get("success_pct")
+        pct_text = f"{float(pct):.1f}%" if isinstance(pct, (int, float)) else "-"
+        parts.append(f"{key} 高{high}/{total}({pct_text})")
+    return "；".join(parts) if parts else "-"
+
+
+def _current_terrain_bucket_hint(state: PuzzleState, stats: dict) -> str:
+    key = _terrain_bucket_key_from_state(state)
+    label = _terrain_bucket_label(key)
+    prior = stats.get("terrain_prior") if isinstance(stats.get("terrain_prior"), dict) else {}
+    buckets = prior.get("terrain_buckets") if isinstance(prior.get("terrain_buckets"), dict) else {}
+    items = buckets.get("items") if isinstance(buckets.get("items"), list) else []
+    item = next((entry for entry in items if isinstance(entry, dict) and entry.get("key") == key), None)
+    if item is None:
+        return f"{label}：暂无历史样本，先按规则推荐，继续收集真实数据。"
+    high = int(item.get("high", 0) or 0)
+    total = int(item.get("total", 0) or 0)
+    pct = item.get("success_pct")
+    pct_text = f"{float(pct):.1f}%" if isinstance(pct, (int, float)) else "-"
+    min_samples = 8
+    if total < min_samples:
+        advice = "样本不足，先按规则推荐，不建议因为这个桶额外消耗刷新/强制。"
+    else:
+        success_rate = float(item.get("success_rate", 0.0) or 0.0)
+        if success_rate >= 0.58:
+            advice = "历史表现偏好，可以正常投入资源；仍优先保护宝箱和7级。"
+        elif success_rate <= 0.32:
+            advice = "历史表现偏差，谨慎使用刷新/强制，除非当前已有宝箱或明确冲7机会。"
+        else:
+            advice = "历史表现中性，按当前推荐评分执行。"
+    return f"{label}：历史高分 {high}/{total}（{pct_text}）。{advice}"
+
+
+def _terrain_bucket_key_from_state(state: PuzzleState) -> str:
+    blank = sum(1 for tile in state.tiles if tile.state == TileState.BLANK)
+    paint = sum(1 for tile in state.tiles if tile.state == TileState.PAINT)
+    blocked = sum(1 for tile in state.tiles if tile.state == TileState.BLOCKED)
+    void = sum(1 for tile in state.tiles if tile.state == TileState.VOID)
+    center_open = sum(
+        1
+        for row, col in ((2, 2), (2, 3), (3, 2), (3, 3))
+        if state.tile(row, col).state in {TileState.BLANK, TileState.PAINT}
+    )
+    return "|".join(
+        (
+            f"open:{_terrain_bucket_range(blank + paint, (16, 22))}",
+            f"block:{_terrain_bucket_range(blocked, (4, 8))}",
+            f"void:{_terrain_bucket_range(void, (8, 13))}",
+            f"center:{_terrain_bucket_range(center_open, (1, 3))}",
+        )
+    )
+
+
+def _terrain_bucket_range(value: int, cuts: tuple[int, int]) -> str:
+    low, high = cuts
+    if value <= low:
+        return "low"
+    if value <= high:
+        return "mid"
+    return "high"
+
+
+def _format_terrain_bucket_analysis_lines(stats: dict) -> list[str]:
+    prior = stats.get("terrain_prior") if isinstance(stats.get("terrain_prior"), dict) else {}
+    buckets = prior.get("terrain_buckets") if isinstance(prior.get("terrain_buckets"), dict) else {}
+    items = buckets.get("items") if isinstance(buckets.get("items"), list) else []
+    lines = ["", "地形分桶分析"]
+    if not items:
+        lines.append("- 暂无地形桶样本；继续积累真实高分局和普通/失败局摘要。")
+        return lines
+
+    enough: list[dict] = []
+    sparse: list[dict] = []
+    min_samples = 8
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        total = int(item.get("total", 0) or 0)
+        if total >= min_samples:
+            enough.append(item)
+        else:
+            sparse.append(item)
+
+    invest = [item for item in enough if float(item.get("success_rate", 0.0) or 0.0) >= 0.58]
+    caution = [item for item in enough if float(item.get("success_rate", 0.0) or 0.0) <= 0.32]
+    neutral = [item for item in enough if item not in invest and item not in caution]
+    lines.append(f"- 可分析桶：{len(enough)} 个；样本不足桶：{len(sparse)} 个。")
+    lines.append(f"- 值得投入：{_format_terrain_bucket_items(invest, limit=5, advice='可正常投入资源')}")
+    lines.append(f"- 谨慎投入：{_format_terrain_bucket_items(caution, limit=5, advice='少用刷新/强制')}")
+    lines.append(f"- 中性观察：{_format_terrain_bucket_items(neutral, limit=4, advice='继续观察')}")
+    lines.append(f"- 样本不足：{_format_terrain_bucket_items(sparse, limit=5, advice='继续收集')}")
+    return lines
+
+
+def _format_terrain_bucket_items(items: list[dict], *, limit: int, advice: str) -> str:
+    if not items:
+        return "-"
+    parts: list[str] = []
+    for item in items[:limit]:
+        key = _terrain_bucket_label(str(item.get("key", "-")))
+        high = int(item.get("high", 0) or 0)
+        total = int(item.get("total", 0) or 0)
+        pct = item.get("success_pct")
+        gap = item.get("score_gap")
+        pct_text = f"{float(pct):.1f}%" if isinstance(pct, (int, float)) else "-"
+        gap_text = f" 分差{float(gap):+.0f}" if isinstance(gap, (int, float)) else ""
+        parts.append(f"{key} 高{high}/{total}({pct_text}){gap_text} {advice}")
+    return "；".join(parts)
+
+
+def _terrain_bucket_label(key: str) -> str:
+    labels = {
+        "open": "开放",
+        "block": "阻挡",
+        "void": "虚空",
+        "center": "中心",
+        "low": "低",
+        "mid": "中",
+        "high": "高",
+    }
+    parts: list[str] = []
+    for segment in key.split("|"):
+        if ":" not in segment:
+            continue
+        name, value = segment.split(":", 1)
+        parts.append(f"{labels.get(name, name)}{labels.get(value, value)}")
+    return "/".join(parts) if parts else key
 
 
 def _format_unknown_affix_summary(stats: dict, *, limit: int) -> str:
@@ -5732,6 +5991,8 @@ def _short_source(source) -> str:
     text = str(source or "-")
     if text.startswith("window-content"):
         return "窗口内容"
+    if text.startswith("window-foreground-screen"):
+        return "前台窗口"
     if text.startswith("window-screen"):
         return "桌面区域"
     if text.startswith("screen:fallback"):

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
+import huahua_assistant.learning as learning
 from huahua_assistant.codes import canonical_affix_id
 from huahua_assistant.learning import (
     _build_stats,
@@ -19,6 +23,29 @@ def _trajectory(*quality_flags: bool, gate_passed: bool = True) -> dict:
 
 
 class LearningTrustBaselineTests(unittest.TestCase):
+    def test_learning_stats_cache_reuses_and_invalidates_by_log_signature(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = [root / "observations.jsonl", root / "corrections.jsonl", root / "trajectories.jsonl"]
+            for path in paths:
+                path.write_text("", encoding="utf-8")
+            with (
+                patch.object(learning, "OBSERVATION_LOG", paths[0]),
+                patch.object(learning, "CORRECTION_LOG", paths[1]),
+                patch.object(learning, "TRAJECTORY_LOG", paths[2]),
+                patch.object(learning, "_LEARNING_STATS_CACHE_SIGNATURE", None),
+                patch.object(learning, "_LEARNING_STATS_CACHE", None),
+                patch.object(learning, "_build_complete_stats", side_effect=[{"generation": 1}, {"generation": 2}]) as build,
+            ):
+                first = learning.load_learning_stats()
+                second = learning.load_learning_stats()
+                paths[0].write_text("{}\n", encoding="utf-8")
+                third = learning.load_learning_stats()
+
+            self.assertIs(first, second)
+            self.assertEqual({"generation": 2}, third)
+            self.assertEqual(2, build.call_count)
+
     def test_trusted_trajectory_requires_steps_and_all_quality_gates(self) -> None:
         self.assertTrue(_trajectory_payload_is_trusted(_trajectory(True, True)))
         self.assertFalse(_trajectory_payload_is_trusted(_trajectory()))

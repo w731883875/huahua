@@ -19,6 +19,7 @@ class RegionKind(str, Enum):
     BACKPACK = "backpack"
     BRUSH_OPTIONS = "brush_options"
     CONFIRM_BUTTON = "confirm_button"
+    START_DRAWING = "start_drawing"
     FINISH_DRAWING = "finish_drawing"
     FORCE_COMPLETE = "force_complete"
     REFRESH_AFFIX = "refresh_affix"
@@ -79,6 +80,10 @@ class TileObservation:
     paint_level_confidence: float = 0.0
     paint_subtype: str | None = None
     paint_is_treasure: bool = False
+    is_scope_highlight: bool = False
+    scope_highlight_confidence: float = 0.0
+    is_current_anchor: bool = False
+    current_anchor_confidence: float = 0.0
 
 
 @dataclass(frozen=True)

@@ -298,8 +298,15 @@ def state_from_observation(
 ) -> PuzzleState:
     rule = rule_from_observation(current_paint)
     anchor: tuple[int, int] | None = None
+    marked_cells = [tile for tile in board.tiles if getattr(tile, "is_current_anchor", False)]
     paint_cells = [tile for tile in board.tiles if tile.state == TileState.PAINT]
-    if rule is not None and len(paint_cells) == 1:
+    if rule is not None and marked_cells:
+        marked = max(
+            marked_cells,
+            key=lambda tile: float(getattr(tile, "current_anchor_confidence", 0.0) or 0.0),
+        )
+        anchor = (marked.row, marked.col)
+    elif rule is not None and len(paint_cells) == 1:
         anchor = (paint_cells[0].row, paint_cells[0].col)
 
     tiles = []
@@ -553,7 +560,11 @@ def recommend_placements(
             )
             score += lookahead_score
             prior_score = _placement_policy_prior_score(learning_stats, row, col) if learning_stats else 0.0
+            terrain_prior_score = _terrain_policy_prior_score(learning_stats, outcome.terrain_delta) if learning_stats else 0.0
+            bucket_prior_score = _terrain_bucket_policy_score(learning_stats, state) if learning_stats else 0.0
             score += prior_score
+            score += terrain_prior_score
+            score += bucket_prior_score
             if score <= 0:
                 continue
             recommendations.append(
@@ -564,7 +575,7 @@ def recommend_placements(
                     score=score,
                     completes_match=outcome.completes_match,
                     affected=scoped_cells,
-                    reason=_reason(rule, outcome, paint, lookahead_score, prior_score),
+                    reason=_reason(rule, outcome, paint, lookahead_score, prior_score + terrain_prior_score + bucket_prior_score),
                     explanation=_placement_explanation(
                         state,
                         rule,
@@ -574,7 +585,7 @@ def recommend_placements(
                         outcome,
                         paint,
                         lookahead_score,
-                        prior_score,
+                        prior_score + terrain_prior_score + bucket_prior_score,
                     ),
                 )
             )
@@ -897,16 +908,18 @@ def recommend_special_actions(
     state: PuzzleState,
     resources: ResourceState,
     brush_scenario: BrushChoiceScenario | None = None,
+    *,
+    learning_stats: dict | None = None,
 ) -> list[SpecialActionRecommendation]:
     recommendations: list[SpecialActionRecommendation] = []
-    force = _recommend_force_complete(state, resources)
+    force = _recommend_force_complete(state, resources, learning_stats=learning_stats)
     if force is not None:
         recommendations.append(force)
     if resources.refresh_available and resources.refresh_remaining > 0:
-        stage1 = _recommend_refresh_stage1(state, brush_scenario)
+        stage1 = _recommend_refresh_stage1(state, brush_scenario, learning_stats=learning_stats)
         if stage1 is not None:
             recommendations.append(stage1)
-        stage2 = _recommend_refresh_stage2(state, brush_scenario)
+        stage2 = _recommend_refresh_stage2(state, brush_scenario, learning_stats=learning_stats)
         if stage2 is not None:
             recommendations.append(stage2)
     recommendations.sort(key=lambda item: item.score, reverse=True)
@@ -1026,6 +1039,8 @@ def apply_affix_to_state(state: PuzzleState, affix: AffixRule, seed: int | None 
 def _recommend_force_complete(
     state: PuzzleState,
     resources: ResourceState,
+    *,
+    learning_stats: dict | None = None,
 ) -> SpecialActionRecommendation | None:
     rule = state.current_rule
     if rule is None or resources.force_remaining <= 0 or current_rule_is_pending(state):
@@ -1057,6 +1072,16 @@ def _recommend_force_complete(
             reason_parts.append("当前是高等级宝箱且自然完成困难，强制救场价值高")
         else:
             reason_parts.append("当前是宝箱，强制收益更高")
+    bucket_adjust, bucket_reason = _resource_bucket_adjustment(
+        learning_stats,
+        state,
+        good_bonus=float(config_value("force.good_bucket_bonus", 90.0)),
+        bad_penalty=float(config_value("force.bad_bucket_penalty", 160.0)),
+        allow_aggressive=_state_has_resource_opportunity(state),
+    )
+    score += bucket_adjust
+    if bucket_reason:
+        reason_parts.append(bucket_reason)
     recommended = score >= float(config_value("force.recommend_threshold", 350.0))
     if not recommended:
         reason_parts.append("暂不建议，除非局面即将卡死")
@@ -1071,6 +1096,8 @@ def _recommend_force_complete(
 def _recommend_refresh_stage1(
     state: PuzzleState,
     brush_scenario: BrushChoiceScenario | None,
+    *,
+    learning_stats: dict | None = None,
 ) -> SpecialActionRecommendation | None:
     if brush_scenario is None:
         return None
@@ -1096,6 +1123,16 @@ def _recommend_refresh_stage1(
         reason += "；理想大类未出现，可考虑阶段1刷新"
     else:
         reason += "；理想大类已出现，通常不刷新"
+    bucket_adjust, bucket_reason = _resource_bucket_adjustment(
+        learning_stats,
+        state,
+        good_bonus=float(config_value("refresh.good_bucket_bonus", 80.0)),
+        bad_penalty=float(config_value("refresh.bad_bucket_penalty", 130.0)),
+        allow_aggressive=_state_has_resource_opportunity(state),
+    )
+    score += bucket_adjust
+    if bucket_reason:
+        reason += f"；{bucket_reason}"
     return SpecialActionRecommendation(
         action=SpecialAction.REFRESH_STAGE1,
         score=score,
@@ -1107,6 +1144,8 @@ def _recommend_refresh_stage1(
 def _recommend_refresh_stage2(
     state: PuzzleState,
     brush_scenario: BrushChoiceScenario | None,
+    *,
+    learning_stats: dict | None = None,
 ) -> SpecialActionRecommendation | None:
     if brush_scenario is None:
         return None
@@ -1141,6 +1180,16 @@ def _recommend_refresh_stage2(
         reason += "；当前二阶段词条偏弱，可考虑刷新"
     else:
         reason += "；当前词条可接受，刷新价值不足"
+    bucket_adjust, bucket_reason = _resource_bucket_adjustment(
+        learning_stats,
+        state,
+        good_bonus=float(config_value("refresh.good_bucket_bonus", 80.0)),
+        bad_penalty=float(config_value("refresh.bad_bucket_penalty", 130.0)),
+        allow_aggressive=_state_has_resource_opportunity(state),
+    )
+    score += bucket_adjust
+    if bucket_reason:
+        reason += f"；{bucket_reason}"
     return SpecialActionRecommendation(
         action=SpecialAction.REFRESH_STAGE2,
         score=score,
@@ -1160,6 +1209,59 @@ def _is_treasure_premium_affix(affix: AffixRule) -> bool:
         return True
     if affix.effect == AffixEffect.RANDOMIZE_SCOPE_ANY:
         return True
+    return False
+
+
+def _resource_bucket_adjustment(
+    stats: dict | None,
+    state: PuzzleState,
+    *,
+    good_bonus: float,
+    bad_penalty: float,
+    allow_aggressive: bool,
+) -> tuple[float, str]:
+    item = _terrain_bucket_item_for_state(stats, state)
+    if item is None:
+        return 0.0, ""
+    total = int(item.get("total", 0) or 0)
+    if total < int(config_value("learning.terrain_bucket_min_samples", 8)):
+        return 0.0, "当前地形桶样本不足，资源建议不受历史分桶影响"
+    success_rate = float(item.get("success_rate", 0.0) or 0.0)
+    pct = float(item.get("success_pct", success_rate * 100.0) or 0.0)
+    if success_rate >= 0.58 and allow_aggressive:
+        return good_bonus, f"当前地形桶历史高分率{pct:.1f}%，且有宝箱/冲7机会，资源可略积极"
+    if success_rate <= 0.32:
+        return -bad_penalty, f"当前地形桶历史高分率{pct:.1f}%，资源建议更保守"
+    return 0.0, f"当前地形桶历史高分率{pct:.1f}%，资源按常规评估"
+
+
+def _terrain_bucket_item_for_state(stats: dict | None, state: PuzzleState) -> dict | None:
+    if not stats:
+        return None
+    prior = stats.get("terrain_prior") if isinstance(stats.get("terrain_prior"), dict) else {}
+    if prior.get("ready") is not True:
+        return None
+    buckets = prior.get("terrain_buckets") if isinstance(prior.get("terrain_buckets"), dict) else {}
+    items = buckets.get("items") if isinstance(buckets.get("items"), list) else []
+    key = _terrain_bucket_key_for_state(state)
+    for item in items:
+        if isinstance(item, dict) and item.get("key") == key:
+            return item
+    return None
+
+
+def _state_has_resource_opportunity(state: PuzzleState) -> bool:
+    rule = state.current_rule
+    if rule is not None and (rule.paint.is_treasure or rule.paint.level >= 6):
+        return True
+    for tile in state.tiles:
+        paint = tile.paint
+        if paint is None:
+            continue
+        if paint.is_treasure and paint.level >= 5:
+            return True
+        if paint.level >= 6:
+            return True
     return False
 
 
@@ -2371,6 +2473,87 @@ def _placement_policy_prior_score(stats: dict | None, row: int, col: int) -> flo
     zone_ratio = zones.get(zone, 0) / max(1, zone_total)
     score = cell_ratio * 420.0 + zone_ratio * 160.0
     return min(float(config_value("learning.placement_max_bonus", 180.0)), score)
+
+
+def _terrain_policy_prior_score(stats: dict | None, terrain_delta: float) -> float:
+    if not stats:
+        return 0.0
+    prior = stats.get("terrain_prior") if isinstance(stats.get("terrain_prior"), dict) else {}
+    if prior.get("ready") is not True:
+        return 0.0
+    samples = prior.get("samples") if isinstance(prior.get("samples"), dict) else {}
+    total_samples = int(samples.get("high", 0) or 0) + int(samples.get("compressed", 0) or 0)
+    if total_samples < int(config_value("learning.terrain_min_samples", 20)):
+        return 0.0
+    deltas = prior.get("delta_high_minus_compressed") if isinstance(prior.get("delta_high_minus_compressed"), dict) else {}
+    high_prefers_open = float(deltas.get("open_cells", 0.0) or 0.0)
+    high_avoids_blocked = -float(deltas.get("blocked", 0.0) or 0.0)
+    confidence = min(1.0, total_samples / max(1.0, float(config_value("learning.terrain_min_samples", 20)) * 3.0))
+    if terrain_delta > 0:
+        raw = min(abs(terrain_delta) * 0.22, float(config_value("learning.terrain_prior_max_bonus", 95.0)))
+        preference = 1.0 + max(0.0, high_prefers_open) * 0.035 + max(0.0, high_avoids_blocked) * 0.025
+        return min(float(config_value("learning.terrain_prior_max_bonus", 95.0)), raw * preference * confidence)
+    if terrain_delta < 0:
+        raw = min(abs(terrain_delta) * 0.20, float(config_value("learning.terrain_prior_max_penalty", 85.0)))
+        preference = 1.0 + max(0.0, high_prefers_open) * 0.030
+        return -min(float(config_value("learning.terrain_prior_max_penalty", 85.0)), raw * preference * confidence)
+    return 0.0
+
+
+def _terrain_bucket_policy_score(stats: dict | None, state: PuzzleState) -> float:
+    if not stats:
+        return 0.0
+    prior = stats.get("terrain_prior") if isinstance(stats.get("terrain_prior"), dict) else {}
+    if prior.get("ready") is not True:
+        return 0.0
+    buckets = prior.get("terrain_buckets") if isinstance(prior.get("terrain_buckets"), dict) else {}
+    items = buckets.get("items") if isinstance(buckets.get("items"), list) else []
+    if not items:
+        return 0.0
+    key = _terrain_bucket_key_for_state(state)
+    for item in items:
+        if not isinstance(item, dict) or item.get("key") != key:
+            continue
+        total = int(item.get("total", 0) or 0)
+        if total < int(config_value("learning.terrain_bucket_min_samples", 8)):
+            return 0.0
+        success_rate = float(item.get("success_rate", 0.0) or 0.0)
+        centered = success_rate - 0.5
+        confidence = min(1.0, total / max(1.0, float(config_value("learning.terrain_bucket_min_samples", 8)) * 3.0))
+        raw = centered * 120.0 * confidence
+        if raw >= 0:
+            return min(float(config_value("learning.terrain_prior_max_bonus", 95.0)), raw)
+        return max(-float(config_value("learning.terrain_prior_max_penalty", 85.0)), raw)
+    return 0.0
+
+
+def _terrain_bucket_key_for_state(state: PuzzleState) -> str:
+    blank = _count_tiles(state, TileState.BLANK)
+    paint = _count_tiles(state, TileState.PAINT)
+    blocked = _count_tiles(state, TileState.BLOCKED)
+    void = _count_tiles(state, TileState.VOID)
+    center_open = sum(
+        1
+        for row, col in ((2, 2), (2, 3), (3, 2), (3, 3))
+        if state.tile(row, col).state in {TileState.BLANK, TileState.PAINT}
+    )
+    return "|".join(
+        (
+            f"open:{_bucket_range_for_policy(blank + paint, (16, 22))}",
+            f"block:{_bucket_range_for_policy(blocked, (4, 8))}",
+            f"void:{_bucket_range_for_policy(void, (8, 13))}",
+            f"center:{_bucket_range_for_policy(center_open, (1, 3))}",
+        )
+    )
+
+
+def _bucket_range_for_policy(value: int, cuts: tuple[int, int]) -> str:
+    low, high = cuts
+    if value <= low:
+        return "low"
+    if value <= high:
+        return "mid"
+    return "high"
 
 
 def _brush_policy_prior_score(stats: dict | None, brush_type: BrushType) -> float:

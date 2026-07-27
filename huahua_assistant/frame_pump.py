@@ -138,5 +138,6 @@ def default_auto_capture() -> CaptureResult:
     return capture_target(
         fallback_to_screen=True,
         fallback_if_target_uncaptureable=False,
-        activate=False,
+        activate=True,
+        activation_delay=0.02,
     )

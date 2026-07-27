@@ -38,6 +38,29 @@ CURRENT_DIRECTION_TEMPLATE_FILES = {
     "纵向": "direction_vertical.png",
     "对角斜向": "direction_diagonal.png",
 }
+CURRENT_TARGET_TEMPLATE_FILES = {
+    "玩法": ("target_gameplay.png", "target_gameplay_red.png"),
+    "怪物": ("target_monster.png",),
+    "所有": ("target_all.png",),
+}
+CURRENT_PAINT_CANONICAL_TEXT_SIZE = (725, 97)
+CURRENT_PAINT_KEYWORD_ROI = (180, 25, 520, 70)
+BRUSH_STAGE2_TEMPLATE_DIR = Path(__file__).resolve().parent / "assets" / "brush_stage2"
+BRUSH_STAGE2_TEMPLATE_FILES = {
+    "随机改变自身的内容，等级不变": "transform_random_content.png",
+    "当前颜料等级随机改变": "transform_random_level.png",
+    "作用方向改为横向": "transform_direction_horizontal.png",
+    "重新获得一个随机初始颜料": "transform_reroll_current.png",
+    "自身提升2级": "stack_upgrade_self_2.png",
+    "范围内随机1个颜料提升1级": "stack_upgrade_scope_random_1.png",
+    "将距离最近的1个阻挡地块转变为空白地块": "spread_clear_nearest_blocked.png",
+    "当前颜料可放置在阻挡地块": "spread_place_blocked.png",
+}
+BRUSH_STAGE2_CANONICAL_PANEL_SIZE = (755, 251)
+BRUSH_STAGE2_TEXT_RECTS = (
+    (85, 42, 555, 76),
+    (85, 137, 555, 82),
+)
 
 
 class VisionTracker:
@@ -54,6 +77,17 @@ class VisionTracker:
 
     def analyze_quick(self, image: np.ndarray) -> SceneObservation | None:
         scene = analyze_scene_quick(image, previous_scene=self.last_scene, previous_board_rect=self.board_rect)
+        if scene is not None:
+            self.board_rect = scene.board.rect
+            self.last_scene = scene
+        return scene
+
+    def analyze_realtime(self, image: np.ndarray) -> SceneObservation | None:
+        scene = analyze_scene_realtime(
+            image,
+            previous_scene=self.last_scene,
+            previous_board_rect=self.board_rect,
+        )
         if scene is not None:
             self.board_rect = scene.board.rect
             self.last_scene = scene
@@ -119,13 +153,122 @@ def analyze_scene_quick(
 ) -> SceneObservation | None:
     if not _is_supported_scene_image(image):
         return None
+    if previous_scene is not None and previous_scene.region(RegionKind.START_DRAWING) is not None:
+        return analyze_scene_realtime(
+            image,
+            previous_scene=previous_scene,
+            previous_board_rect=previous_board_rect,
+        )
+    if previous_scene is not None and _find_start_drawing_button_fast(image) is not None:
+        return analyze_scene_realtime(
+            image,
+            previous_scene=previous_scene,
+            previous_board_rect=previous_board_rect,
+        )
     rect = previous_scene.board.rect if previous_scene is not None else previous_board_rect
     if rect is None:
-        return analyze_scene(image)
+        return analyze_scene_realtime(image)
     scene = _analyze_scene_from_board_rect(image, rect, fast=True, quick=True, previous_scene=previous_scene)
     if scene is not None and scene.board.score >= MIN_BOARD_DETECTION_SCORE:
         return scene
     return None
+
+
+def analyze_scene_realtime(
+    image: np.ndarray,
+    previous_scene: SceneObservation | None = None,
+    previous_board_rect: Rect | None = None,
+) -> SceneObservation | None:
+    """Low-latency scene analysis for the interactive capture path."""
+
+    if not _is_supported_scene_image(image):
+        return None
+    height, width = image.shape[:2]
+    side = int(round(min(width, height) * 0.594))
+    active_rect = Rect(int(round(width * 0.187)), int(round(height * 0.256)), side, side)
+    start_rect = Rect(int(round(width * 0.354)), int(round(height * 0.256)), side, side)
+    tracked_rect = previous_scene.board.rect if previous_scene is not None else previous_board_rect
+    # The active layout is by far the common case. Score it once and return
+    # immediately when strong; this keeps waiting -> active transitions below
+    # the 0.5-second update budget.
+    active_score = _score_board_rect(image, active_rect)
+    if active_score >= MIN_BOARD_DETECTION_SCORE:
+        rect = active_rect
+    else:
+        start_score = _score_board_rect(image, start_rect)
+        start_button = _find_start_drawing_button_fast(image)
+        # The centered waiting layout receives a lower position prior than the
+        # active left layout. The independently detected action button keeps
+        # this relaxed threshold specific to the waiting scene.
+        if start_button is not None and start_score >= 0.56:
+            return _analyze_start_drawing_scene(
+                image,
+                start_rect,
+                start_button,
+                previous_scene=previous_scene,
+                board_score=start_score,
+            )
+
+        if tracked_rect is None or _rect_is_near(tracked_rect, active_rect) or _rect_is_near(tracked_rect, start_rect):
+            return None
+        tracked_score = _score_board_rect(image, tracked_rect)
+        if tracked_score < MIN_BOARD_DETECTION_SCORE:
+            return None
+        rect = tracked_rect
+    scene = _analyze_scene_from_board_rect(
+        image,
+        rect,
+        fast=True,
+        quick=True,
+        previous_scene=previous_scene,
+        board_score=active_score if _rect_is_near(rect, active_rect) else tracked_score,
+    )
+    if scene is not None and scene.board.score >= MIN_BOARD_DETECTION_SCORE:
+        return scene
+    # Realtime capture must reject non-drawing game screens immediately. A
+    # full-frame fallback can find incidental 6x6-like UI and take many seconds.
+    return None
+
+
+def _rect_is_near(first: Rect, second: Rect) -> bool:
+    tolerance = max(8, int(round(second.w * 0.08)))
+    return (
+        abs(first.x - second.x) <= tolerance
+        and abs(first.y - second.y) <= tolerance
+        and abs(first.w - second.w) <= tolerance
+    )
+
+
+def _analyze_start_drawing_scene(
+    image: np.ndarray,
+    rect: Rect,
+    start_button: tuple[float, Rect],
+    *,
+    previous_scene: SceneObservation | None = None,
+    board_score: float | None = None,
+) -> SceneObservation:
+    bounded = _bounded_rect(rect.x, rect.y, rect.w, rect.h, image.shape[1], image.shape[0])
+    previous_board = previous_scene.board if previous_scene is not None and _rect_is_near(previous_scene.board.rect, bounded) else None
+    tiles = tuple(
+        _classify_tiles_quick(image, bounded, previous_board)
+        if previous_board is not None
+        else _classify_tiles(image, bounded)
+    )
+    raw_board_score = _score_board_rect(image, bounded) if board_score is None else board_score
+    position_score = _board_position_score(image.shape, bounded)
+    normalized_board_score = float(np.clip(raw_board_score / max(0.55, position_score), 0.0, 0.96))
+    board = BoardObservation(
+        rect=bounded,
+        score=normalized_board_score,
+        tiles=tiles,
+    )
+    region = RegionObservation(
+        kind=RegionKind.START_DRAWING,
+        rect=start_button[1],
+        confidence=start_button[0],
+        label="start drawing button fast",
+    )
+    return SceneObservation(board=board, regions=(region,))
 
 
 def _is_supported_scene_image(image: np.ndarray) -> bool:
@@ -145,30 +288,43 @@ def _analyze_scene_from_board_rect(
     *,
     quick: bool = False,
     previous_scene: SceneObservation | None = None,
+    board_score: float | None = None,
 ) -> SceneObservation | None:
     if not fast:
         rect = _refine_board_rect(image, rect)
     rect = _bounded_rect(rect.x, rect.y, rect.w, rect.h, image.shape[1], image.shape[0])
-    score = _score_board_rect(image, rect)
+    score = _score_board_rect(image, rect) if board_score is None else board_score
     if score < 0.20:
         return None
-    tiles = tuple(_classify_tiles(image, rect))
+    tiles = tuple(
+        _classify_tiles_quick(image, rect, previous_scene.board)
+        if quick and previous_scene is not None
+        else _classify_tiles(image, rect)
+    )
     board = BoardObservation(rect=rect, score=score, tiles=tiles)
     regions = tuple(_estimate_regions_fast(image, board) if quick else _estimate_regions(image, board))
     if quick:
         current_paint = _analyze_current_paint_fast(image, regions, previous_scene.current_paint if previous_scene is not None else None)
         current_paint = _correct_current_paint_from_board_anchor(image, current_paint, tiles)
+        current_paint = _correct_current_paint_from_scope(current_paint, tiles)
         board = _sync_single_anchor_tile_from_current_paint(board, current_paint)
         backpack = _analyze_backpack_fast(image, regions, previous_scene.backpack if previous_scene is not None else None)
+        brush_region = next((item for item in regions if item.kind == RegionKind.BRUSH_OPTIONS), None)
+        brush_options = (
+            _analyze_brush_options_realtime(image, regions)
+            if brush_region is not None
+            else None
+        )
         return SceneObservation(
             board=board,
             regions=regions,
             current_paint=current_paint,
-            brush_options=previous_scene.brush_options if previous_scene is not None else None,
+            brush_options=brush_options,
             backpack=backpack,
         )
     current_paint = _analyze_current_paint(image, regions)
     current_paint = _correct_current_paint_from_board_anchor(image, current_paint, tiles)
+    current_paint = _correct_current_paint_from_scope(current_paint, tiles)
     board = _sync_single_anchor_tile_from_current_paint(board, current_paint)
     brush_options = _analyze_brush_options(image, regions)
     backpack = _analyze_backpack(image, regions)
@@ -190,7 +346,8 @@ def _correct_current_paint_from_board_anchor(
         return None
     if current_paint.category != PaintCategory.UNKNOWN and current_paint.category_confidence >= 0.58:
         return current_paint
-    paint_tiles = [tile for tile in tiles if tile.state == TileState.PAINT]
+    marked_tiles = [tile for tile in tiles if tile.is_current_anchor]
+    paint_tiles = marked_tiles or [tile for tile in tiles if tile.state == TileState.PAINT]
     if len(paint_tiles) != 1:
         return current_paint
     category, confidence = _classify_current_paint_category(image, paint_tiles[0].rect)
@@ -216,6 +373,38 @@ def _correct_current_paint_from_board_anchor(
     )
 
 
+def _correct_current_paint_from_scope(
+    current_paint: CurrentPaintObservation | None,
+    tiles: tuple[TileObservation, ...],
+) -> CurrentPaintObservation | None:
+    if current_paint is None:
+        return None
+    highlighted = [tile for tile in tiles if tile.is_scope_highlight]
+    if len(highlighted) < 2:
+        return current_paint
+
+    rows = {tile.row for tile in highlighted}
+    cols = {tile.col for tile in highlighted}
+    direction = PaintDirection.UNKNOWN
+    if len(cols) == 1 and len(rows) >= 2:
+        direction = PaintDirection.VERTICAL
+    elif len(rows) == 1 and len(cols) >= 2:
+        direction = PaintDirection.HORIZONTAL
+    if direction == PaintDirection.UNKNOWN or direction == current_paint.direction:
+        return current_paint
+
+    scores = dict(current_paint.keyword_scores)
+    scores[f"board_scope:direction:{direction.value}"] = max(
+        tile.scope_highlight_confidence for tile in highlighted
+    )
+    return replace(
+        current_paint,
+        direction=direction,
+        keyword_scores=scores,
+        raw_text_hint=f"{current_paint.raw_text_hint} scope-corrected",
+    )
+
+
 def _sync_single_anchor_tile_from_current_paint(
     board: BoardObservation,
     current_paint: CurrentPaintObservation | None,
@@ -227,7 +416,8 @@ def _sync_single_anchor_tile_from_current_paint(
     if current_paint.category_confidence < 0.55 or current_paint.level_confidence < 0.55:
         return board
 
-    paint_indices = [index for index, tile in enumerate(board.tiles) if tile.state == TileState.PAINT]
+    marked_indices = [index for index, tile in enumerate(board.tiles) if tile.is_current_anchor]
+    paint_indices = marked_indices or [index for index, tile in enumerate(board.tiles) if tile.state == TileState.PAINT]
     if len(paint_indices) != 1:
         return board
 
@@ -308,6 +498,7 @@ def make_debug_image(image: np.ndarray, scene: SceneObservation | BoardObservati
         RegionKind.BACKPACK: (255, 120, 0),
         RegionKind.BRUSH_OPTIONS: (255, 80, 255),
         RegionKind.CONFIRM_BUTTON: (80, 255, 120),
+        RegionKind.START_DRAWING: (255, 210, 80),
         RegionKind.FINISH_DRAWING: (80, 255, 255),
         RegionKind.FORCE_COMPLETE: (0, 140, 255),
         RegionKind.REFRESH_AFFIX: (0, 255, 255),
@@ -382,8 +573,12 @@ def analyze_and_save_debug(
     debug_path: str | Path | None = None,
     tracker: VisionTracker | None = None,
     save_crops: bool = True,
+    realtime: bool = False,
 ) -> tuple[SceneObservation | None, Path | None]:
-    scene = tracker.analyze(image) if tracker is not None else analyze_scene(image)
+    if tracker is not None:
+        scene = tracker.analyze_realtime(image) if realtime else tracker.analyze(image)
+    else:
+        scene = analyze_scene_realtime(image) if realtime else analyze_scene(image)
     if save_crops:
         _save_current_paint_crops(image, scene)
         _save_brush_options_crops(image, scene)
@@ -421,6 +616,7 @@ def _analyze_current_paint(
     level, level_confidence = _detect_level_by_color(image, icon)
     text_crop = image[text.y : text.bottom, text.x : text.right]
     keyword_scores = _current_paint_keyword_scores(text_crop)
+    _store_current_panel_signature(keyword_scores, _current_panel_signature(text_crop))
     match_current, match_required = _infer_match_count(keyword_scores)
     if match_required is None:
         match_current, match_required = _detect_match_count_hint(text_crop)
@@ -487,29 +683,41 @@ def _analyze_current_paint_fast(
     )
     category, category_confidence = _classify_current_paint_category(image, icon)
     level, level_confidence = _detect_level_by_color(image, icon)
+    text_crop = image[text.y : text.bottom, text.x : text.right]
     if level is None or level_confidence < 0.38:
-        text_crop = image[text.y : text.bottom, text.x : text.right]
         hint_level, hint_confidence = _detect_level_hint(text_crop)
         if hint_level is not None and hint_confidence > level_confidence:
             level, level_confidence = hint_level, hint_confidence
 
-    if previous is not None:
+    keyword_scores = _current_paint_raster_direction_scores(text_crop)
+    keyword_scores.update(_current_paint_raster_target_scores(text_crop))
+    signature = _current_panel_signature(text_crop)
+    previous_signature = _current_panel_signature_from_scores(previous.keyword_scores) if previous is not None else None
+    panel_changed = (
+        previous_signature is not None
+        and float(np.mean(np.abs(np.asarray(signature) - np.asarray(previous_signature)))) > 0.045
+    )
+    _store_current_panel_signature(keyword_scores, signature)
+    detected_target = _infer_target_object(keyword_scores)
+    detected_direction = _infer_direction(keyword_scores)
+
+    if previous is not None and not panel_changed:
         if category == PaintCategory.UNKNOWN or category_confidence < 0.46:
             category = previous.category
             category_confidence = max(0.42, previous.category_confidence * 0.72)
         if level is None or level_confidence < 0.40:
             level = previous.level
             level_confidence = max(0.36, previous.level_confidence * 0.72)
-        target_object = previous.target_object
-        direction = previous.direction
+        target_object = detected_target if detected_target != PaintObject.UNKNOWN else previous.target_object
+        direction = detected_direction if detected_direction != PaintDirection.UNKNOWN else previous.direction
         match_current = previous.match_current
         match_required = previous.match_required
         upgrade_amount = previous.upgrade_amount
         subtype = previous.subtype
         is_treasure = previous.is_treasure
     else:
-        target_object = PaintObject.UNKNOWN
-        direction = PaintDirection.UNKNOWN
+        target_object = detected_target
+        direction = detected_direction
         match_current = 0
         match_required = None
         upgrade_amount = None
@@ -531,7 +739,7 @@ def _analyze_current_paint_fast(
         direction,
         upgrade_amount,
     )
-    if previous is not None:
+    if previous is not None and not panel_changed:
         raw_text_hint = f"{raw_text_hint} fast"
 
     return CurrentPaintObservation(
@@ -549,9 +757,31 @@ def _analyze_current_paint_fast(
         target_object=target_object,
         direction=direction,
         upgrade_amount=upgrade_amount,
-        keyword_scores={},
+        keyword_scores=keyword_scores,
         raw_text_hint=raw_text_hint,
     )
+
+
+def _current_panel_signature(crop: np.ndarray) -> tuple[float, ...]:
+    if crop.size == 0:
+        return (0.0,) * 48
+    small = cv2.resize(crop, (8, 2), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+    return tuple(float(value) for value in small.reshape(-1))
+
+
+def _store_current_panel_signature(scores: dict[str, float], signature: tuple[float, ...]) -> None:
+    for index, value in enumerate(signature):
+        scores[f"current_visual_{index}"] = value
+
+
+def _current_panel_signature_from_scores(scores: dict[str, float]) -> tuple[float, ...] | None:
+    values: list[float] = []
+    for index in range(48):
+        key = f"current_visual_{index}"
+        if key not in scores:
+            return None
+        values.append(float(scores[key]))
+    return tuple(values)
 
 
 def _empirical_current_defaults(level: int | None) -> tuple[int, int]:
@@ -846,31 +1076,46 @@ def _current_paint_keyword_scores(text_crop: np.ndarray) -> dict[str, float]:
 
 
 def _current_paint_raster_direction_scores(text_crop: np.ndarray) -> dict[str, float]:
+    return {
+        f"raster:direction:{keyword}": score
+        for keyword, score in _match_current_paint_raster_templates(
+            text_crop,
+            {keyword: (filename,) for keyword, filename in CURRENT_DIRECTION_TEMPLATE_FILES.items()},
+        ).items()
+    }
+
+
+def _current_paint_raster_target_scores(text_crop: np.ndarray) -> dict[str, float]:
+    return {
+        f"raster:target:{keyword}": score
+        for keyword, score in _match_current_paint_raster_templates(
+            text_crop,
+            CURRENT_TARGET_TEMPLATE_FILES,
+        ).items()
+    }
+
+
+def _match_current_paint_raster_templates(
+    text_crop: np.ndarray,
+    template_files: dict[str, tuple[str, ...]],
+) -> dict[str, float]:
     if text_crop.size == 0:
         return {}
+    canonical_w, canonical_h = CURRENT_PAINT_CANONICAL_TEXT_SIZE
+    normalized = cv2.resize(text_crop, (canonical_w, canonical_h), interpolation=cv2.INTER_AREA)
+    x1, y1, x2, y2 = CURRENT_PAINT_KEYWORD_ROI
+    roi = normalized[y1:y2, x1:x2]
     scores: dict[str, float] = {}
-    for keyword, filename in CURRENT_DIRECTION_TEMPLATE_FILES.items():
-        template = _load_current_paint_template(filename)
-        if template is None:
-            continue
+    for keyword, filenames in template_files.items():
         best = 0.0
-        for scale in (0.82, 0.91, 1.0, 1.10, 1.20):
-            if scale == 1.0:
-                candidate = template
-            else:
-                candidate = cv2.resize(
-                    template,
-                    None,
-                    fx=scale,
-                    fy=scale,
-                    interpolation=cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC,
-                )
-            if candidate.shape[0] > text_crop.shape[0] or candidate.shape[1] > text_crop.shape[1]:
+        for filename in filenames:
+            template = _load_current_paint_template(filename)
+            if template is None or template.shape[0] > roi.shape[0] or template.shape[1] > roi.shape[1]:
                 continue
-            result = cv2.matchTemplate(text_crop, candidate, cv2.TM_CCOEFF_NORMED)
+            result = cv2.matchTemplate(roi, template, cv2.TM_CCOEFF_NORMED)
             _, max_value, _, _ = cv2.minMaxLoc(result)
             best = max(best, float(max_value))
-        scores[f"raster:direction:{keyword}"] = best
+        scores[keyword] = best
     return scores
 
 
@@ -947,6 +1192,21 @@ def _keyword_scores_from_mask(
 
 
 def _infer_target_object(scores: dict[str, float]) -> PaintObject:
+    raster_mapping = {
+        "玩法": PaintObject.GAMEPLAY,
+        "怪物": PaintObject.MONSTER,
+        "所有": PaintObject.ALL,
+    }
+    raster_ranked = sorted(
+        ((key, scores.get(f"raster:target:{key}", 0.0)) for key in raster_mapping),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    if raster_ranked and raster_ranked[0][1] >= 0.88:
+        runner_up = raster_ranked[1][1] if len(raster_ranked) > 1 else 0.0
+        if raster_ranked[0][1] - runner_up >= 0.08:
+            return raster_mapping[raster_ranked[0][0]]
+
     object_scores = {
         PaintObject.MONSTER: max(scores.get("target:怪物", 0.0), scores.get("color:target:怪物", 0.0), scores.get("effect:怪物", 0.0)),
         PaintObject.GAMEPLAY: max(scores.get("target:玩法", 0.0), scores.get("color:target:玩法", 0.0), scores.get("effect:玩法", 0.0)),
@@ -1235,6 +1495,118 @@ def _analyze_brush_options(
     )
 
 
+def _analyze_brush_options_realtime(
+    image: np.ndarray,
+    regions: tuple[RegionObservation, ...],
+) -> BrushOptionsObservation | None:
+    """Recognize brush cards without the expensive general text matcher."""
+
+    region = next((item for item in regions if item.kind == RegionKind.BRUSH_OPTIONS), None)
+    if region is None:
+        return None
+    panel = region.rect
+    crop = image[panel.y : panel.bottom, panel.x : panel.right]
+    if crop.size == 0:
+        return None
+
+    stage2_options, stage2_scores = _match_brush_stage2_raster_templates(crop)
+    if len(stage2_options) == 2:
+        chosen_stage1 = _infer_chosen_stage1((), stage2_options)
+        stage1_scores = {chosen_stage1: max(stage2_scores.values())} if chosen_stage1 is not None else {}
+        return BrushOptionsObservation(
+            panel_rect=panel,
+            stage1_options=(chosen_stage1,) if chosen_stage1 is not None else (),
+            stage1_scores=stage1_scores,
+            chosen_stage1=chosen_stage1,
+            stage2_options=stage2_options,
+            stage2_scores=stage2_scores,
+            keyword_scores={},
+            confidence=max(stage2_scores.values(), default=0.0),
+        )
+
+    pattern_scores = _brush_card_pattern_scores(crop)
+    ordered_options, selected_by_card = _brush_stage1_options_from_cards(crop)
+    stage1_options = ordered_options or _detected_stage1_options(pattern_scores)
+    for option in stage1_options:
+        pattern_scores[option] = max(pattern_scores.get(option, 0.0), 0.76)
+    confidence = max(pattern_scores.values(), default=0.0)
+    return BrushOptionsObservation(
+        panel_rect=panel,
+        stage1_options=stage1_options,
+        stage1_scores=pattern_scores,
+        chosen_stage1=selected_by_card,
+        stage2_options=(),
+        stage2_scores={},
+        keyword_scores={},
+        confidence=float(np.clip(confidence, 0.0, 1.0)),
+    )
+
+
+def _match_brush_stage2_raster_templates(crop: np.ndarray) -> tuple[tuple[str, ...], dict[str, float]]:
+    if crop.size == 0:
+        return (), {}
+    panel = cv2.resize(crop, BRUSH_STAGE2_CANONICAL_PANEL_SIZE, interpolation=cv2.INTER_AREA)
+    templates = _brush_stage2_raster_templates()
+    if not templates:
+        return (), {}
+
+    options: list[str] = []
+    scores: dict[str, float] = {}
+    for x, y, w, h in BRUSH_STAGE2_TEXT_RECTS:
+        text_crop = panel[y : y + h, x : x + w]
+        target = _brush_stage2_text_mask(text_crop)
+        ranked = sorted(
+            (
+                (_aligned_binary_template_score(target, template), name)
+                for name, template in templates.items()
+                if template.shape == target.shape
+            ),
+            reverse=True,
+        )
+        if not ranked:
+            continue
+        score, name = ranked[0]
+        second_score = ranked[1][0] if len(ranked) > 1 else 0.0
+        if score < 0.48 or score - second_score < 0.045 or name in options:
+            continue
+        options.append(name)
+        scores[name] = score
+    return tuple(options), scores
+
+
+@lru_cache(maxsize=1)
+def _brush_stage2_raster_templates() -> dict[str, np.ndarray]:
+    templates: dict[str, np.ndarray] = {}
+    for name, filename in BRUSH_STAGE2_TEMPLATE_FILES.items():
+        template = cv2.imread(str(BRUSH_STAGE2_TEMPLATE_DIR / filename), cv2.IMREAD_GRAYSCALE)
+        if template is not None and template.size:
+            templates[name] = template
+    return templates
+
+
+def _brush_stage2_text_mask(crop: np.ndarray) -> np.ndarray:
+    if crop.size == 0:
+        return np.zeros(crop.shape[:2], dtype=np.uint8)
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    hue = hsv[:, :, 0]
+    saturation = hsv[:, :, 1]
+    value = hsv[:, :, 2]
+    white = (value > 150) & (saturation < 155)
+    cyan = (hue >= 82) & (hue <= 112) & (saturation >= 65) & (value > 135)
+    mask = np.where(white | cyan, 255, 0).astype(np.uint8)
+    return cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((2, 2), dtype=np.uint8))
+
+
+def _aligned_binary_template_score(target: np.ndarray, template: np.ndarray) -> float:
+    if target.size == 0 or template.size == 0 or target.shape != template.shape:
+        return 0.0
+    pad = 3
+    padded = cv2.copyMakeBorder(target, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=0)
+    result = cv2.matchTemplate(padded, template, cv2.TM_CCOEFF_NORMED)
+    _, score, _, _ = cv2.minMaxLoc(result)
+    return float(max(0.0, score))
+
+
 def _analyze_backpack(
     image: np.ndarray,
     regions: tuple[RegionObservation, ...],
@@ -1270,7 +1642,7 @@ def _analyze_backpack_fast(
     paints = tuple(
         observation
         for slot in slots
-        if (observation := _analyze_backpack_slot_fast(image, slot)) is not None
+        if (observation := _analyze_backpack_slot_fast(image, slot, assume_visible=True)) is not None
     )
     if paints:
         confidence = float(np.mean([paint.category_confidence * 0.55 + paint.level_confidence * 0.45 for paint in paints]))
@@ -1298,12 +1670,39 @@ def _locate_backpack_slots_fast(
         visible_slots = tuple(slot for slot in slots if _slot_has_icon(image, slot))
         if visible_slots:
             return visible_slots
+    calibrated = _calibrated_backpack_slots(image, panel)
+    if len(calibrated) >= 5:
+        return calibrated
     return _locate_backpack_slots(image, panel)
 
 
-def _analyze_backpack_slot_fast(image: np.ndarray, slot: Rect) -> BackpackPaintObservation | None:
+def _calibrated_backpack_slots(image: np.ndarray, panel: Rect) -> tuple[Rect, ...]:
+    slot = max(42, int(round(panel.h * 0.36)))
+    pitch = max(slot + 2, int(round(panel.h * 0.375)))
+    x0 = int(round(panel.w * 0.12))
+    candidates = tuple(
+        _bounded_rect(
+            panel.x + x0 + col * pitch,
+            panel.y + row * pitch,
+            slot,
+            slot,
+            image.shape[1],
+            image.shape[0],
+        )
+        for row in range(3)
+        for col in range(5)
+    )
+    return tuple(candidate for candidate in candidates if _slot_has_icon(image, candidate))
+
+
+def _analyze_backpack_slot_fast(
+    image: np.ndarray,
+    slot: Rect,
+    *,
+    assume_visible: bool = False,
+) -> BackpackPaintObservation | None:
     crop = image[slot.y : slot.bottom, slot.x : slot.right]
-    if crop.size == 0 or not _slot_has_icon(image, slot):
+    if crop.size == 0 or (not assume_visible and not _slot_has_icon(image, slot)):
         return None
 
     category, category_confidence = _classify_backpack_category(crop)
@@ -2199,38 +2598,74 @@ def _estimate_regions_fast(image: np.ndarray, board: BoardObservation) -> list[R
     right = _clamp_int(max(x0 + 1, width - b.w * 0.06), 1, width)
     panel_w = max(1, right - x0)
     content_panel_w = max(1, right - content_x0)
-    return [
+    stage_mode = _detect_brush_options_mode(image, x0, b, panel_w)
+    regions = [
         RegionObservation(
             kind=RegionKind.CURRENT_PAINT,
             rect=_bounded_rect(x0, b.y - b.h * 0.02, panel_w, b.h * 0.24, width, height),
             confidence=board.score,
             label="current paint fast",
         ),
-        RegionObservation(
-            kind=RegionKind.BACKPACK,
-            rect=_bounded_rect(content_x0, b.y + b.h * 0.29, content_panel_w, b.h * 0.50, width, height),
-            confidence=board.score * 0.85,
-            label="backpack fast",
-        ),
-        RegionObservation(
-            kind=RegionKind.FORCE_COMPLETE,
-            rect=_bounded_rect(x0 + panel_w * 0.50, b.y + b.h * 0.80, panel_w * 0.42, b.h * 0.11, width, height),
-            confidence=board.score * 0.75,
-            label="force complete fast",
-        ),
-        RegionObservation(
-            kind=RegionKind.REFRESH_AFFIX,
-            rect=_bounded_rect(x0, b.y + b.h * 0.80, panel_w * 0.42, b.h * 0.11, width, height),
-            confidence=board.score * 0.55,
-            label="refresh affix fast",
-        ),
-        RegionObservation(
-            kind=RegionKind.CONFIRM_BUTTON,
-            rect=_bounded_rect(x0 + panel_w * 0.35, b.y + b.h * 0.88, panel_w * 0.38, b.h * 0.10, width, height),
-            confidence=board.score * 0.62,
-            label="confirm button fast",
-        ),
     ]
+    blank_count = sum(tile.state == TileState.BLANK for tile in board.tiles)
+    if blank_count <= 1:
+        enter_button = _find_raster_action_button_fast(image, "enter_painting.png")
+        if enter_button is not None:
+            regions.append(
+                RegionObservation(
+                    kind=RegionKind.FINISH_DRAWING,
+                    rect=enter_button[1],
+                    confidence=enter_button[0],
+                    label="enter painting button fast",
+                )
+            )
+    if stage_mode:
+        regions.extend(
+            [
+                RegionObservation(
+                    kind=RegionKind.BRUSH_OPTIONS,
+                    rect=_bounded_rect(x0, b.y + b.h * 0.23, panel_w, b.h * 0.48, width, height),
+                    confidence=board.score * 0.88,
+                    label="brush options fast",
+                ),
+                RegionObservation(
+                    kind=RegionKind.CONFIRM_BUTTON,
+                    rect=_bounded_rect(x0 + panel_w * 0.35, b.y + b.h * 0.88, panel_w * 0.38, b.h * 0.10, width, height),
+                    confidence=board.score * 0.62,
+                    label="confirm button fast",
+                ),
+            ]
+        )
+    else:
+        regions.extend(
+            [
+                RegionObservation(
+                    kind=RegionKind.BACKPACK,
+                    rect=_bounded_rect(content_x0, b.y + b.h * 0.29, content_panel_w, b.h * 0.50, width, height),
+                    confidence=board.score * 0.85,
+                    label="backpack fast",
+                ),
+                RegionObservation(
+                    kind=RegionKind.FORCE_COMPLETE,
+                    rect=_bounded_rect(x0 + panel_w * 0.50, b.y + b.h * 0.80, panel_w * 0.42, b.h * 0.11, width, height),
+                    confidence=board.score * 0.75,
+                    label="force complete fast",
+                ),
+                RegionObservation(
+                    kind=RegionKind.REFRESH_AFFIX,
+                    rect=_bounded_rect(x0, b.y + b.h * 0.80, panel_w * 0.42, b.h * 0.11, width, height),
+                    confidence=board.score * 0.55,
+                    label="refresh affix fast",
+                ),
+                RegionObservation(
+                    kind=RegionKind.CONFIRM_BUTTON,
+                    rect=_bounded_rect(x0 + panel_w * 0.35, b.y + b.h * 0.88, panel_w * 0.38, b.h * 0.10, width, height),
+                    confidence=board.score * 0.62,
+                    label="confirm button fast",
+                ),
+            ]
+        )
+    return regions
 
 
 def _find_finish_drawing_signal(image: np.ndarray) -> tuple[float, Rect, str] | None:
@@ -2247,6 +2682,30 @@ def _find_finish_drawing_signal(image: np.ndarray) -> tuple[float, Rect, str] | 
     if not candidates:
         return None
     return max(candidates, key=lambda item: item[0])
+
+
+def _find_start_drawing_button_fast(image: np.ndarray) -> tuple[float, Rect] | None:
+    if image.size == 0:
+        return None
+    height, width = image.shape[:2]
+    rect = _bounded_rect(width * 0.72, height * 0.86, width * 0.15, height * 0.10, width, height)
+    crop = image[rect.y : rect.bottom, rect.x : rect.right]
+    if crop.size == 0:
+        return None
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    hue = hsv[:, :, 0]
+    saturation = hsv[:, :, 1]
+    value = hsv[:, :, 2]
+    ice = ((hue >= 82) & (hue <= 112) & (saturation > 55) & (value > 130)) | (
+        (saturation < 70) & (value > 205)
+    )
+    orange = (hue <= 25) & (saturation > 75) & (value > 105)
+    ice_ratio = float(np.mean(ice))
+    orange_ratio = float(np.mean(orange))
+    if ice_ratio < 0.035 or orange_ratio < 0.003:
+        return None
+    confidence = float(np.clip(0.55 + ice_ratio * 1.8 + orange_ratio * 2.2, 0.0, 0.96))
+    return confidence, rect
 
 
 def _find_finish_drawing_button(image: np.ndarray) -> tuple[float, Rect] | None:
@@ -2301,6 +2760,43 @@ def _find_raster_action_button(image: np.ndarray, filename: str) -> tuple[float,
         height,
     )
     return score, button_rect
+
+
+def _find_raster_action_button_fast(image: np.ndarray, filename: str) -> tuple[float, Rect] | None:
+    template = _load_current_paint_template(filename)
+    if template is None or image.size == 0:
+        return None
+    height, width = image.shape[:2]
+    roi_rect = _bounded_rect(width * 0.67, height * 0.73, width * 0.23, height * 0.16, width, height)
+    roi = image[roi_rect.y : roi_rect.bottom, roi_rect.x : roi_rect.right]
+    if roi.size == 0:
+        return None
+    scale = min(width / 1673.0, height / 878.0)
+    candidate = template if abs(scale - 1.0) < 0.01 else cv2.resize(
+        template,
+        None,
+        fx=scale,
+        fy=scale,
+        interpolation=cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC,
+    )
+    if candidate.shape[0] > roi.shape[0] or candidate.shape[1] > roi.shape[1]:
+        return None
+    result = cv2.matchTemplate(roi, candidate, cv2.TM_CCOEFF_NORMED)
+    _, score, _, location = cv2.minMaxLoc(result)
+    if score < 0.78:
+        return None
+    match_width, match_height = candidate.shape[1], candidate.shape[0]
+    center_x = roi_rect.x + location[0] + match_width / 2.0
+    center_y = roi_rect.y + location[1] + match_height / 2.0
+    button_rect = _bounded_rect(
+        center_x - max(width * 0.14, match_width * 4.8) / 2.0,
+        center_y - max(height * 0.05, match_height * 2.1) / 2.0,
+        max(width * 0.14, match_width * 4.8),
+        max(height * 0.05, match_height * 2.1),
+        width,
+        height,
+    )
+    return float(score), button_rect
 
 
 def _find_blue_action_button(image: np.ndarray, keywords: tuple[str, ...]) -> tuple[float, Rect] | None:
@@ -3012,58 +3508,209 @@ def _classify_tiles(image: np.ndarray, board_rect: Rect) -> list[TileObservation
             y2 = round(board_rect.y + (row + 1) * cell_h)
             rect = Rect(x1, y1, max(1, x2 - x1), max(1, y2 - y1))
             crop = image[y1:y2, x1:x2]
-            state, confidence, features = classify_tile(crop)
-            (
-                paint_category,
-                paint_category_confidence,
-                paint_level,
-                paint_level_confidence,
-                paint_subtype,
-                paint_is_treasure,
-            ) = _analyze_board_paint_tile(crop)
-            paint_detail_score = _board_paint_detail_score(
-                paint_category,
-                paint_category_confidence,
-                paint_level,
-                paint_level_confidence,
+            tiles.append(_classify_tile_observation(crop, row, col, rect))
+    return _resolve_board_scope_anchor(tiles)
+
+
+def _classify_tiles_quick(
+    image: np.ndarray,
+    board_rect: Rect,
+    previous_board: BoardObservation,
+) -> list[TileObservation]:
+    tiles: list[TileObservation] = []
+    cell_w = board_rect.w / BOARD_SIZE
+    cell_h = board_rect.h / BOARD_SIZE
+    for row in range(BOARD_SIZE):
+        for col in range(BOARD_SIZE):
+            x1 = round(board_rect.x + col * cell_w)
+            y1 = round(board_rect.y + row * cell_h)
+            x2 = round(board_rect.x + (col + 1) * cell_w)
+            y2 = round(board_rect.y + (row + 1) * cell_h)
+            rect = Rect(x1, y1, max(1, x2 - x1), max(1, y2 - y1))
+            crop = image[y1:y2, x1:x2]
+            signature = _tile_visual_signature(crop)
+            previous = previous_board.tile(row, col)
+            previous_signature = _tile_signature_from_features(previous.features)
+            visual_change = (
+                float(np.mean(np.abs(np.asarray(signature) - np.asarray(previous_signature))))
+                if previous_signature is not None
+                else 1.0
             )
-            features["paint_detail_score"] = paint_detail_score
-            features["paint_category_confidence"] = paint_category_confidence
-            features["paint_level_confidence"] = paint_level_confidence
-            if _paint_detail_can_override_tile_state(
-                state,
-                features,
-                paint_detail_score,
-                paint_category_confidence,
-                paint_level_confidence,
-                paint_is_treasure,
-            ):
-                state = TileState.PAINT
-                confidence = max(confidence, min(0.90, paint_detail_score))
-            if state != TileState.PAINT:
-                paint_category = PaintCategory.UNKNOWN
-                paint_category_confidence = 0.0
-                paint_level = None
-                paint_level_confidence = 0.0
-                paint_subtype = None
-                paint_is_treasure = False
-            tiles.append(
-                TileObservation(
-                    row=row,
-                    col=col,
-                    rect=rect,
-                    state=state,
-                    confidence=confidence,
-                    features=features,
-                    paint_category=paint_category,
-                    paint_category_confidence=paint_category_confidence,
-                    paint_level=paint_level,
-                    paint_level_confidence=paint_level_confidence,
-                    paint_subtype=paint_subtype,
-                    paint_is_treasure=paint_is_treasure,
-                )
-            )
-    return tiles
+            fast_state = _classify_tile_for_board_score(crop)
+            state_compatible = fast_state in {previous.state, TileState.UNKNOWN}
+            if visual_change <= 0.05 and state_compatible:
+                features = dict(previous.features)
+                _store_tile_visual_signature(features, signature)
+                features["visual_change"] = visual_change
+                tiles.append(replace(previous, row=row, col=col, rect=rect, features=features))
+            else:
+                observation = _classify_tile_observation(crop, row, col, rect)
+                observation.features["visual_change"] = visual_change
+                tiles.append(observation)
+    return _resolve_board_scope_anchor(tiles)
+
+
+def _classify_tile_observation(tile_bgr: np.ndarray, row: int, col: int, rect: Rect) -> TileObservation:
+    state, confidence, features = classify_tile(tile_bgr)
+    scope_score, anchor_score = _tile_scope_and_anchor_scores(tile_bgr)
+    is_scope_highlight = scope_score >= 0.24 and (
+        state == TileState.BLANK or _features_look_like_blank_tile(features)
+    )
+    is_current_anchor = anchor_score >= 0.10 and state == TileState.PAINT
+    features["scope_highlight_score"] = scope_score
+    features["current_anchor_score"] = anchor_score
+    # The gold frame is an overlay on a still-empty white cell. It must not
+    # become paint or contribute to the current rule's match progress.
+    if is_scope_highlight and _features_look_like_blank_tile(features):
+        state = TileState.BLANK
+        confidence = max(confidence, min(0.98, 0.62 + scope_score * 0.50))
+    _store_tile_visual_signature(features, _tile_visual_signature(tile_bgr))
+    if state in {TileState.PAINT, TileState.UNKNOWN}:
+        (
+            paint_category,
+            paint_category_confidence,
+            paint_level,
+            paint_level_confidence,
+            paint_subtype,
+            paint_is_treasure,
+        ) = _analyze_board_paint_tile(tile_bgr)
+    else:
+        paint_category = PaintCategory.UNKNOWN
+        paint_category_confidence = 0.0
+        paint_level = None
+        paint_level_confidence = 0.0
+        paint_subtype = None
+        paint_is_treasure = False
+    paint_detail_score = _board_paint_detail_score(
+        paint_category,
+        paint_category_confidence,
+        paint_level,
+        paint_level_confidence,
+    )
+    features["paint_detail_score"] = paint_detail_score
+    features["paint_category_confidence"] = paint_category_confidence
+    features["paint_level_confidence"] = paint_level_confidence
+    if _paint_detail_can_override_tile_state(
+        state,
+        features,
+        paint_detail_score,
+        paint_category_confidence,
+        paint_level_confidence,
+        paint_is_treasure,
+    ):
+        state = TileState.PAINT
+        confidence = max(confidence, min(0.90, paint_detail_score))
+    if state != TileState.PAINT:
+        paint_category = PaintCategory.UNKNOWN
+        paint_category_confidence = 0.0
+        paint_level = None
+        paint_level_confidence = 0.0
+        paint_subtype = None
+        paint_is_treasure = False
+    return TileObservation(
+        row=row,
+        col=col,
+        rect=rect,
+        state=state,
+        confidence=confidence,
+        features=features,
+        paint_category=paint_category,
+        paint_category_confidence=paint_category_confidence,
+        paint_level=paint_level,
+        paint_level_confidence=paint_level_confidence,
+        paint_subtype=paint_subtype,
+        paint_is_treasure=paint_is_treasure,
+        is_scope_highlight=is_scope_highlight,
+        scope_highlight_confidence=scope_score,
+        is_current_anchor=is_current_anchor,
+        current_anchor_confidence=anchor_score,
+    )
+
+
+def _resolve_board_scope_anchor(tiles: list[TileObservation]) -> list[TileObservation]:
+    highlighted = [tile for tile in tiles if tile.is_scope_highlight]
+    candidates = [tile for tile in tiles if tile.is_current_anchor]
+    if not highlighted or not candidates:
+        return [
+            replace(tile, is_current_anchor=False, current_anchor_confidence=0.0)
+            if tile.is_current_anchor
+            else tile
+            for tile in tiles
+        ]
+
+    rows = {tile.row for tile in highlighted}
+    cols = {tile.col for tile in highlighted}
+    if len(rows) == 1:
+        candidates = [tile for tile in candidates if tile.row in rows]
+    elif len(cols) == 1:
+        candidates = [tile for tile in candidates if tile.col in cols]
+    else:
+        candidates = []
+    winner = max(candidates, key=lambda tile: tile.current_anchor_confidence) if candidates else None
+    return [
+        replace(
+            tile,
+            is_current_anchor=winner is not None and (tile.row, tile.col) == (winner.row, winner.col),
+            current_anchor_confidence=(
+                tile.current_anchor_confidence
+                if winner is not None and (tile.row, tile.col) == (winner.row, winner.col)
+                else 0.0
+            ),
+        )
+        if tile.is_current_anchor
+        else tile
+        for tile in tiles
+    ]
+
+
+def _tile_scope_and_anchor_scores(tile_bgr: np.ndarray) -> tuple[float, float]:
+    if tile_bgr.size == 0:
+        return 0.0, 0.0
+    hsv = cv2.cvtColor(tile_bgr, cv2.COLOR_BGR2HSV)
+    hue = hsv[:, :, 0]
+    saturation = hsv[:, :, 1]
+    value = hsv[:, :, 2]
+    gold = (hue >= 12) & (hue <= 45) & (saturation > 75) & (value > 120)
+
+    height, width = gold.shape
+    band = max(3, min(height, width) // 14)
+    perimeter = np.zeros_like(gold, dtype=bool)
+    perimeter[:band, :] = True
+    perimeter[-band:, :] = True
+    perimeter[:, :band] = True
+    perimeter[:, -band:] = True
+    scope_score = float(np.mean(gold[perimeter])) if np.any(perimeter) else 0.0
+
+    marker_height = max(1, int(height * 0.32))
+    marker_width = max(1, int(width * 0.28))
+    marker = gold[:marker_height, :marker_width]
+    marker_dark = value[:marker_height, :marker_width] < 70
+    marker_gold_ratio = float(np.mean(marker)) if marker.size else 0.0
+    marker_dark_ratio = float(np.mean(marker_dark)) if marker_dark.size else 0.0
+    anchor_score = marker_gold_ratio if marker_dark_ratio >= 0.018 else 0.0
+    return scope_score, anchor_score
+
+
+def _tile_visual_signature(tile_bgr: np.ndarray) -> tuple[float, ...]:
+    if tile_bgr.size == 0:
+        return (0.0,) * 48
+    small = cv2.resize(tile_bgr, (4, 4), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+    return tuple(float(value) for value in small.reshape(-1))
+
+
+def _store_tile_visual_signature(features: dict[str, float], signature: tuple[float, ...]) -> None:
+    for index, value in enumerate(signature):
+        features[f"visual_{index}"] = value
+
+
+def _tile_signature_from_features(features: dict[str, float]) -> tuple[float, ...] | None:
+    values: list[float] = []
+    for index in range(48):
+        key = f"visual_{index}"
+        if key not in features:
+            return None
+        values.append(float(features[key]))
+    return tuple(values)
 
 
 def _analyze_board_paint_tile(

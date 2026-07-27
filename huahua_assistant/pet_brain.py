@@ -248,6 +248,7 @@ def _phase_evidence(app, frame_id: str) -> PhaseEvidence:
         affix_selected=selected_affix is not None,
         backpack_target=_has_backpack_target(app) and not selection_changed,
         board_target=selection_changed or bool(getattr(app, "recommendations", None)),
+        start_visible=bool(scene is not None and scene.region(RegionKind.START_DRAWING) is not None),
         finish_signals=frozenset(finish_signals),
     )
 
@@ -301,6 +302,21 @@ def _target_proposal(app, evidence: PhaseEvidence) -> TargetProposal | None:
     confidence = _guidance_confidence(app)
     scene = getattr(app, "current_scene", None)
     state = getattr(app, "current_state", None)
+
+    if evidence.start_visible and scene is not None:
+        region = scene.region(RegionKind.START_DRAWING)
+        if region is not None:
+            point = _capture_rect_point(app, region.rect, 0.5, 0.5)
+            if point is not None:
+                return TargetProposal(
+                    key="start_drawing",
+                    kind=TargetKind.START,
+                    priority=0,
+                    screen_point=point,
+                    confidence=min(confidence, float(region.confidence)),
+                    reason_short="开始绘制",
+                    source_frame_id=evidence.frame_id,
+                )
 
     if len(evidence.finish_signals) >= 2 and scene is not None:
         region = scene.region(RegionKind.FINISH_DRAWING)

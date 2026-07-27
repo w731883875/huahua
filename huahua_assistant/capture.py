@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import ctypes
+import threading
 import time
+from contextlib import contextmanager
 from ctypes import wintypes
 from dataclasses import dataclass
 from os.path import basename
@@ -15,6 +17,58 @@ import numpy as np
 
 DEFAULT_WINDOW_TITLE = "torchlight_infinite"
 DEFAULT_WINDOW_CANDIDATES = ("torchlight_infinite", "Torchlight: Infinite", "Torchlight")
+PER_MONITOR_AWARE_V2 = -4
+
+
+def enable_process_dpi_awareness() -> bool:
+    """Enable physical-pixel coordinates before Tk creates any windows."""
+
+    try:
+        user32 = ctypes.windll.user32
+        setter = getattr(user32, "SetProcessDpiAwarenessContext", None)
+        if setter is not None:
+            setter.argtypes = (ctypes.c_void_p,)
+            setter.restype = wintypes.BOOL
+            if setter(ctypes.c_void_p(PER_MONITOR_AWARE_V2)):
+                return True
+    except Exception:
+        pass
+    try:
+        shcore = ctypes.windll.shcore
+        if shcore.SetProcessDpiAwareness(2) in (0, -2147024891):
+            return True
+    except Exception:
+        pass
+    try:
+        return bool(ctypes.windll.user32.SetProcessDPIAware())
+    except Exception:
+        return False
+
+
+@contextmanager
+def physical_pixel_coordinates():
+    """Temporarily disable DPI virtualization for capture worker threads."""
+
+    previous = None
+    setter = None
+    try:
+        user32 = ctypes.windll.user32
+        setter = getattr(user32, "SetThreadDpiAwarenessContext", None)
+        if setter is not None:
+            setter.argtypes = (ctypes.c_void_p,)
+            setter.restype = ctypes.c_void_p
+            previous = setter(ctypes.c_void_p(PER_MONITOR_AWARE_V2))
+    except Exception:
+        previous = None
+        setter = None
+    try:
+        yield
+    finally:
+        if setter is not None and previous:
+            try:
+                setter(previous)
+            except Exception:
+                pass
 
 
 @dataclass(frozen=True)
@@ -76,6 +130,8 @@ class LegacyCaptureBackend:
     name = "legacy"
 
     def capture_window_content(self, window: WindowInfo) -> tuple[np.ndarray | None, str]:
+        if window.process_name.casefold() == "torchlight_infinite.exe":
+            return None, "printwindow_skipped_directx"
         try:
             image = _capture_window_print(window)
         except Exception as exc:
@@ -149,12 +205,16 @@ class DxcamRegionCaptureBackend:
 
 _LEGACY_BACKEND = LegacyCaptureBackend()
 _DXCAM_BACKEND = DxcamRegionCaptureBackend()
+_CAPTURE_THREAD_LOCAL = threading.local()
 
 
 def capture_screen(region: dict[str, int] | None = None) -> np.ndarray:
-    with mss.mss() as sct:
-        target = region if region is not None else sct.monitors[1]
-        shot = sct.grab(target)
+    sct = getattr(_CAPTURE_THREAD_LOCAL, "mss", None)
+    if sct is None:
+        sct = mss.mss()
+        _CAPTURE_THREAD_LOCAL.mss = sct
+    target = region if region is not None else sct.monitors[1]
+    shot = sct.grab(target)
     frame = np.asarray(shot)
     return cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
 
@@ -197,6 +257,25 @@ def capture_target(
     activation_delay: float = 0.35,
     backend: str | CaptureBackend | None = None,
 ) -> CaptureResult:
+    with physical_pixel_coordinates():
+        return _capture_target_physical(
+            window_title=window_title,
+            fallback_to_screen=fallback_to_screen,
+            fallback_if_target_uncaptureable=fallback_if_target_uncaptureable,
+            activate=activate,
+            activation_delay=activation_delay,
+            backend=backend,
+        )
+
+
+def _capture_target_physical(
+    window_title: str,
+    fallback_to_screen: bool,
+    fallback_if_target_uncaptureable: bool,
+    activate: bool,
+    activation_delay: float,
+    backend: str | CaptureBackend | None,
+) -> CaptureResult:
     backend_plan = resolve_capture_backend(backend)
     candidates = _target_candidates(window_title)
     matches = find_matching_windows(candidates)
@@ -210,6 +289,7 @@ def capture_target(
     captureable = [window for window in matches if window.captureable]
     window = max(captureable, key=lambda item: item.width * item.height) if captureable else None
     if window is not None:
+        foreground_confirmed = False
         if activate:
             activate_window(window.hwnd)
             if activation_delay > 0:
@@ -218,6 +298,7 @@ def capture_target(
             refreshed_captureable = [item for item in refreshed_matches if item.captureable]
             if refreshed_captureable:
                 window = max(refreshed_captureable, key=lambda item: item.width * item.height)
+            foreground_confirmed = is_foreground_window(window.hwnd)
         attempts: list[str] = []
         for capture_backend in backend_plan.content_backends:
             internal_image, internal_method = capture_backend.capture_window_content(window)
@@ -239,7 +320,8 @@ def capture_target(
                 return CaptureResult(
                     image=region_image,
                     source=(
-                        f"window-screen:{window.title} process:{window.process_name} "
+                        f"{'window-foreground-screen' if foreground_confirmed else 'window-screen'}:"
+                        f"{window.title} process:{window.process_name} "
                         f"backend:{capture_backend.name} method:{region_method} "
                         f"content_failed:{_format_capture_attempts(attempts)}"
                     ),
@@ -379,8 +461,26 @@ def restore_window(hwnd: int) -> None:
 def activate_window(hwnd: int) -> None:
     restore_window(hwnd)
     user32 = ctypes.windll.user32
+    SWP_NOSIZE = 0x0001
+    SWP_NOMOVE = 0x0002
+    SWP_SHOWWINDOW = 0x0040
+    HWND_TOPMOST = -1
+    HWND_NOTOPMOST = -2
+    flags = SWP_NOSIZE | SWP_NOMOVE | SWP_SHOWWINDOW
+    # SetForegroundWindow can be denied when capture runs from a background
+    # worker. A brief topmost toggle reliably raises the game without leaving
+    # it permanently topmost.
+    user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags)
+    user32.SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, flags)
     user32.BringWindowToTop(hwnd)
     user32.SetForegroundWindow(hwnd)
+
+
+def is_foreground_window(hwnd: int) -> bool:
+    try:
+        return int(ctypes.windll.user32.GetForegroundWindow()) == int(hwnd)
+    except Exception:
+        return False
 
 
 class BITMAPINFOHEADER(ctypes.Structure):

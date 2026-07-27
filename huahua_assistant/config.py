@@ -45,6 +45,8 @@ DEFAULT_STRATEGY_CONFIG: dict[str, Any] = {
         "treasure_missing_stack_bonus": 420.0,
         "treasure_missing_premium_stage2_bonus": 520.0,
         "treasure_has_premium_stage2_penalty": 760.0,
+        "good_bucket_bonus": 80.0,
+        "bad_bucket_penalty": 130.0,
     },
     "force": {
         "recommend_threshold": 350.0,
@@ -52,6 +54,8 @@ DEFAULT_STRATEGY_CONFIG: dict[str, Any] = {
         "natural_completion_penalty": 900.0,
         "no_natural_completion_bonus": 450.0,
         "high_treasure_rescue_bonus": 520.0,
+        "good_bucket_bonus": 90.0,
+        "bad_bucket_penalty": 160.0,
     },
     "placement": {
         "terrain_delta_weight": 1.15,
@@ -70,9 +74,13 @@ DEFAULT_STRATEGY_CONFIG: dict[str, Any] = {
         "placement_min_samples": 30,
         "brush_min_samples": 20,
         "affix_min_samples": 20,
+        "terrain_min_samples": 20,
+        "terrain_bucket_min_samples": 8,
         "placement_max_bonus": 180.0,
         "brush_max_bonus": 130.0,
         "affix_max_bonus": 150.0,
+        "terrain_prior_max_bonus": 95.0,
+        "terrain_prior_max_penalty": 85.0,
     },
     "debug": {
         "save_fast_captures": False,

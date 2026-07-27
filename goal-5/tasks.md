@@ -180,17 +180,41 @@ Next step:
 
 ## Task 6: Major Checkpoint 2
 
-Status: pending
+Status: completed
 
 Review canonical data compatibility, phase transitions, target stability, tests, event/data consistency, UI integration risk, and rollback before changing desktop-pet movement.
 
 Work performed:
 
+- Audited the 48 canonical affix identities, all 55 historical codes, legacy aliases, current runtime logs, phase legality, target hysteresis/expiry, UI coordinate boundaries, passive-assistance constraints, and rollback isolation before desktop-pet movement changes.
+- Fixed a target lifetime bug where repeated UI rendering of the same capture frame could refresh `expires_at` indefinitely; only a distinct source frame can now renew an otherwise unchanged target.
+- Fixed `FINISH_READY` stabilization by deriving persistent terminal-map evidence from the current snapshot instead of relying only on edge-triggered events. Terminal evidence now requires zero blanks and at least 36 known cells, and malformed/partial counts are rejected.
+- Added target safety validation for board, backpack, brush, and finish proposals: points must be finite, fall inside a valid positive-size capture window, and, for the real Tk app, land on an actual Windows monitor. Windows `MonitorFromPoint` supports negative multi-monitor coordinates; Tk virtual-root bounds remain the non-Windows/API-failure fallback.
+- Added regression coverage for same-frame TTL behavior, stable two-frame finish guidance, incomplete terminal evidence, window/screen rejection, negative-coordinate secondary monitors, and malformed/non-finite inputs.
+- Kept desktop-pet movement unchanged as required by the checkpoint boundary; structured `RecommendationTarget` consumption remains isolated to Task 7.
+- Checkpoint code commit: `f313b7b Harden guidance checkpoint behavior`.
+
 Validation evidence:
+
+- Full suite passed: 41 tests in 0.111 seconds; the 21 focused guidance/pet tests passed independently.
+- Canonical compatibility tests cover every historical code and explicit canonical identity. A read-only rebuild of current logs produced 295 real events, 4 trusted trajectories, 14 action/placement samples, 0 brush samples, 0 affix-policy samples, and 0 recommendation decisions; canonical observed IDs remained `transform.randomize_scope.monster` (2), `transform.randomize_scope.any` (1), and `spread.place_on.blocked` (1).
+- Strict environment validation passed on Python 3.12.10 with all 11 locked distributions exact; `pip check` reported no broken requirements, and encoding validation checked 58 project text files.
+- AST parsing and core imports passed for 26 Python files/modules. The fixed-seed brush/refresh simulation exited 0 and produced install, placement, brush, force, and refresh recommendations.
+- Passive safety scan found no network or input-injection API usage in application, script, or test Python files.
+- Final temporary PyInstaller build from the committed code succeeded in `C:\Users\m'm'm'm'm'm'm'm'm'm'\AppData\Local\Temp\huahua-goal5-task6-final-fea0fe054cda4adf85c34f7778bf49f3`; the EXE is 75,756,533 bytes with SHA256 `9A1CB95655562B0980F2DC4587E545B576CBCC8E161A6508276E12075B0534B7`. Warning audit found 0 critical missing modules and the Analysis TOC contains `huahua_assistant.guidance`.
+- SHA256 values for corrected observations, desktop-pet position, trajectories, observations, and stats were unchanged after the full test/read-only rebuild/build cycle.
+- `git diff --cached --check` passed and the checkpoint commit contained only `guidance.py`, `pet_brain.py`, and their two tests; all pre-existing dirty files remained outside the commit.
 
 Remaining risk:
 
+- The packaged GUI was not launched because it would open a window and potentially steal focus. Live game capture, per-monitor DPI changes, game-window movement, Tk click-through, and exact pet/marker placement still require Task 7 runtime behavior plus the final screenshot audit.
+- The legacy immediate `finish_hint` message can still react to a single `finish_candidate` event, but no structured finish movement target is released until two independent evidence categories stabilize across two frames.
+- If Windows monitor lookup is unavailable, safety falls back to Tk virtual-root bounds; a non-Tk test/integration object without screen metadata is constrained only by its capture-window bounds.
+- Recognition accuracy for aliases and phase evidence remains heuristic. Current structural/runtime compatibility is proven, while representative live visual accuracy stays intentionally deferred to Task 13.
+
 Next step:
+
+- Task 7: make the desktop-pet actor consume only stable, unexpired `RecommendationTarget` values, teleport beside Top1 without covering the click point, and preserve lightweight Top2/Top3 markers and click-through behavior.
 
 ## Task 7: Implement Top1 Desktop-Pet Teleport Guidance
 

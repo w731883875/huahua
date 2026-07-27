@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from functools import lru_cache
 from pathlib import Path
 
 import cv2
@@ -30,6 +31,13 @@ from .models import (
 BOARD_SIZE = 6
 MIN_CAPTURE_SIDE = 320
 MIN_BOARD_DETECTION_SCORE = 0.70
+CURRENT_PAINT_TEMPLATE_DIR = Path(__file__).resolve().parent / "assets" / "current_paint"
+CURRENT_DIRECTION_TEMPLATE_FILES = {
+    "横向": "direction_horizontal.png",
+    "相邻": "direction_adjacent.png",
+    "纵向": "direction_vertical.png",
+    "对角斜向": "direction_diagonal.png",
+}
 
 
 class VisionTracker:
@@ -833,7 +841,49 @@ def _current_paint_keyword_scores(text_crop: np.ndarray) -> dict[str, float]:
         }
     )
     scores.update(_current_paint_color_hint_scores(target_line))
+    scores.update(_current_paint_raster_direction_scores(text_crop))
     return scores
+
+
+def _current_paint_raster_direction_scores(text_crop: np.ndarray) -> dict[str, float]:
+    if text_crop.size == 0:
+        return {}
+    scores: dict[str, float] = {}
+    for keyword, filename in CURRENT_DIRECTION_TEMPLATE_FILES.items():
+        template = _load_current_paint_template(filename)
+        if template is None:
+            continue
+        best = 0.0
+        for scale in (0.82, 0.91, 1.0, 1.10, 1.20):
+            if scale == 1.0:
+                candidate = template
+            else:
+                candidate = cv2.resize(
+                    template,
+                    None,
+                    fx=scale,
+                    fy=scale,
+                    interpolation=cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC,
+                )
+            if candidate.shape[0] > text_crop.shape[0] or candidate.shape[1] > text_crop.shape[1]:
+                continue
+            result = cv2.matchTemplate(text_crop, candidate, cv2.TM_CCOEFF_NORMED)
+            _, max_value, _, _ = cv2.minMaxLoc(result)
+            best = max(best, float(max_value))
+        scores[f"raster:direction:{keyword}"] = best
+    return scores
+
+
+@lru_cache(maxsize=16)
+def _load_current_paint_template(filename: str) -> np.ndarray | None:
+    path = CURRENT_PAINT_TEMPLATE_DIR / filename
+    try:
+        raw = np.fromfile(str(path), dtype=np.uint8)
+    except OSError:
+        return None
+    if raw.size == 0:
+        return None
+    return cv2.imdecode(raw, cv2.IMREAD_COLOR)
 
 
 def _current_paint_color_hint_scores(target_line: np.ndarray) -> dict[str, float]:
@@ -913,6 +963,23 @@ def _infer_target_object(scores: dict[str, float]) -> PaintObject:
 
 
 def _infer_direction(scores: dict[str, float]) -> PaintDirection:
+    mapping = {
+        "横向": PaintDirection.HORIZONTAL,
+        "纵向": PaintDirection.VERTICAL,
+        "对角斜向": PaintDirection.DIAGONAL,
+        "相邻": PaintDirection.ADJACENT,
+        "全图": PaintDirection.GLOBAL,
+    }
+    raster_scores = {
+        keyword: scores.get(f"raster:direction:{keyword}", 0.0)
+        for keyword in CURRENT_DIRECTION_TEMPLATE_FILES
+    }
+    raster_ranked = sorted(raster_scores.items(), key=lambda item: item[1], reverse=True)
+    if raster_ranked and raster_ranked[0][1] >= 0.78:
+        runner_up = raster_ranked[1][1] if len(raster_ranked) > 1 else 0.0
+        if raster_ranked[0][1] - runner_up >= 0.08:
+            return mapping[raster_ranked[0][0]]
+
     direction_scores = {
         "横向": max(scores.get("target:横向", 0.0), scores.get("color:direction:横向", 0.0), scores.get("effect:横向", 0.0)),
         "纵向": max(scores.get("target:纵向", 0.0), scores.get("color:direction:纵向", 0.0), scores.get("effect:纵向", 0.0)),
@@ -941,13 +1008,6 @@ def _infer_direction(scores: dict[str, float]) -> PaintDirection:
     sorted_scores = sorted(direction_scores.values(), reverse=True)
     if score < 0.42 or (len(sorted_scores) > 1 and score - sorted_scores[1] < 0.035):
         return PaintDirection.UNKNOWN
-    mapping = {
-        "横向": PaintDirection.HORIZONTAL,
-        "纵向": PaintDirection.VERTICAL,
-        "对角斜向": PaintDirection.DIAGONAL,
-        "相邻": PaintDirection.ADJACENT,
-        "全图": PaintDirection.GLOBAL,
-    }
     return mapping[keyword]
 
 
@@ -1669,7 +1729,7 @@ def _brush_stage1_options_from_cards(crop: np.ndarray) -> tuple[tuple[str, ...],
     cards = _split_brush_cards(crop)
     options: list[str] = []
     selected: str | None = None
-    for card in cards[:2]:
+    for card in cards:
         scores = _brush_pattern_score_single(card)
         if not scores:
             continue
@@ -1679,6 +1739,8 @@ def _brush_stage1_options_from_cards(crop: np.ndarray) -> tuple[tuple[str, ...],
         options.append(brush_type)
         if _brush_card_selected_score(card) >= 0.16:
             selected = brush_type
+        if len(options) >= 2:
+            break
 
     ordered = tuple(brush_type.value for brush_type in BRUSH_TYPE_ORDER if brush_type.value in options)
     if selected not in ordered:
@@ -1749,6 +1811,11 @@ def _brush_pattern_score_single(card: np.ndarray) -> dict[str, float]:
     # 转锋: teal/cyan leaf motif, 堆砌: bright blue swirl, 扩散: deeper blue/purple target motif.
     transform_score = _clamp01_vision((cyan - 0.28) / 0.55)
     stack_score = _clamp01_vision((bright_blue - 0.22) / 0.52 + (1.0 - abs(median_hue - 103.0) / 18.0) * 0.22)
+    dark_stack_score = _clamp01_vision((dim_blue - 0.52) / 0.34) * _clamp01_vision(
+        1.0 - abs(median_hue - 104.0) / 8.0
+    )
+    if cyan < 0.32 and deep_blue < 0.18:
+        stack_score = max(stack_score, dark_stack_score)
     spread_score = _clamp01_vision((deep_blue - 0.32) / 0.60 + dim_blue * 0.18)
 
     if transform_score < 0.22:
@@ -2171,6 +2238,9 @@ def _find_finish_drawing_signal(image: np.ndarray) -> tuple[float, Rect, str] | 
     button = _find_finish_drawing_button(image)
     if button is not None:
         candidates.append((button[0], button[1], "finish drawing button"))
+    enter_button = _find_enter_painting_button(image)
+    if enter_button is not None:
+        candidates.append((enter_button[0], enter_button[1], "enter painting button"))
     banner = _find_finish_ready_banner(image)
     if banner is not None:
         candidates.append((banner[0], banner[1], "finish ready banner"))
@@ -2180,6 +2250,60 @@ def _find_finish_drawing_signal(image: np.ndarray) -> tuple[float, Rect, str] | 
 
 
 def _find_finish_drawing_button(image: np.ndarray) -> tuple[float, Rect] | None:
+    return _find_blue_action_button(image, ("完成绘制",))
+
+
+def _find_enter_painting_button(image: np.ndarray) -> tuple[float, Rect] | None:
+    return _find_blue_action_button(image, ("入画",)) or _find_raster_action_button(
+        image,
+        "enter_painting.png",
+    )
+
+
+def _find_raster_action_button(image: np.ndarray, filename: str) -> tuple[float, Rect] | None:
+    template = _load_current_paint_template(filename)
+    if template is None or image.size == 0:
+        return None
+    height, width = image.shape[:2]
+    roi_rect = _bounded_rect(width * 0.45, height * 0.55, width * 0.50, height * 0.38, width, height)
+    roi = image[roi_rect.y : roi_rect.bottom, roi_rect.x : roi_rect.right]
+    if roi.size == 0:
+        return None
+    best: tuple[float, tuple[int, int], tuple[int, int]] | None = None
+    for scale in (0.82, 0.91, 1.0, 1.10, 1.20):
+        candidate = template if scale == 1.0 else cv2.resize(
+            template,
+            None,
+            fx=scale,
+            fy=scale,
+            interpolation=cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC,
+        )
+        if candidate.shape[0] > roi.shape[0] or candidate.shape[1] > roi.shape[1]:
+            continue
+        result = cv2.matchTemplate(roi, candidate, cv2.TM_CCOEFF_NORMED)
+        _, max_value, _, max_location = cv2.minMaxLoc(result)
+        matched = (float(max_value), max_location, (candidate.shape[1], candidate.shape[0]))
+        if best is None or matched[0] > best[0]:
+            best = matched
+    if best is None or best[0] < 0.78:
+        return None
+    score, (match_x, match_y), (match_width, match_height) = best
+    center_x = roi_rect.x + match_x + match_width / 2.0
+    center_y = roi_rect.y + match_y + match_height / 2.0
+    button_width = max(width * 0.14, match_width * 4.8)
+    button_height = max(height * 0.05, match_height * 2.1)
+    button_rect = _bounded_rect(
+        center_x - button_width / 2.0,
+        center_y - button_height / 2.0,
+        button_width,
+        button_height,
+        width,
+        height,
+    )
+    return score, button_rect
+
+
+def _find_blue_action_button(image: np.ndarray, keywords: tuple[str, ...]) -> tuple[float, Rect] | None:
     height, width = image.shape[:2]
     # Settlement UI places a large blue button in the lower-right half, but
     # other blue buttons exist. Require the red/orange "完成绘制" text too.
@@ -2213,7 +2337,7 @@ def _find_finish_drawing_button(image: np.ndarray) -> tuple[float, Rect] | None:
             continue
         button_rect = _bounded_rect(roi_rect.x + x, roi_rect.y + y, w_box, h_box, width, height)
         crop = image[button_rect.y : button_rect.bottom, button_rect.x : button_rect.right]
-        confidence = _finish_drawing_button_confidence(crop, area / roi_area, aspect)
+        confidence = _finish_drawing_button_confidence(crop, area / roi_area, aspect, keywords)
         if confidence >= 0.62:
             candidates.append((confidence, button_rect))
     if not candidates:
@@ -2293,7 +2417,12 @@ def _finish_ready_banner_confidence(crop: np.ndarray, area_ratio: float, aspect:
     )
 
 
-def _finish_drawing_button_confidence(crop: np.ndarray, area_ratio: float, aspect: float) -> float:
+def _finish_drawing_button_confidence(
+    crop: np.ndarray,
+    area_ratio: float,
+    aspect: float,
+    keywords: tuple[str, ...] = ("完成绘制",),
+) -> float:
     if crop.size == 0:
         return 0.0
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
@@ -2303,7 +2432,7 @@ def _finish_drawing_button_confidence(crop: np.ndarray, area_ratio: float, aspec
     blue_ratio = float(np.mean((h >= 88) & (h <= 112) & (s > 45) & (v > 115)))
     red_text_ratio = float(np.mean((((h <= 12) | (h >= 170)) & (s > 55) & (v > 95))))
     bright_ratio = float(np.mean(v > 145))
-    keyword_score = _finish_button_keyword_score(crop)
+    keyword_score = _finish_button_keyword_score(crop, keywords)
     aspect_score = 1.0 - min(1.0, abs(aspect - 3.6) / 3.0)
     area_score = min(1.0, area_ratio / 0.08)
     if keyword_score < 0.40 or red_text_ratio < 0.010:
@@ -2322,7 +2451,7 @@ def _finish_drawing_button_confidence(crop: np.ndarray, area_ratio: float, aspec
     )
 
 
-def _finish_button_keyword_score(crop: np.ndarray) -> float:
+def _finish_button_keyword_score(crop: np.ndarray, keywords: tuple[str, ...] = ("完成绘制",)) -> float:
     if crop.size == 0:
         return 0.0
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
@@ -2335,13 +2464,13 @@ def _finish_button_keyword_score(crop: np.ndarray) -> float:
     text_crop = cv2.bitwise_and(crop, crop, mask=mask)
     scores = match_keywords(
         text_crop,
-        ("完成绘制",),
+        keywords,
         font_size_range=range(14, 34, 2),
         scale=2.0,
         include_binary=True,
         threshold=0.0,
     )
-    return scores.get("完成绘制", 0.0)
+    return max(scores.values(), default=0.0)
 
 
 def _finish_banner_keyword_score(crop: np.ndarray) -> float:
@@ -2399,17 +2528,27 @@ def _detect_brush_options_mode(image: np.ndarray, x0: int, board_rect: Rect, pan
     roi = image[roi_rect.y : roi_rect.bottom, roi_rect.x : roi_rect.right]
     if roi.size == 0:
         return False
+    # Real brush pages contain two wide horizontal cards. Keyword scores alone
+    # are unsafe here: backpack art and the large pending-paint panel can both
+    # weakly match brush words and previously entered the wrong phase.
+    return _has_brush_card_layout(roi)
 
-    scores = _brush_stage1_scores(_brush_stage1_crop(roi))
-    pattern_scores = _brush_card_pattern_scores(roi)
-    for brush_type, score in pattern_scores.items():
-        scores[brush_type] = max(scores.get(brush_type, 0.0), score)
-    ranked = sorted(scores.values(), reverse=True)
-    strong_count = sum(1 for score in ranked if score >= 0.52)
-    # The first initial paint has backpack icons here; their texture can match
-    # brush words weakly. Only enter brush mode when two real stage-1 labels are
-    # present.
-    return len(ranked) >= 2 and strong_count >= 2 and ranked[1] >= 0.52
+
+def _has_brush_card_layout(crop: np.ndarray) -> bool:
+    if crop.size == 0:
+        return False
+    height, width = crop.shape[:2]
+    wide_cards = 0
+    for card in _split_brush_cards(crop):
+        card_height, card_width = card.shape[:2]
+        if not height * 0.12 <= card_height <= height * 0.62:
+            continue
+        if card_width < width * 0.50:
+            continue
+        if card_width / max(1, card_height) < 3.8:
+            continue
+        wide_cards += 1
+    return wide_cards >= 2
 
 
 def _candidate_board_rects(image: np.ndarray) -> list[Rect]:

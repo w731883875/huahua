@@ -648,6 +648,43 @@ def _flush_dwm() -> None:
         pass
 
 
+def _set_ctypes_signature(function, argtypes: tuple, restype) -> None:
+    try:
+        function.argtypes = argtypes
+        function.restype = restype
+    except (AttributeError, TypeError):
+        pass
+
+
+def _window_long_functions(user32):
+    get_window_long = getattr(user32, "GetWindowLongPtrW", None) or user32.GetWindowLongW
+    set_window_long = getattr(user32, "SetWindowLongPtrW", None) or user32.SetWindowLongW
+    _set_ctypes_signature(get_window_long, (wintypes.HWND, ctypes.c_int), ctypes.c_ssize_t)
+    _set_ctypes_signature(
+        set_window_long,
+        (wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t),
+        ctypes.c_ssize_t,
+    )
+    return get_window_long, set_window_long
+
+
+def _native_toplevel_hwnd(widget: tk.Misc, user32=None) -> int:
+    raw_hwnd = int(widget.winfo_id())
+    try:
+        native_user32 = user32 or ctypes.windll.user32
+        get_ancestor = native_user32.GetAncestor
+        _set_ctypes_signature(
+            get_ancestor,
+            (wintypes.HWND, wintypes.UINT),
+            wintypes.HWND,
+        )
+        GA_ROOT = 2
+        root_hwnd = int(get_ancestor(raw_hwnd, GA_ROOT) or 0)
+        return root_hwnd or raw_hwnd
+    except Exception:
+        return raw_hwnd
+
+
 def _make_clickthrough_widgets(widgets: Iterable[tk.Misc], wndprocs: dict[int, tuple[int, object]]) -> None:
     try:
         user32 = ctypes.windll.user32
@@ -664,12 +701,13 @@ def _make_clickthrough_widgets(widgets: Iterable[tk.Misc], wndprocs: dict[int, t
         SWP_NOZORDER = 0x0004
         SWP_FRAMECHANGED = 0x0020
 
-        get_window_long = getattr(user32, "GetWindowLongPtrW", user32.GetWindowLongW)
-        set_window_long = getattr(user32, "SetWindowLongPtrW", user32.SetWindowLongW)
-        get_window_long.restype = ctypes.c_ssize_t
-        set_window_long.restype = ctypes.c_ssize_t
+        get_window_long, set_window_long = _window_long_functions(user32)
         call_window_proc = user32.CallWindowProcW
-        call_window_proc.restype = ctypes.c_ssize_t
+        _set_ctypes_signature(
+            call_window_proc,
+            (ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM),
+            ctypes.c_ssize_t,
+        )
         wndproc_type = ctypes.WINFUNCTYPE(
             ctypes.c_ssize_t,
             wintypes.HWND,
@@ -678,8 +716,8 @@ def _make_clickthrough_widgets(widgets: Iterable[tk.Misc], wndprocs: dict[int, t
             wintypes.LPARAM,
         )
 
-        for widget in widgets:
-            hwnd = int(widget.winfo_id())
+        native_hwnds = dict.fromkeys(_native_toplevel_hwnd(widget, user32) for widget in widgets)
+        for hwnd in native_hwnds:
             style = get_window_long(hwnd, GWL_EXSTYLE)
             set_window_long(
                 hwnd,
@@ -695,7 +733,8 @@ def _make_clickthrough_widgets(widgets: Iterable[tk.Misc], wndprocs: dict[int, t
                     return call_window_proc(original, window_hwnd, msg, wparam, lparam)
 
                 callback = wndproc_type(transparent_proc)
-                set_window_long(hwnd, GWLP_WNDPROC, ctypes.cast(callback, ctypes.c_void_p).value)
+                callback_address = int(ctypes.cast(callback, ctypes.c_void_p).value or 0)
+                set_window_long(hwnd, GWLP_WNDPROC, callback_address)
                 wndprocs[hwnd] = (int(original_proc), callback)
             user32.SetWindowPos(
                 hwnd,
@@ -727,11 +766,8 @@ def _make_desktop_pet_window_clickthrough(window: tk.Toplevel, wndprocs: dict[in
         SWP_FRAMECHANGED = 0x0020
         LWA_COLORKEY = 0x00000001
 
-        hwnd = int(window.winfo_id())
-        get_window_long = getattr(user32, "GetWindowLongPtrW", user32.GetWindowLongW)
-        set_window_long = getattr(user32, "SetWindowLongPtrW", user32.SetWindowLongW)
-        get_window_long.restype = ctypes.c_ssize_t
-        set_window_long.restype = ctypes.c_ssize_t
+        hwnd = _native_toplevel_hwnd(window, user32)
+        get_window_long, set_window_long = _window_long_functions(user32)
         style = get_window_long(hwnd, GWL_EXSTYLE)
         set_window_long(
             hwnd,
@@ -750,7 +786,11 @@ def _make_desktop_pet_window_clickthrough(window: tk.Toplevel, wndprocs: dict[in
         user32.SetLayeredWindowAttributes(hwnd, colorref, 255, LWA_COLORKEY)
 
         call_window_proc = user32.CallWindowProcW
-        call_window_proc.restype = ctypes.c_ssize_t
+        _set_ctypes_signature(
+            call_window_proc,
+            (ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM),
+            ctypes.c_ssize_t,
+        )
         wndproc_type = ctypes.WINFUNCTYPE(
             ctypes.c_ssize_t,
             wintypes.HWND,
@@ -767,7 +807,8 @@ def _make_desktop_pet_window_clickthrough(window: tk.Toplevel, wndprocs: dict[in
                 return call_window_proc(original, window_hwnd, msg, wparam, lparam)
 
             callback = wndproc_type(transparent_proc)
-            set_window_long(hwnd, GWLP_WNDPROC, ctypes.cast(callback, ctypes.c_void_p).value)
+            callback_address = int(ctypes.cast(callback, ctypes.c_void_p).value or 0)
+            set_window_long(hwnd, GWLP_WNDPROC, callback_address)
             wndprocs[hwnd] = (int(original_proc), callback)
 
         user32.SetWindowPos(
@@ -798,11 +839,8 @@ def _make_desktop_pet_window_interactive(window: tk.Toplevel, wndprocs: dict[int
         SWP_FRAMECHANGED = 0x0020
         LWA_COLORKEY = 0x00000001
 
-        hwnd = int(window.winfo_id())
-        get_window_long = getattr(user32, "GetWindowLongPtrW", user32.GetWindowLongW)
-        set_window_long = getattr(user32, "SetWindowLongPtrW", user32.SetWindowLongW)
-        get_window_long.restype = ctypes.c_ssize_t
-        set_window_long.restype = ctypes.c_ssize_t
+        hwnd = _native_toplevel_hwnd(window, user32)
+        get_window_long, set_window_long = _window_long_functions(user32)
         style = get_window_long(hwnd, GWL_EXSTYLE)
         style |= WS_EX_LAYERED | WS_EX_TOOLWINDOW
         style &= ~WS_EX_TRANSPARENT
@@ -837,8 +875,7 @@ def _restore_window_procs(wndprocs: dict[int, tuple[int, object]]) -> None:
     try:
         user32 = ctypes.windll.user32
         GWLP_WNDPROC = -4
-        set_window_long = getattr(user32, "SetWindowLongPtrW", user32.SetWindowLongW)
-        set_window_long.restype = ctypes.c_ssize_t
+        _get_window_long, set_window_long = _window_long_functions(user32)
         for hwnd, (original_proc, _callback) in list(wndprocs.items()):
             try:
                 set_window_long(hwnd, GWLP_WNDPROC, original_proc)

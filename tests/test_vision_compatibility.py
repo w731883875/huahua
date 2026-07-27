@@ -7,6 +7,7 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 
+from huahua_assistant.capture import read_image
 from huahua_assistant.models import Rect, RegionKind, RegionObservation, TileState
 from huahua_assistant.vision import (
     _analyze_brush_options,
@@ -20,6 +21,8 @@ from huahua_assistant.vision import (
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+TEST_FIXTURE_ROOT = PROJECT_ROOT / "tests" / "fixtures"
+USER_SCREENSHOT_ROOT = PROJECT_ROOT / "jietu"
 
 
 def _fixture(name: str) -> np.ndarray:
@@ -27,6 +30,20 @@ def _fixture(name: str) -> np.ndarray:
     if image is None:
         raise AssertionError(f"missing tracked vision fixture: {name}")
     return image
+
+
+def _user_screenshot(name: str) -> np.ndarray:
+    path = USER_SCREENSHOT_ROOT / name
+    if not path.is_file():
+        raise AssertionError(f"missing tracked user screenshot: {name}")
+    return read_image(path)
+
+
+def _test_fixture(name: str) -> np.ndarray:
+    path = TEST_FIXTURE_ROOT / name
+    if not path.is_file():
+        raise AssertionError(f"missing tracked test fixture: {name}")
+    return read_image(path)
 
 
 class OpenCvCompatibilityTests(unittest.TestCase):
@@ -87,7 +104,7 @@ class OpenCvCompatibilityTests(unittest.TestCase):
         self.assertEqual((), observation.stage2_options)
 
     def test_tracked_full_frames_reject_desktop_and_keep_game_states(self) -> None:
-        desktop = analyze_scene(_fixture("capture.png"))
+        desktop = analyze_scene(_test_fixture("non_game_desktop.png"))
         active_game = analyze_scene(_fixture("capture_perf_write.png"))
         terminal_game_image = _fixture("capture_auto.png")
         terminal_game = analyze_scene(terminal_game_image)
@@ -98,6 +115,62 @@ class OpenCvCompatibilityTests(unittest.TestCase):
         self.assertEqual(36, len(active_game.board.tiles))
         self.assertIsNotNone(terminal_game)
         self.assertIsNotNone(_find_finish_drawing_signal(terminal_game_image))
+
+    def test_user_screenshots_cover_real_current_paint_directions(self) -> None:
+        cases = {
+            "初始和背包宝箱.png": "horizontal",
+            "其他.png": "adjacent",
+            "纵向.png": "vertical",
+            "斜对角.png": "diagonal",
+        }
+        for filename, expected in cases.items():
+            with self.subTest(filename=filename):
+                scene = analyze_scene(_user_screenshot(filename))
+                self.assertIsNotNone(scene)
+                self.assertIsNotNone(scene.current_paint)
+                self.assertEqual(expected, scene.current_paint.direction.value)
+
+    def test_user_stage1_screenshots_do_not_leak_stage2_affixes(self) -> None:
+        cases = {
+            "堆砌选择前.png": {"transform", "stack"},
+            "斜对角.png": {"stack", "spread"},
+        }
+        for filename, expected in cases.items():
+            with self.subTest(filename=filename):
+                scene = analyze_scene(_user_screenshot(filename))
+                self.assertIsNotNone(scene)
+                self.assertIsNotNone(scene.brush_options)
+                self.assertEqual(expected, set(scene.brush_options.stage1_options))
+                self.assertEqual((), scene.brush_options.stage2_options)
+
+    def test_user_stage2_screenshots_keep_selected_brush_family(self) -> None:
+        cases = {
+            "转锋后选择前.png": "transform",
+            "堆砌后选择前.png": "stack",
+            "扩散后选择前.png": "spread",
+            "重新获取随机调色颜料之前.png": "transform",
+        }
+        for filename, expected in cases.items():
+            with self.subTest(filename=filename):
+                scene = analyze_scene(_user_screenshot(filename))
+                self.assertIsNotNone(scene)
+                self.assertIsNotNone(scene.brush_options)
+                self.assertEqual(expected, scene.brush_options.chosen_stage1)
+                self.assertEqual(2, len(scene.brush_options.stage2_options))
+
+    def test_pending_paint_panel_is_not_a_brush_page(self) -> None:
+        scene = analyze_scene(_user_screenshot("重新获取随机调色颜料之后.png"))
+
+        self.assertIsNotNone(scene)
+        self.assertIsNone(scene.brush_options)
+
+    def test_enter_painting_page_is_a_terminal_action(self) -> None:
+        image = _user_screenshot("结束--地块全部无空白和入画按钮.png")
+
+        signal = _find_finish_drawing_signal(image)
+
+        self.assertIsNotNone(signal)
+        self.assertEqual("enter painting button", signal[2])
 
 
 if __name__ == "__main__":

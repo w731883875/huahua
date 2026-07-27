@@ -10,6 +10,7 @@ from huahua_assistant.desktop_pet import (
     DesktopPetActor,
     _active_recommendation_target,
     _build_markers,
+    _native_toplevel_hwnd,
 )
 from huahua_assistant.guidance import RecommendationTarget, TargetKind
 from huahua_assistant.models import Rect
@@ -36,6 +37,18 @@ def _target(
 
 
 class PetLayoutTests(unittest.TestCase):
+    def test_tk_inner_handle_resolves_to_native_toplevel(self) -> None:
+        widget = SimpleNamespace(winfo_id=lambda: 123)
+        user32 = SimpleNamespace(GetAncestor=lambda hwnd, mode: 456 if (hwnd, mode) == (123, 2) else 0)
+
+        self.assertEqual(456, _native_toplevel_hwnd(widget, user32))
+
+    def test_native_toplevel_resolution_falls_back_to_widget_handle(self) -> None:
+        widget = SimpleNamespace(winfo_id=lambda: 123)
+        user32 = SimpleNamespace(GetAncestor=lambda _hwnd, _mode: 0)
+
+        self.assertEqual(123, _native_toplevel_hwnd(widget, user32))
+
     def test_prefers_above_and_never_covers_target(self) -> None:
         placement = choose_pet_guidance_placement(
             (960, 540),

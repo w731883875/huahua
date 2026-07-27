@@ -145,17 +145,38 @@ Next step:
 
 ## Task 5: Add Stable Game Phase And Recommendation Target Model
 
-Status: pending
+Status: completed
 
 Introduce explicit phases and a structured Top1 target with confidence, coordinates, source frame, stability/expiry metadata, and hysteresis so recognition changes cannot make the pet oscillate.
 
 Work performed:
 
+- Added `guidance.py` with explicit `WAITING`, `INITIAL_MAP`, `BRUSH_STAGE1`, `BRUSH_STAGE2`, `BACKPACK_SELECT`, `BOARD_PLACE`, `FINISH_READY`, and `UNSTABLE` phases plus documented legal transitions.
+- Added frame-based phase confirmation: phase and key evidence require two distinct frames; low-confidence/conflicting frames expose `UNSTABLE` without overwriting the last trusted phase, and illegal jumps are rejected.
+- Added the structured `RecommendationTarget` contract with target kind, screen point, priority, confidence, short reason, source frame, stable time, expiry time, and JSON-compatible serialization.
+- Added a target stabilizer requiring two distinct frames, at least 300ms, confidence >= 0.75, matching phase, and an unchanged window/capture/board context. Stable targets expire after two seconds, same-key coordinate jitter does not move them, and context changes invalidate them immediately.
+- Integrated phase evidence and Top1 proposal generation into `pet_brain.py` for board, backpack, brush stage 1/2, and finish targets. Existing immediate pet modes remain compatible; Task 5 only exposes stable target data and does not move the desktop-pet window.
+- Added deterministic frame IDs per snapshot object so repeated UI renders cannot masquerade as multiple capture frames.
+- Code commit: `4e42aa4 Add stable game phase and recommendation targets`.
+
 Validation evidence:
+
+- Full suite passed: 35 tests in 0.073 seconds.
+- Fifteen focused guidance/pet tests passed, covering two-frame confirmation, key-field stability, illegal transitions, low-confidence freeze/recovery, two-category finish evidence, 300ms target latency, expiry, context invalidation, same-key jitter suppression, serialization, and a two-snapshot `pet_brain` integration flow.
+- Strict environment validation passed on Python 3.12.10 with all 11 locked packages exact; encoding validation checked 58 text files successfully.
+- Core imports passed for the Tk app, desktop-pet patch, guidance controller, and recommendation target types.
+- Fixed-seed CLI simulation with brush and refresh recommendations exited 0.
+- `git diff --cached --check` passed, and the Task 5 commit contained only `guidance.py`, `pet_brain.py`, and their tests; pre-existing dirty files remained outside the commit.
 
 Remaining risk:
 
+- Live capture has not yet proven phase/target timing across real window movement, DPI changes, and brush/finish transitions; pure tests cover the intended contracts but visual/runtime evidence remains for later tasks.
+- `FINISH_READY` intentionally needs two independent evidence categories. If existing recognition only supplies one category in a real layout, the final visual audit must identify the missing signal instead of weakening the safety rule prematurely.
+- The desktop pet does not consume `RecommendationTarget` coordinates yet; that behavior is deliberately deferred until Task 7 after the Task 6 checkpoint.
+
 Next step:
+
+- Task 6: run the second major checkpoint across canonical data, phase legality, target stability, event consistency, UI integration risk, tests, build, and rollback.
 
 ## Task 6: Major Checkpoint 2
 

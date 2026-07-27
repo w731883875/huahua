@@ -21,6 +21,8 @@ RUNTIME_PACKAGES = (
 )
 
 REQUIRED_PROJECT_FILES = (
+    ".editorconfig",
+    ".gitattributes",
     "run_app.py",
     "requirements.txt",
     "requirements-lock.txt",

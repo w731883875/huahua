@@ -83,18 +83,18 @@ class FrameAssetTests(unittest.TestCase):
         """两个比例都是实机量出来的，不能退回「贴图尺寸相除」。
 
         早期按 ``128/200 = 0.64`` 推，错在两头：文件名 ``_128`` 只是逻辑尺寸
-        （实际贴图 256×256），框的 200 是含辉光的切图外接框。
-        真正错的是框没放大——素材有色环只占画布 0.845，实机里环撑满格子。
+        （实际贴图 256×256），框的 200 是切图外接框。
+        真正错的是**框没放大**——素材实心环只占画布 0.74，而实机里环贴着格子边。
         """
         self.assertGreater(paint_frame.FRAME_SCALE, 1.15, "框必须放大，否则相对看就是图标过大")
-        self.assertLess(paint_frame.FRAME_SCALE, 1.30)
-        self.assertGreater(paint_frame.ICON_SCALE, 0.55)
+        self.assertLess(paint_frame.FRAME_SCALE, 1.40)
+        self.assertGreater(paint_frame.ICON_SCALE, 0.50)
         self.assertLess(paint_frame.ICON_SCALE, 0.70)
-        # 合成出来的两个量要对上实机：图案/格子 ≈ 0.66、框/格子 ≈ 1.0
+        # 合成出来的两个量要分别对上实机，这是「还原游戏内设置」的硬判据
         art_of_cell = paint_frame.FRAME_SCALE * paint_frame.ICON_SCALE * paint_frame.ICON_ART_OF_CANVAS
-        self.assertAlmostEqual(0.66, art_of_cell, delta=0.04)
+        self.assertAlmostEqual(paint_frame.TARGET_ART_OF_CELL, art_of_cell, delta=0.02)
         frame_of_cell = paint_frame.FRAME_SCALE * paint_frame.FRAME_RING_OF_CANVAS
-        self.assertAlmostEqual(1.0, frame_of_cell, delta=0.06)
+        self.assertAlmostEqual(paint_frame.TARGET_FRAME_OF_CELL, frame_of_cell, delta=0.03)
 
     def test_backpack_and_board_share_one_shape_rule(self) -> None:
         """背包和地块用同一套形状规则：怪物圆形、玩法菱形，不按场景区分。"""

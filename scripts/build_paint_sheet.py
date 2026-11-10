@@ -291,8 +291,13 @@ def _render_html(rows: list[dict], specials: list[dict] | None = None) -> str:
   <b>两处形状规则相同</b>：<b style="color:var(--monster)">怪物 = 圆形</b>、
   <b style="color:var(--gameplay)">玩法 = 菱形</b>。
   框的颜色按等级固定：白绿蓝紫橙红彩 = Lv1~Lv7。
-  <b>图标按原生尺寸比 0.64 缩放</b>（图标 <code>_128</code> ÷ 品质框 ≈200），
-  不是铺满框——之前画成 1.0 所以显得过大。
+  <b>尺寸按实机截图标定</b>：框 {paint_frame.FRAME_SCALE:g}×、图标 {paint_frame.ICON_SCALE:g}×
+  （相对框画布）。框素材四周是渐隐辉光，实心彩色环只占画布七成多，
+  而实机里环几乎贴着格子边，所以<b>框必须放大</b>——框画小了，图案相对就显得过满，
+  这才是之前「图标很大」的根因。合成后图案占格子
+  {paint_frame.FRAME_SCALE * paint_frame.ICON_SCALE * paint_frame.ICON_ART_OF_CANVAS:.2f}
+  （实机 0.66），与实机格子像素显著区 IoU 中位 0.82。
+  早期按「贴图 128 ÷ 框 200 = 0.64」推错过：<code>_128</code> 只是逻辑尺寸（贴图实际 256×256）。
   图标来自 PAK 解包（<code>UI_S8Gameplay_Color*_128</code>），框来自 S8 图集切片，均未从网页下载。
   共 {len(rows)} 个家族；赛季只有 Lv3/Lv4，黑潮~玩偶只有 Lv3~Lv7，缺的等级显示「—」。
 </p>

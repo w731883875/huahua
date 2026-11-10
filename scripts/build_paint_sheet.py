@@ -104,20 +104,21 @@ def _paste_center(canvas: np.ndarray, image: np.ndarray, ratio: float) -> np.nda
 
 
 def compose(icon_path: Path, frame_path: Path) -> np.ndarray:
-    """图标与框都按实机比例画：框 :data:`paint_frame.FRAME_SCALE`、图标再乘 ``ICON_SCALE``。
+    """图标与框都按**官方逻辑尺寸**画：框 = 一个逻辑格、图标 = ``ICON_SCALE`` 个逻辑格。
 
-    合成参数是从实机截图量出来的（见 :mod:`huahua_assistant.paint_frame` 文档）：
-    框要放大到 1.234 才和游戏里一样大，图标相对框 0.62。
-    框放大后会超出画布，居中裁掉——实机的框外沿也是切在格子边上的。
+    比例来自 ``S8Paint.uexp`` 的 SizeBox：框 192、图标 128（见 :mod:`huahua_assistant.paint_frame`）。
+    框素材的画布带辉光留白（198~233），所以按**该素材自己的画布**换算，
+    让画布恰好铺满一个逻辑格——不按画布大小做额外放大。
     """
     icon = _rgba(_read(icon_path))
     frame = _rgba(_read(frame_path))
-    frame_layer = _paste_center(np.zeros((SIZE, SIZE, 4), np.uint8), frame, paint_frame.FRAME_SCALE)
-    icon_layer = _paste_center(
-        np.zeros((SIZE, SIZE, 4), np.uint8),
-        icon,
-        paint_frame.FRAME_SCALE * paint_frame.ICON_SCALE,
-    )
+    canvas = max(frame.shape[:2])
+    # 框：画布 -> 一个逻辑格
+    frame_ratio = paint_frame.FRAME_LOGICAL / float(canvas)
+    # 图标：128 逻辑像素
+    icon_ratio = paint_frame.ICON_LOGICAL / float(canvas)
+    frame_layer = _paste_center(np.zeros((SIZE, SIZE, 4), np.uint8), frame, frame_ratio)
+    icon_layer = _paste_center(np.zeros((SIZE, SIZE, 4), np.uint8), icon, icon_ratio)
     return _over(icon_layer, frame_layer)
 
 
@@ -291,13 +292,11 @@ def _render_html(rows: list[dict], specials: list[dict] | None = None) -> str:
   <b>两处形状规则相同</b>：<b style="color:var(--monster)">怪物 = 圆形</b>、
   <b style="color:var(--gameplay)">玩法 = 菱形</b>。
   框的颜色按等级固定：白绿蓝紫橙红彩 = Lv1~Lv7。
-  <b>尺寸按实机截图标定</b>：框 {paint_frame.FRAME_SCALE:g}×、图标 {paint_frame.ICON_SCALE:g}×
-  （相对框画布）。框素材四周是渐隐辉光，实心彩色环只占画布七成多，
-  而实机里环几乎贴着格子边，所以<b>框必须放大</b>——框画小了，图案相对就显得过满，
-  这才是之前「图标很大」的根因。合成后图案占格子
-  {paint_frame.FRAME_SCALE * paint_frame.ICON_SCALE * paint_frame.ICON_ART_OF_CANVAS:.2f}
-  （实机 0.66），与实机格子像素显著区 IoU 中位 0.82。
-  早期按「贴图 128 ÷ 框 200 = 0.64」推错过：<code>_128</code> 只是逻辑尺寸（贴图实际 256×256）。
+  <b>尺寸取解包出来的官方设置</b>：UI 蓝图 <code>S8Paint.uexp</code> 里，
+  品质框 SizeBox <b>{paint_frame.FRAME_LOGICAL}</b>、图标 SizeBox <b>{paint_frame.ICON_LOGICAL}</b>，
+  图标 ÷ 框 = <b>{paint_frame.ICON_SCALE:.4f}</b>。
+  框素材画布带辉光留白（198~233），按各素材自己的画布换算成一个逻辑格。
+  早期从截图反推的「框要放大 1.30 倍」是错的——把实心环和含辉光外沿搞混了。
   图标来自 PAK 解包（<code>UI_S8Gameplay_Color*_128</code>），框来自 S8 图集切片，均未从网页下载。
   共 {len(rows)} 个家族；赛季只有 Lv3/Lv4，黑潮~玩偶只有 Lv3~Lv7，缺的等级显示「—」。
 </p>

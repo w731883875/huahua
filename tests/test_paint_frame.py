@@ -79,22 +79,22 @@ class FrameAssetTests(unittest.TestCase):
         self.assertEqual({"monster": "circle", "gameplay": "diamond"}, paint_frame.SHAPE_OF_CATEGORY)
         self.assertEqual({"circle": "monster", "diamond": "gameplay"}, paint_frame.CATEGORY_OF_SHAPE)
 
-    def test_scale_comes_from_the_real_match_not_from_texture_sizes(self) -> None:
-        """两个比例都是实机量出来的，不能退回「贴图尺寸相除」。
+    def test_scale_comes_from_official_ui_blueprint_sizes(self) -> None:
+        """比例取自解包出来的 UI 蓝图，不再从截图反推。
 
-        早期按 ``128/200 = 0.64`` 推，错在两头：文件名 ``_128`` 只是逻辑尺寸
-        （实际贴图 256×256），框的 200 是切图外接框。
-        真正错的是**框没放大**——素材实心环只占画布 0.74，而实机里环贴着格子边。
+        ``S8Paint.uexp`` 里品质框 SizeBox = 192、图标 SizeBox = 128，
+        两者之比 0.6667 就是图标相对框的比例。
+
+        早期两次推导都错：按 ``128/200 = 0.64``（``_128`` 只是逻辑尺寸，
+        贴图实际 256×256）；后来「框要放大 1.30 倍」更是把素材的实心环
+        （占画布 0.74）当成了视觉外沿（含辉光，接近画布边）。
         """
-        self.assertGreater(paint_frame.FRAME_SCALE, 1.15, "框必须放大，否则相对看就是图标过大")
-        self.assertLess(paint_frame.FRAME_SCALE, 1.40)
-        self.assertGreater(paint_frame.ICON_SCALE, 0.50)
-        self.assertLess(paint_frame.ICON_SCALE, 0.70)
-        # 合成出来的两个量要分别对上实机，这是「还原游戏内设置」的硬判据
-        art_of_cell = paint_frame.FRAME_SCALE * paint_frame.ICON_SCALE * paint_frame.ICON_ART_OF_CANVAS
-        self.assertAlmostEqual(paint_frame.TARGET_ART_OF_CELL, art_of_cell, delta=0.02)
-        frame_of_cell = paint_frame.FRAME_SCALE * paint_frame.FRAME_RING_OF_CANVAS
-        self.assertAlmostEqual(paint_frame.TARGET_FRAME_OF_CELL, frame_of_cell, delta=0.03)
+        self.assertEqual(192, paint_frame.FRAME_LOGICAL)
+        self.assertEqual(128, paint_frame.ICON_LOGICAL)
+        self.assertAlmostEqual(128 / 192, paint_frame.ICON_SCALE, places=4)
+        # 框素材画布带辉光留白（198~233），逻辑格 192 比它小，所以是**缩小**
+        self.assertLess(paint_frame.FRAME_SCALE, 1.0, "框素材画布含辉光留白，应缩到一格之内")
+        self.assertGreater(paint_frame.FRAME_SCALE, 0.75)
 
     def test_backpack_and_board_share_one_shape_rule(self) -> None:
         """背包和地块用同一套形状规则：怪物圆形、玩法菱形，不按场景区分。"""

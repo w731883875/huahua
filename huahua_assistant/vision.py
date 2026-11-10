@@ -3,6 +3,9 @@ from __future__ import annotations
 from dataclasses import replace
 from functools import lru_cache
 from pathlib import Path
+from difflib import SequenceMatcher
+import re
+import time
 
 import cv2
 import numpy as np
@@ -10,6 +13,15 @@ import numpy as np
 from .capture import write_image
 from .game_model import BRUSH_TYPE_ORDER, BrushType, build_affix_catalog
 from .keyword_match import match_keywords
+from .layout import ScreenLayout, load_layout
+from . import frame_level
+from . import brush_panel
+from . import paint_frame
+from . import paint_icon
+from . import paint_kind
+from . import paint_panel
+from . import presence
+from . import tile_reader
 from .models import (
     BackpackObservation,
     BackpackPaintObservation,
@@ -26,11 +38,16 @@ from .models import (
     TileObservation,
     TileState,
 )
+from .windows_ocr import recognize_chinese_lines_async, warm_windows_ocr_async
 
 
 BOARD_SIZE = 6
 MIN_CAPTURE_SIDE = 320
 MIN_BOARD_DETECTION_SCORE = 0.70
+#: 银框兜底时，角标的最高等级分要比 Lv1 高出这么多才敢翻案。
+#: 实测：真 Lv1 的 Lv1 分 1.00、次高 0.84（差 -0.15）；Lv7 宝箱的 Lv1 只有 0.73、
+#: Lv7 有 0.91~0.94（差 +0.15~+0.21）。取 0.10 两边都留了余量。
+SILVER_LABEL_MARGIN = 0.10
 CURRENT_PAINT_TEMPLATE_DIR = Path(__file__).resolve().parent / "assets" / "current_paint"
 CURRENT_DIRECTION_TEMPLATE_FILES = {
     "横向": "direction_horizontal.png",
@@ -63,6 +80,20 @@ BRUSH_STAGE2_TEXT_RECTS = (
 )
 
 
+def _warm_numpy_median() -> None:
+    """预加载 ``numpy.ma``，避免首次 ``np.median`` 落在实时路径上。
+
+    ``np.median`` 在 numpy 里是懒加载入口：第一次调用才会 import ``numpy.ma``，
+    实测 0.048s。实时首帧预算只有 0.20s，这一下就能占掉四分之一。模块加载阶段
+    一次性付掉，之后刷色板色相、背包格子间距等处的 ``np.median`` 都走热路径。
+    """
+
+    np.median(np.zeros(2, dtype=np.float64))
+
+
+_warm_numpy_median()
+
+
 class VisionTracker:
     def __init__(self) -> None:
         self.board_rect: Rect | None = None
@@ -76,7 +107,21 @@ class VisionTracker:
         return scene
 
     def analyze_quick(self, image: np.ndarray) -> SceneObservation | None:
-        scene = analyze_scene_quick(image, previous_scene=self.last_scene, previous_board_rect=self.board_rect)
+        previous_scene = self.last_scene
+        scene = analyze_scene_quick(
+            image,
+            previous_scene=previous_scene,
+            previous_board_rect=self.board_rect,
+        )
+        if (
+            scene is not None
+            and scene.current_paint is None
+            and scene.backpack is not None
+            and len(scene.backpack.paints) >= 5
+        ):
+            recovered = analyze_scene_realtime(image)
+            if recovered is not None and recovered.current_paint is not None:
+                scene = recovered
         if scene is not None:
             self.board_rect = scene.board.rect
             self.last_scene = scene
@@ -103,11 +148,19 @@ def analyze_frame(image: np.ndarray) -> BoardObservation | None:
     return scene.board if scene is not None else None
 
 
-def analyze_scene(image: np.ndarray, previous_board_rect: Rect | None = None) -> SceneObservation | None:
+def analyze_scene(
+    image: np.ndarray,
+    previous_board_rect: Rect | None = None,
+    *,
+    icon_fallback: bool = True,
+) -> SceneObservation | None:
+    """单张截图分析（离线/冷启动）。默认开官方图标兜底，见 ``_classify_tiles``。"""
     if not _is_supported_scene_image(image):
         return None
     if previous_board_rect is not None:
-        scene = _analyze_scene_from_board_rect(image, previous_board_rect, fast=True)
+        scene = _analyze_scene_from_board_rect(
+            image, previous_board_rect, fast=True, icon_fallback=icon_fallback
+        )
         # A wrong-but-grid-like candidate can score well if it lands on the
         # backpack/debug grid. Only reuse the tracked board when it is still a
         # strong match; otherwise do a full search and recover.
@@ -117,8 +170,15 @@ def analyze_scene(image: np.ndarray, previous_board_rect: Rect | None = None) ->
     layout_best = _best_estimated_board_layout(image)
     if layout_best is not None:
         refined_layout, layout_score = layout_best
-        if layout_score >= 0.72:
-            return _analyze_scene_from_board_rect(image, refined_layout, fast=False)
+        # 布局候选是「按 UI 版式推算」出来的，比全搜索的纯边缘匹配可靠得多。
+        # 但边缘分数会随分辨率掉：2K 下同一块棋盘 layout 只有 0.712、全搜索更是
+        # 掉到 0.64，两个门槛都过不去，直接判「无棋盘」。所以 layout 这条路单独
+        # 放宽到 0.68，同时要求尺寸先验过关，避免又把「棋盘内部一圈」的小框放进来。
+        layout_size_ok = _board_size_score(image.shape, refined_layout) >= 0.85
+        if layout_score >= 0.68 and layout_size_ok:
+            return _analyze_scene_from_board_rect(
+                image, refined_layout, fast=False, icon_fallback=icon_fallback
+            )
 
     rects = _candidate_board_rects(image)
     best: tuple[float, Rect] | None = None
@@ -131,7 +191,7 @@ def analyze_scene(image: np.ndarray, previous_board_rect: Rect | None = None) ->
         return None
 
     rect = _choose_board_rect(image, best[1], best[0])
-    return _analyze_scene_from_board_rect(image, rect, fast=False)
+    return _analyze_scene_from_board_rect(image, rect, fast=False, icon_fallback=icon_fallback)
 
 
 def _choose_board_rect(image: np.ndarray, best_rect: Rect, best_score: float) -> Rect:
@@ -168,7 +228,17 @@ def analyze_scene_quick(
     rect = previous_scene.board.rect if previous_scene is not None else previous_board_rect
     if rect is None:
         return analyze_scene_realtime(image)
-    scene = _analyze_scene_from_board_rect(image, rect, fast=True, quick=True, previous_scene=previous_scene)
+    if previous_scene is not None and not _tracked_board_visual_guard(image, rect, previous_scene.board):
+        return None
+    cached_board_score = previous_scene.board.score if previous_scene is not None else None
+    scene = _analyze_scene_from_board_rect(
+        image,
+        rect,
+        fast=True,
+        quick=True,
+        previous_scene=previous_scene,
+        board_score=cached_board_score,
+    )
     if scene is not None and scene.board.score >= MIN_BOARD_DETECTION_SCORE:
         return scene
     return None
@@ -179,24 +249,46 @@ def analyze_scene_realtime(
     previous_scene: SceneObservation | None = None,
     previous_board_rect: Rect | None = None,
 ) -> SceneObservation | None:
-    """Low-latency scene analysis for the interactive capture path."""
+    """Low-latency scene analysis for the interactive capture path.
+
+    棋盘位置由布局直接算出（``layout.py``），不再每帧做多候选搜索；
+    "这块区域是不是棋盘"先用 6x6 网格线判断（内容无关、约 5ms），
+    再用梯度模板兜底（``presence.py``）。比整块评分便宜一个数量级。
+    """
 
     if not _is_supported_scene_image(image):
         return None
     height, width = image.shape[:2]
-    side = int(round(min(width, height) * 0.594))
-    active_rect = Rect(int(round(width * 0.187)), int(round(height * 0.256)), side, side)
-    start_rect = Rect(int(round(width * 0.354)), int(round(height * 0.256)), side, side)
-    tracked_rect = previous_scene.board.rect if previous_scene is not None else previous_board_rect
-    # The active layout is by far the common case. Score it once and return
-    # immediately when strong; this keeps waiting -> active transitions below
-    # the 0.5-second update budget.
-    active_score = _score_board_rect(image, active_rect)
-    if active_score >= MIN_BOARD_DETECTION_SCORE:
-        rect = active_rect
-    else:
-        start_score = _score_board_rect(image, start_rect)
+    screen = _screen_layout()
+
+    active_rect = _pick_board_rect(image, screen, width, height, drawing=True)
+    if active_rect is not None:
+        board_score = _score_board_rect(image, active_rect)
+        tracked = previous_scene.board.rect if previous_scene is not None else previous_board_rect
+        if board_score < MIN_BOARD_DETECTION_SCORE:
+            # 布局可信但分数偏低：只有上一帧就在跟踪同一块棋盘时才继续。
+            if tracked is None or not _rect_is_near(tracked, active_rect):
+                return None
+            board_score = max(board_score, previous_scene.board.score if previous_scene is not None else 0.0)
+            if board_score < MIN_BOARD_DETECTION_SCORE:
+                return None
+        scene = _analyze_scene_from_board_rect(
+            image,
+            active_rect,
+            fast=True,
+            quick=True,
+            previous_scene=previous_scene,
+            board_score=board_score,
+        )
+        if scene is not None and scene.board.score >= MIN_BOARD_DETECTION_SCORE:
+            return scene
+        return None
+
+    # 等待开画时棋盘居中，先看这个布局；都不像就看上一帧跟踪到的位置。
+    start_rect = _pick_board_rect(image, screen, width, height, drawing=False)
+    if start_rect is not None:
         start_button = _find_start_drawing_button_fast(image)
+        start_score = _score_board_rect(image, start_rect)
         # The centered waiting layout receives a lower position prior than the
         # active left layout. The independently detected action button keeps
         # this relaxed threshold specific to the waiting scene.
@@ -209,25 +301,99 @@ def analyze_scene_realtime(
                 board_score=start_score,
             )
 
-        if tracked_rect is None or _rect_is_near(tracked_rect, active_rect) or _rect_is_near(tracked_rect, start_rect):
-            return None
-        tracked_score = _score_board_rect(image, tracked_rect)
-        if tracked_score < MIN_BOARD_DETECTION_SCORE:
-            return None
-        rect = tracked_rect
+    tracked = previous_scene.board.rect if previous_scene is not None else previous_board_rect
+    if tracked is None:
+        return None
+    if any(_rect_is_near(tracked, rect) for rect in screen.candidates(width, height, drawing=True)):
+        return None
+    if any(_rect_is_near(tracked, rect) for rect in screen.candidates(width, height, drawing=False)):
+        return None
+    if not _board_present(image, tracked, screen):
+        return None
+    tracked_score = _score_board_rect(image, tracked)
+    if tracked_score < MIN_BOARD_DETECTION_SCORE:
+        return None
     scene = _analyze_scene_from_board_rect(
         image,
-        rect,
+        tracked,
         fast=True,
         quick=True,
         previous_scene=previous_scene,
-        board_score=active_score if _rect_is_near(rect, active_rect) else tracked_score,
+        board_score=tracked_score,
     )
     if scene is not None and scene.board.score >= MIN_BOARD_DETECTION_SCORE:
         return scene
     # Realtime capture must reject non-drawing game screens immediately. A
     # full-frame fallback can find incidental 6x6-like UI and take many seconds.
     return None
+
+
+GRID_PRESENCE_SCORE = 0.55
+
+
+def _pick_board_rect(
+    image: np.ndarray,
+    screen: ScreenLayout,
+    width: int,
+    height: int,
+    *,
+    drawing: bool,
+) -> Rect | None:
+    """在布局给出的少数候选里挑一个网格线成立的；都立不住就返回 None。
+
+    实机 11 张截图：棋盘区网格分 0.573~0.673，其他区域最高 0.504。
+    """
+    best: tuple[Rect | None, float] = (None, 0.0)
+    for rect in screen.candidates(width, height, drawing=drawing):
+        score = _board_grid_score(image, rect, outer_penalty=False)
+        if score >= GRID_PRESENCE_SCORE:
+            return rect
+        if score > best[1]:
+            best = (rect, score)
+    if best[0] is None:
+        return None
+    present, _ = presence.is_drawing_screen(
+        image, screen.presence_rect(best[0]), template=_presence_template()
+    )
+    return best[0] if present else None
+
+
+def _board_present(image: np.ndarray, rect: Rect, screen: ScreenLayout) -> bool:
+    """这块区域像不像棋盘：先看 6x6 网格线（内容无关），再用梯度模板兜底。"""
+    if _board_grid_score(image, rect) >= GRID_PRESENCE_SCORE:
+        return True
+    present, _ = presence.is_drawing_screen(
+        image, screen.presence_rect(rect), template=_presence_template()
+    )
+    return present
+
+
+_LAYOUT_CACHE: ScreenLayout | None = None
+_PRESENCE_LOADED = False
+_PRESENCE_TEMPLATE: np.ndarray | None = None
+
+
+def _screen_layout() -> ScreenLayout:
+    global _LAYOUT_CACHE
+    if _LAYOUT_CACHE is None:
+        _LAYOUT_CACHE = load_layout()
+    return _LAYOUT_CACHE
+
+
+def _presence_template() -> np.ndarray | None:
+    global _PRESENCE_LOADED, _PRESENCE_TEMPLATE
+    if not _PRESENCE_LOADED:
+        _PRESENCE_TEMPLATE = presence.load_template()
+        _PRESENCE_LOADED = True
+    return _PRESENCE_TEMPLATE
+
+
+def reset_vision_caches() -> None:
+    """布局文件或模板被替换后调用，让下一次识别重新读取。"""
+    global _LAYOUT_CACHE, _PRESENCE_LOADED, _PRESENCE_TEMPLATE
+    _LAYOUT_CACHE = None
+    _PRESENCE_LOADED = False
+    _PRESENCE_TEMPLATE = None
 
 
 def _rect_is_near(first: Rect, second: Rect) -> bool:
@@ -237,6 +403,49 @@ def _rect_is_near(first: Rect, second: Rect) -> bool:
         and abs(first.y - second.y) <= tolerance
         and abs(first.w - second.w) <= tolerance
     )
+
+
+def _median(values: list[float]) -> float:
+    """36 元素级别的小数组中位数，比 ``np.median`` 快一个数量级。
+
+    ``np.median`` 每次调用要过一层 numpy 调度，在 36 个元素上开销远大于计算本身
+    （实测 0.06ms vs 0.002ms）。它还只在首次调用时才懒加载 ``numpy.ma``（0.048s），
+    若落在首帧实时路径上会直接吃掉整个增量预算，因此热路径一律走这里。
+    """
+
+    ordered = sorted(values)
+    count = len(ordered)
+    middle = count // 2
+    if count % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2.0
+
+
+def _tracked_board_visual_guard(
+    image: np.ndarray,
+    rect: Rect,
+    previous_board: BoardObservation,
+) -> bool:
+    """Reject a vanished board using 4x4 cell signatures instead of a full board rescore."""
+
+    differences: list[float] = []
+    cell_w = rect.w / BOARD_SIZE
+    cell_h = rect.h / BOARD_SIZE
+    for tile in previous_board.tiles:
+        previous_signature = _tile_signature_from_features(tile.features)
+        if previous_signature is None:
+            continue
+        x1 = round(rect.x + tile.col * cell_w)
+        y1 = round(rect.y + tile.row * cell_h)
+        x2 = round(rect.x + (tile.col + 1) * cell_w)
+        y2 = round(rect.y + (tile.row + 1) * cell_h)
+        current_signature = _tile_visual_signature(image[y1:y2, x1:x2])
+        differences.append(
+            float(np.mean(np.abs(np.asarray(current_signature) - np.asarray(previous_signature))))
+        )
+    if len(differences) < BOARD_SIZE:
+        return True
+    return _median(differences) <= 0.26
 
 
 def _analyze_start_drawing_scene(
@@ -289,6 +498,7 @@ def _analyze_scene_from_board_rect(
     quick: bool = False,
     previous_scene: SceneObservation | None = None,
     board_score: float | None = None,
+    icon_fallback: bool = False,
 ) -> SceneObservation | None:
     if not fast:
         rect = _refine_board_rect(image, rect)
@@ -299,7 +509,7 @@ def _analyze_scene_from_board_rect(
     tiles = tuple(
         _classify_tiles_quick(image, rect, previous_scene.board)
         if quick and previous_scene is not None
-        else _classify_tiles(image, rect)
+        else _classify_tiles(image, rect, icon_fallback=icon_fallback)
     )
     board = BoardObservation(rect=rect, score=score, tiles=tiles)
     regions = tuple(_estimate_regions_fast(image, board) if quick else _estimate_regions(image, board))
@@ -309,9 +519,14 @@ def _analyze_scene_from_board_rect(
         current_paint = _correct_current_paint_from_scope(current_paint, tiles)
         board = _sync_single_anchor_tile_from_current_paint(board, current_paint)
         backpack = _analyze_backpack_fast(image, regions, previous_scene.backpack if previous_scene is not None else None)
+        current_paint = _correct_current_target_from_backpack(current_paint, backpack)
         brush_region = next((item for item in regions if item.kind == RegionKind.BRUSH_OPTIONS), None)
         brush_options = (
-            _analyze_brush_options_realtime(image, regions)
+            _analyze_brush_options_realtime(
+                image,
+                regions,
+                previous=previous_scene.brush_options if previous_scene is not None else None,
+            )
             if brush_region is not None
             else None
         )
@@ -326,14 +541,64 @@ def _analyze_scene_from_board_rect(
     current_paint = _correct_current_paint_from_board_anchor(image, current_paint, tiles)
     current_paint = _correct_current_paint_from_scope(current_paint, tiles)
     board = _sync_single_anchor_tile_from_current_paint(board, current_paint)
+    _learn_kind_from_scene(image, board, current_paint)
     brush_options = _analyze_brush_options(image, regions)
     backpack = _analyze_backpack(image, regions)
+    current_paint = _correct_current_target_from_backpack(current_paint, backpack)
     return SceneObservation(
         board=board,
         regions=regions,
         current_paint=current_paint,
         brush_options=brush_options,
         backpack=backpack,
+    )
+
+
+def _correct_current_target_from_backpack(
+    current_paint: CurrentPaintObservation | None,
+    backpack: BackpackObservation | None,
+) -> CurrentPaintObservation | None:
+    """用背包排序反推当前初始颜料的目标类别。
+
+    实机背包按当前初始颜料排序，所以靠前那批就是匹配颜料。但这个判据只在
+    **类别识别真的有把握**时才有意义：`_classify_backpack_frame_shape` 的
+    置信度下限是 0.64，实机 15 格常年全部读成 0.64（等于"我触发了，但几乎没证据"）。
+    那种情况下 5 格全是 GAMEPLAY 是识别退化，不是排序证据——照它纠正会把
+    怪物规则一律翻成玩法。所以这里要求 0.70 以上（明显高于下限）才采信。
+    """
+    if current_paint is None or backpack is None or len(backpack.paints) < 5:
+        return current_paint
+    # 目标类别已经由面板文字直接读出来了，就不要再让「背包前 5 格投票」翻案。
+    # 框形状分不出类别（背包 15 格外框全是菱形），这条旁证只在没读到文字时兜底。
+    if float(current_paint.keyword_scores.get("panel_text:target", 0.0)) >= 0.5:
+        return current_paint
+    leading = [
+        paint for paint in backpack.paints[:5] if paint.category_confidence >= 0.70
+    ]
+    if len(leading) < 4:
+        return current_paint
+    counts = {
+        category: sum(1 for paint in leading if paint.category == category)
+        for category in (PaintCategory.MONSTER, PaintCategory.GAMEPLAY)
+    }
+    category, count = max(counts.items(), key=lambda item: item[1])
+    if count < 4:
+        return current_paint
+    target = PaintObject.MONSTER if category == PaintCategory.MONSTER else PaintObject.GAMEPLAY
+    if current_paint.target_object == target:
+        return current_paint
+    evidence = sum(
+        paint.category_confidence
+        for paint in leading
+        if paint.category == category
+    ) / count
+    scores = dict(current_paint.keyword_scores)
+    scores[f"backpack_order:target:{target.value}"] = float(evidence)
+    return replace(
+        current_paint,
+        target_object=target,
+        keyword_scores=scores,
+        raw_text_hint=f"{current_paint.raw_text_hint} backpack-order-corrected",
     )
 
 
@@ -344,9 +609,38 @@ def _correct_current_paint_from_board_anchor(
 ) -> CurrentPaintObservation | None:
     if current_paint is None:
         return None
+    marked_tiles = [tile for tile in tiles if tile.is_current_anchor]
+    if len(marked_tiles) == 1:
+        anchor = marked_tiles[0]
+        if (
+            anchor.paint_category != PaintCategory.UNKNOWN
+            and anchor.paint_category_confidence >= 0.62
+            and anchor.paint_level is not None
+            and anchor.paint_level_confidence >= 0.62
+        ):
+            scores = dict(current_paint.keyword_scores)
+            scores[f"board_anchor:category:{anchor.paint_category.value}"] = float(
+                anchor.paint_category_confidence
+            )
+            return replace(
+                current_paint,
+                category=anchor.paint_category,
+                category_confidence=max(
+                    float(current_paint.category_confidence),
+                    float(anchor.paint_category_confidence),
+                ),
+                level=anchor.paint_level,
+                level_confidence=max(
+                    float(current_paint.level_confidence),
+                    float(anchor.paint_level_confidence),
+                ),
+                subtype=anchor.paint_subtype,
+                is_treasure=anchor.paint_is_treasure,
+                keyword_scores=scores,
+                raw_text_hint=f"{current_paint.raw_text_hint} board-anchor-corrected",
+            )
     if current_paint.category != PaintCategory.UNKNOWN and current_paint.category_confidence >= 0.58:
         return current_paint
-    marked_tiles = [tile for tile in tiles if tile.is_current_anchor]
     paint_tiles = marked_tiles or [tile for tile in tiles if tile.state == TileState.PAINT]
     if len(paint_tiles) != 1:
         return current_paint
@@ -403,6 +697,56 @@ def _correct_current_paint_from_scope(
         keyword_scores=scores,
         raw_text_hint=f"{current_paint.raw_text_hint} scope-corrected",
     )
+
+
+#: 运行时自学习的节流：同一个家族两次尝试之间至少隔这么久。
+#: 面板一换颜料就会重算一遍「面板图标 ↔ 36 格」的配对，36 次多尺度匹配约 30ms，
+#: 不能每帧都跑。
+KIND_LEARN_INTERVAL = 3.0
+
+#: 官方图标兜底给出的置信度。比模板命中（0.68~0.9）低一档：图标证明「画的是谁」，
+#: 但没经过本机渲染的像素对齐，所以不拿它去压等级/类别的其它证据。
+ICON_FALLBACK_CONFIDENCE = 0.72
+
+_KIND_LEARN_AT: dict[str, float] = {}
+
+
+def _learn_kind_from_scene(
+    image: np.ndarray,
+    board: BoardObservation,
+    current_paint: CurrentPaintObservation | None,
+) -> None:
+    """面板上读到家族名时，顺手把这个家族的图案收进模板库。
+
+    这是唯一能自动拿到「图案 ↔ 名字」对应关系的路子：解包资源里只有图标名
+    （``UI_S8Gameplay_ColorMonster2_128``），既没有图也没有名字对照表；
+    而右侧「当前颜料」面板同时渲染着图标和 ``怪物颜料·邪影LV3`` 这行字。
+
+    只在慢路径（冷启动 / 单张截图分析）里调用。凑不齐「分数够高 + 领先亚军够多」
+    就不学——一个错模板会持续污染这个家族。
+    """
+    if current_paint is None or not current_paint.subtype:
+        return
+    subtype = current_paint.subtype
+    if paint_kind.family_key(subtype) is None:
+        return
+    active = paint_kind.bank()
+    if len(active.templates.get(subtype, [])) >= paint_kind.MAX_TEMPLATES_PER_KIND:
+        return
+    now = time.monotonic()
+    if now - _KIND_LEARN_AT.get(subtype, 0.0) < KIND_LEARN_INTERVAL:
+        return
+    _KIND_LEARN_AT[subtype] = now
+    icon = current_paint.icon_rect
+    panel_icon = image[icon.y : icon.bottom, icon.x : icon.right]
+    if panel_icon.size == 0:
+        return
+    cells = [image[tile.rect.y : tile.rect.bottom, tile.rect.x : tile.rect.right] for tile in board.tiles]
+    if paint_kind.learn_from_panel(panel_icon, subtype, cells, active=active):
+        try:
+            active.save()
+        except OSError:
+            pass
 
 
 def _sync_single_anchor_tile_from_current_paint(
@@ -589,6 +933,59 @@ def analyze_and_save_debug(
     return scene, write_image(debug_path, debug)
 
 
+# 面板文字读到几个字段才算可信。低于这个值就走原来的字形模板路径。
+_PANEL_TEXT_MIN_CONFIDENCE = 0.55
+
+
+def _panel_text_overrides(reading: paint_panel.PanelReading | None) -> dict[str, object]:
+    """把「当前颜料」面板读到的字段整理成覆盖项，两条分析路径共用。"""
+    if reading is None or reading.confidence < _PANEL_TEXT_MIN_CONFIDENCE:
+        return {}
+    overrides: dict[str, object] = {}
+    if reading.category != PaintCategory.UNKNOWN:
+        overrides["category"] = reading.category
+        overrides["category_confidence"] = 0.88
+    if reading.subtype:
+        overrides["subtype"] = reading.subtype
+        # 官方配置里「玩法颜料-宝箱」就是宝箱玩法，7 级即通关目标。
+        overrides["is_treasure"] = reading.subtype == "宝箱"
+    if reading.level is not None:
+        overrides["level"] = reading.level
+        overrides["level_confidence"] = 0.90
+    if reading.target_object != PaintObject.UNKNOWN:
+        overrides["target_object"] = reading.target_object
+    if reading.direction != PaintDirection.UNKNOWN:
+        overrides["direction"] = reading.direction
+    if reading.upgrade_amount is not None:
+        overrides["upgrade_amount"] = reading.upgrade_amount
+    if reading.match_required is not None:
+        overrides["match_current"] = int(reading.match_current or 0)
+        overrides["match_required"] = int(reading.match_required)
+    return overrides
+
+
+def _current_paint_text_crop(image: np.ndarray, panel: Rect) -> np.ndarray:
+    """给 OCR 用的「当前颜料」文字区，比模板用的裁剪框更宽。
+
+    全屏时这个面板和棋盘顶部基本齐平，窗口化后它会往上挪一大截
+    （实测面板顶比棋盘顶还高 0.15h 以上）。原来只按 ``panel.y + 0.08h`` 取，
+    窗口化后就只剩「调色效果」那一行，OCR 读不出标题和目标，方向和
+    作用颜料全成 UNKNOWN。所以向上多留一截，宁可多读几行——
+    :func:`paint_panel.parse_lines` 从标题行开始解析，多余的行会被丢掉。
+    """
+    width = image.shape[1]
+    height = image.shape[0]
+    rect = _bounded_rect(
+        panel.x + panel.w * 0.02,
+        panel.y - panel.h * 1.20,
+        panel.w * 0.96,
+        panel.h * 2.20,
+        width,
+        height,
+    )
+    return image[rect.y : rect.bottom, rect.x : rect.right]
+
+
 def _analyze_current_paint(
     image: np.ndarray,
     regions: tuple[RegionObservation, ...],
@@ -629,6 +1026,28 @@ def _analyze_current_paint(
             match_current, match_required = 0, default_match_required
         if upgrade_amount is None:
             upgrade_amount = default_upgrade_amount
+
+    # 面板文字是最终真值：字形模板打分只当兜底。这里同步 OCR 一次（约 70~120ms），
+    # 只走冷启动 / 单张截图分析这条路，实时帧走下面的 _analyze_current_paint_fast。
+    panel_text = paint_panel.read_panel(_current_paint_text_crop(image, panel))
+    overrides = _panel_text_overrides(panel_text)
+    if overrides:
+        category = overrides.get("category", category)  # type: ignore[assignment]
+        category_confidence = overrides.get("category_confidence", category_confidence)  # type: ignore[assignment]
+        subtype = overrides.get("subtype", subtype)  # type: ignore[assignment]
+        is_treasure = overrides.get("is_treasure", is_treasure)  # type: ignore[assignment]
+        level = overrides.get("level", level)  # type: ignore[assignment]
+        level_confidence = overrides.get("level_confidence", level_confidence)  # type: ignore[assignment]
+        target_object = overrides.get("target_object", target_object)  # type: ignore[assignment]
+        direction = overrides.get("direction", direction)  # type: ignore[assignment]
+        upgrade_amount = overrides.get("upgrade_amount", upgrade_amount)  # type: ignore[assignment]
+        match_current = overrides.get("match_current", match_current)  # type: ignore[assignment]
+        match_required = overrides.get("match_required", match_required)  # type: ignore[assignment]
+        # 记下「目标类别是文字读出来的」，好让背包排序那条旁证不要再翻案。
+        keyword_scores["panel_text:confidence"] = float(panel_text.confidence)
+        if "target_object" in overrides:
+            keyword_scores["panel_text:target"] = 1.0
+
     raw_text_hint = _build_raw_text_hint(
         category,
         level,
@@ -729,6 +1148,26 @@ def _analyze_current_paint_fast(
         match_current = 0 if match_current is None else match_current
         match_required = default_match_required if match_required is None else match_required
         upgrade_amount = default_upgrade_amount if upgrade_amount is None else upgrade_amount
+
+    # 实时帧不能等 OCR：按时间节流，其余帧复用上一次成功的结果。
+    panel_text = paint_panel.read_panel_async(_current_paint_text_crop(image, panel))
+    overrides = _panel_text_overrides(panel_text)
+    if overrides:
+        category = overrides.get("category", category)  # type: ignore[assignment]
+        category_confidence = overrides.get("category_confidence", category_confidence)  # type: ignore[assignment]
+        subtype = overrides.get("subtype", subtype)  # type: ignore[assignment]
+        is_treasure = overrides.get("is_treasure", is_treasure)  # type: ignore[assignment]
+        level = overrides.get("level", level)  # type: ignore[assignment]
+        level_confidence = overrides.get("level_confidence", level_confidence)  # type: ignore[assignment]
+        target_object = overrides.get("target_object", target_object)  # type: ignore[assignment]
+        direction = overrides.get("direction", direction)  # type: ignore[assignment]
+        upgrade_amount = overrides.get("upgrade_amount", upgrade_amount)  # type: ignore[assignment]
+        match_current = overrides.get("match_current", match_current)  # type: ignore[assignment]
+        match_required = overrides.get("match_required", match_required)  # type: ignore[assignment]
+        # 记下「目标类别是文字读出来的」，好让背包排序那条旁证不要再翻案。
+        keyword_scores["panel_text:confidence"] = float(panel_text.confidence)
+        if "target_object" in overrides:
+            keyword_scores["panel_text:target"] = 1.0
 
     raw_text_hint = _build_raw_text_hint(
         category,
@@ -1452,6 +1891,39 @@ def _analyze_brush_options(
     if crop.size == 0:
         return None
 
+    # 面板文字是最终真值，先走它。以前靠「≥2 张卡片就算方向阶段」区分阶段，
+    # 结果「选笔触效果」阶段被当成「选笔触方向」，报出一堆假的笔锋类型。
+    # 现在用「三条固定描述有没有出现」判定，8 张实拍截图全对。
+    panel_reading = brush_panel.read_brush_panel(crop)
+    if panel_reading is not None:
+        if panel_reading.stage == "direction" and panel_reading.brush_types:
+            options = tuple(item.value for item in panel_reading.brush_types)
+            _ignored, selected_by_card = _brush_stage1_options_from_cards(crop)
+            if selected_by_card not in options:
+                selected_by_card = None
+            return BrushOptionsObservation(
+                panel_rect=panel,
+                stage1_options=options,
+                stage1_scores={option: 0.90 for option in options},
+                chosen_stage1=selected_by_card,
+                stage2_options=(),
+                stage2_scores={},
+                keyword_scores={},
+                confidence=float(panel_reading.confidence),
+            )
+        if panel_reading.stage == "effect" and panel_reading.affixes:
+            chosen_stage1 = _infer_chosen_stage1((), panel_reading.affixes)
+            return BrushOptionsObservation(
+                panel_rect=panel,
+                stage1_options=(chosen_stage1,) if chosen_stage1 is not None else (),
+                stage1_scores={chosen_stage1: 0.80} if chosen_stage1 is not None else {},
+                chosen_stage1=chosen_stage1,
+                stage2_options=panel_reading.affixes,
+                stage2_scores=dict(panel_reading.affix_scores),
+                keyword_scores={},
+                confidence=float(panel_reading.confidence),
+            )
+
     stage1_crop = _brush_stage1_crop(crop)
     stage2_crop = _brush_stage2_crop(crop)
     stage1_scores = _brush_stage1_scores(stage1_crop)
@@ -1498,8 +1970,14 @@ def _analyze_brush_options(
 def _analyze_brush_options_realtime(
     image: np.ndarray,
     regions: tuple[RegionObservation, ...],
+    previous: BrushOptionsObservation | None = None,
 ) -> BrushOptionsObservation | None:
-    """Recognize brush cards without the expensive general text matcher."""
+    """Recognize brush cards without the expensive general text matcher.
+
+    ``previous`` 是上一帧的结果。面板 OCR 走异步，第一次调用只会在后台起线程、
+    当帧返回 ``None``；这时如果直接掉进下面的字形模板兜底，一帧要多花 150ms，
+    而面板压根没换。所以面板区没动过就沿用上一帧，下一帧 OCR 结果自然补上。
+    """
 
     region = next((item for item in regions if item.kind == RegionKind.BRUSH_OPTIONS), None)
     if region is None:
@@ -1508,6 +1986,39 @@ def _analyze_brush_options_realtime(
     crop = image[panel.y : panel.bottom, panel.x : panel.right]
     if crop.size == 0:
         return None
+
+    # 实时帧：面板文字缓存命中就立即用，没命中丢后台线程，这一帧走原来的兜底。
+    panel_reading = brush_panel.read_brush_panel_async(crop)
+    if panel_reading is None and previous is not None and previous.panel_rect == panel:
+        return previous
+    if panel_reading is not None:
+        if panel_reading.stage == "direction" and panel_reading.brush_types:
+            options = tuple(item.value for item in panel_reading.brush_types)
+            _ignored, selected_by_card = _brush_stage1_options_from_cards(crop)
+            if selected_by_card not in options:
+                selected_by_card = None
+            return BrushOptionsObservation(
+                panel_rect=panel,
+                stage1_options=options,
+                stage1_scores={option: 0.90 for option in options},
+                chosen_stage1=selected_by_card,
+                stage2_options=(),
+                stage2_scores={},
+                keyword_scores={},
+                confidence=float(panel_reading.confidence),
+            )
+        if panel_reading.stage == "effect" and panel_reading.affixes:
+            chosen_stage1 = _infer_chosen_stage1((), panel_reading.affixes)
+            return BrushOptionsObservation(
+                panel_rect=panel,
+                stage1_options=(chosen_stage1,) if chosen_stage1 is not None else (),
+                stage1_scores={chosen_stage1: 0.80} if chosen_stage1 is not None else {},
+                chosen_stage1=chosen_stage1,
+                stage2_options=panel_reading.affixes,
+                stage2_scores=dict(panel_reading.affix_scores),
+                keyword_scores={},
+                confidence=float(panel_reading.confidence),
+            )
 
     stage2_options, stage2_scores = _match_brush_stage2_raster_templates(crop)
     if len(stage2_options) == 2:
@@ -1524,8 +2035,27 @@ def _analyze_brush_options_realtime(
             confidence=max(stage2_scores.values(), default=0.0),
         )
 
-    pattern_scores = _brush_card_pattern_scores(crop)
     ordered_options, selected_by_card = _brush_stage1_options_from_cards(crop)
+    if len(ordered_options) < 2:
+        stage2_options, stage2_scores = _match_brush_stage2_windows_ocr(crop)
+        if len(stage2_options) == 2:
+            chosen_stage1 = _infer_chosen_stage1((), stage2_options)
+            stage1_scores = {chosen_stage1: max(stage2_scores.values())} if chosen_stage1 is not None else {}
+            return BrushOptionsObservation(
+                panel_rect=panel,
+                stage1_options=(chosen_stage1,) if chosen_stage1 is not None else (),
+                stage1_scores=stage1_scores,
+                chosen_stage1=chosen_stage1,
+                stage2_options=stage2_options,
+                stage2_scores=stage2_scores,
+                keyword_scores={},
+                confidence=max(stage2_scores.values(), default=0.0),
+            )
+
+    if len(ordered_options) >= 2:
+        warm_windows_ocr_async()
+
+    pattern_scores = _brush_card_pattern_scores(crop)
     stage1_options = ordered_options or _detected_stage1_options(pattern_scores)
     for option in stage1_options:
         pattern_scores[option] = max(pattern_scores.get(option, 0.0), 0.76)
@@ -1572,6 +2102,91 @@ def _match_brush_stage2_raster_templates(crop: np.ndarray) -> tuple[tuple[str, .
         options.append(name)
         scores[name] = score
     return tuple(options), scores
+
+
+_BRUSH_STAGE2_UI_ALIASES = {
+    "范围内随机1个颜料提升1级": ("对作用范围内的随机1个颜料额外提升1级",),
+    "范围内随机2个颜料提升1级": ("对作用范围内的随机2个颜料额外提升1级",),
+    "全图和自身相同的颜料提升1级": ("全图中与自身内容相同的颜料额外提升1级",),
+    "全图和自身相同的颜料提升2级": ("全图中与自身内容相同的颜料额外提升2级",),
+}
+
+
+def _match_brush_stage2_windows_ocr(crop: np.ndarray) -> tuple[tuple[str, ...], dict[str, float]]:
+    if crop.size == 0:
+        return (), {}
+    panel = cv2.resize(crop, BRUSH_STAGE2_CANONICAL_PANEL_SIZE, interpolation=cv2.INTER_AREA)
+    text_crops = [panel[y : y + h, x : x + w] for x, y, w, h in BRUSH_STAGE2_TEXT_RECTS]
+    combined = np.vstack(text_crops)
+    lines = recognize_chinese_lines_async(combined)
+    if lines is None:
+        return (), {}
+    return _match_brush_stage2_ocr_lines(lines)
+
+
+def _match_brush_stage2_ocr_lines(lines: tuple[str, ...]) -> tuple[tuple[str, ...], dict[str, float]]:
+    normalized_lines = tuple(
+        normalized
+        for line in lines
+        if len(normalized := _normalize_brush_ocr_text(line)) >= 4
+    )
+    if not normalized_lines:
+        return (), {}
+
+    candidates: list[tuple[str, str, str]] = []
+    for affix in build_affix_catalog():
+        aliases = (
+            affix.display_name,
+            *affix.aliases,
+            *_BRUSH_STAGE2_UI_ALIASES.get(affix.name, ()),
+        )
+        for alias in aliases:
+            candidates.append((affix.name, affix.brush_type.value, _normalize_brush_ocr_text(alias)))
+
+    matched: list[tuple[str, str, float]] = []
+    for line in normalized_lines:
+        ranked = sorted(
+            (
+                (_brush_ocr_similarity(line, alias), name, brush_type)
+                for name, brush_type, alias in candidates
+                if alias
+            ),
+            reverse=True,
+        )
+        if not ranked:
+            continue
+        score, name, brush_type = ranked[0]
+        if score < 0.66:
+            continue
+        existing_index = next((index for index, item in enumerate(matched) if item[0] == name), None)
+        if existing_index is None:
+            matched.append((name, brush_type, score))
+        elif score > matched[existing_index][2]:
+            matched[existing_index] = (name, brush_type, score)
+
+    if len(matched) < 2:
+        return (), {}
+    for index, first in enumerate(matched):
+        for second in matched[index + 1 :]:
+            if first[1] == second[1]:
+                options = (first[0], second[0])
+                return options, {first[0]: first[2], second[0]: second[2]}
+    return (), {}
+
+
+def _normalize_brush_ocr_text(value: str) -> str:
+    return "".join(character for character in value if character.isalnum())
+
+
+def _brush_ocr_similarity(observed: str, expected: str) -> float:
+    score = SequenceMatcher(None, observed, expected).ratio()
+    observed_digits = re.findall(r"\d+", observed)
+    expected_digits = re.findall(r"\d+", expected)
+    if observed_digits and expected_digits and observed_digits != expected_digits:
+        score -= 0.22
+    if observed in expected or expected in observed:
+        score = max(score, min(len(observed), len(expected)) / max(len(observed), len(expected)))
+    return float(np.clip(score, 0.0, 1.0))
 
 
 @lru_cache(maxsize=1)
@@ -1639,14 +2254,40 @@ def _analyze_backpack_fast(
 
     panel = region.rect
     slots = _locate_backpack_slots_fast(image, panel, previous)
-    paints = tuple(
-        observation
-        for slot in slots
-        if (observation := _analyze_backpack_slot_fast(image, slot, assume_visible=True)) is not None
-    )
+    previous_by_rect = {
+        (paint.slot_rect.x, paint.slot_rect.y, paint.slot_rect.w, paint.slot_rect.h): paint
+        for paint in (previous.paints if previous is not None else ())
+    }
+    paints: list[BackpackPaintObservation] = []
+    for slot in slots:
+        crop = image[slot.y : slot.bottom, slot.x : slot.right]
+        if crop.size == 0:
+            continue
+        fingerprint = _backpack_slot_fingerprint(crop)
+        cached = previous_by_rect.get((slot.x, slot.y, slot.w, slot.h))
+        if cached is not None and _backpack_fingerprint_distance(cached.fingerprint, fingerprint) <= 0.14:
+            is_selected, selection_confidence = _detect_selected_backpack_slot(crop)
+            paints.append(
+                replace(
+                    cached,
+                    slot_rect=slot,
+                    fingerprint=fingerprint,
+                    is_selected=is_selected,
+                    selection_confidence=selection_confidence,
+                )
+            )
+            continue
+        observation = _analyze_backpack_slot_fast(
+            image,
+            slot,
+            assume_visible=True,
+            fingerprint=fingerprint,
+        )
+        if observation is not None:
+            paints.append(observation)
     if paints:
         confidence = float(np.mean([paint.category_confidence * 0.55 + paint.level_confidence * 0.45 for paint in paints]))
-        return BackpackObservation(panel_rect=panel, paints=paints, confidence=float(np.clip(confidence, 0.0, 1.0)))
+        return BackpackObservation(panel_rect=panel, paints=tuple(paints), confidence=float(np.clip(confidence, 0.0, 1.0)))
     return None
 
 
@@ -1700,14 +2341,18 @@ def _analyze_backpack_slot_fast(
     slot: Rect,
     *,
     assume_visible: bool = False,
+    fingerprint: str | None = None,
 ) -> BackpackPaintObservation | None:
     crop = image[slot.y : slot.bottom, slot.x : slot.right]
     if crop.size == 0 or (not assume_visible and not _slot_has_icon(image, slot)):
         return None
 
     category, category_confidence = _classify_backpack_category(crop)
-    level, level_confidence = _detect_backpack_level_fast(crop)
+    level, level_confidence = _detect_backpack_level_fast(crop, category)
+    is_selected, selection_confidence = _detect_selected_backpack_slot(crop)
     is_treasure, treasure_confidence = _detect_treasure_icon(crop)
+    if category == PaintCategory.MONSTER and category_confidence >= 0.55:
+        is_treasure = False
     subtype = "宝箱" if is_treasure else None
     if is_treasure:
         category = PaintCategory.GAMEPLAY
@@ -1720,15 +2365,20 @@ def _analyze_backpack_slot_fast(
         level_confidence=level_confidence,
         subtype=subtype,
         is_treasure=is_treasure,
-        fingerprint=_backpack_slot_fingerprint(crop),
+        fingerprint=fingerprint or _backpack_slot_fingerprint(crop),
+        is_selected=is_selected,
+        selection_confidence=selection_confidence,
     )
 
 
-def _detect_backpack_level_fast(crop: np.ndarray) -> tuple[int, float]:
+def _detect_backpack_level_fast(
+    crop: np.ndarray,
+    category: PaintCategory = PaintCategory.UNKNOWN,
+) -> tuple[int, float]:
     if crop.size == 0:
         return 1, 0.0
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-    color_level, color_confidence = _detect_backpack_level_by_frame_color(hsv)
+    color_level, color_confidence = _detect_backpack_level_by_frame_color(hsv, category)
     if color_level is not None and color_confidence >= 0.38:
         return color_level, color_confidence
     return 1, 0.42
@@ -1869,8 +2519,11 @@ def _analyze_backpack_slot(image: np.ndarray, slot: Rect) -> BackpackPaintObserv
         return None
 
     category, category_confidence = _classify_backpack_category(crop)
-    level, level_confidence = _detect_backpack_level(crop)
+    level, level_confidence = _detect_backpack_level(crop, category)
+    is_selected, selection_confidence = _detect_selected_backpack_slot(crop)
     is_treasure, treasure_confidence = _detect_treasure_icon(crop)
+    if category == PaintCategory.MONSTER and category_confidence >= 0.55:
+        is_treasure = False
     subtype = "宝箱" if is_treasure else None
     if is_treasure:
         category = PaintCategory.GAMEPLAY
@@ -1885,7 +2538,32 @@ def _analyze_backpack_slot(image: np.ndarray, slot: Rect) -> BackpackPaintObserv
         subtype=subtype,
         is_treasure=is_treasure,
         fingerprint=fingerprint,
+        is_selected=is_selected,
+        selection_confidence=selection_confidence,
     )
+
+
+def _detect_selected_backpack_slot(crop: np.ndarray) -> tuple[bool, float]:
+    if crop.size == 0:
+        return False, 0.0
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    saturation = hsv[:, :, 1]
+    value = hsv[:, :, 2]
+    height, width = saturation.shape
+    border = max(3, int(round(min(height, width) * 0.055)))
+    white = (saturation < 55) & (value > 190)
+    inset = max(1, border // 2)
+    side_ratios = (
+        float(np.mean(white[:border, inset : width - inset])),
+        float(np.mean(white[height - border :, inset : width - inset])),
+        float(np.mean(white[inset : height - inset, :border])),
+        float(np.mean(white[inset : height - inset, width - border :])),
+    )
+    strong_sides = sum(ratio >= 0.28 for ratio in side_ratios)
+    score = float(np.mean(sorted(side_ratios, reverse=True)[:3]))
+    selected = strong_sides >= 3 and score >= 0.34
+    confidence = float(np.clip((score - 0.18) / 0.45, 0.0, 1.0))
+    return selected, confidence
 
 
 def _classify_backpack_category(crop: np.ndarray) -> tuple[PaintCategory, float]:
@@ -1918,6 +2596,9 @@ def _classify_backpack_frame_shape(crop: np.ndarray) -> tuple[PaintCategory, flo
     edges = cv2.Canny(gray, 50, 140)
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
     h, w = gray.shape[:2]
+    # Ignore inner artwork. Monster icons frequently contain strong diagonals,
+    # while the actual category evidence is the outer circular/diamond frame.
+    edges[int(h * 0.25) : int(h * 0.75), int(w * 0.25) : int(w * 0.75)] = 0
     roi = edges[
         int(h * 0.05) : int(h * 0.92),
         int(w * 0.05) : int(w * 0.92),
@@ -1929,8 +2610,8 @@ def _classify_backpack_frame_shape(crop: np.ndarray) -> tuple[PaintCategory, flo
         roi,
         1,
         np.pi / 180,
-        threshold=14,
-        minLineLength=max(12, int(min(roi.shape[:2]) * 0.22)),
+        threshold=12,
+        minLineLength=max(10, int(min(roi.shape[:2]) * 0.18)),
         maxLineGap=5,
     )
     diagonal_length = 0.0
@@ -1956,30 +2637,43 @@ def _classify_backpack_frame_shape(crop: np.ndarray) -> tuple[PaintCategory, flo
 
     # Green/blue/silver/orange diamond borders are saturated along the diagonals;
     # circular monster frames have stronger vertical/horizontal ring edges.
-    if diagonal_score >= 2.8 and diagonal_score >= axial_score * 0.72:
+    if diagonal_score >= 2.5 and diagonal_score >= axial_score * 0.75:
         return PaintCategory.GAMEPLAY, float(np.clip(diagonal_score / 10.0, 0.64, 0.92))
-    if axial_score >= 2.4 and axial_score > diagonal_score * 1.10:
+    if axial_score >= 1.8 and axial_score > diagonal_score * 1.50:
         return PaintCategory.MONSTER, float(np.clip(axial_score / 8.0, 0.58, 0.86))
+    # 圆形框的边缘在 HoughLinesP 下角度很杂，轴向长度经常凑不到上面那条线
+    # （实测 12 个圆形格 axial 最高只有 1.77），于是全掉进 UNKNOWN、被
+    # HoughCircles 兜底成固定 0.58——「碰巧对」而不是「认出来」。
+    # 但菱形的对角强度是圆形的 2.5 倍以上（实测圆形 ≤1.78、菱形 ≥4.40），
+    # 所以反过来用「对角强度低」判圆形更稳。
+    if diagonal_score < 2.0:
+        return PaintCategory.MONSTER, float(np.clip(0.78 - diagonal_score * 0.08, 0.55, 0.78))
 
     return PaintCategory.UNKNOWN, 0.0
 
 
-def _detect_backpack_level(crop: np.ndarray) -> tuple[int, float]:
+def _detect_backpack_level(
+    crop: np.ndarray,
+    category: PaintCategory = PaintCategory.UNKNOWN,
+) -> tuple[int, float]:
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
     h = hsv[:, :, 0]
     s = hsv[:, :, 1]
     v = hsv[:, :, 2]
 
-    # Prefer the bottom-right label when visible.
+    color_level, color_confidence = _detect_backpack_level_by_frame_color(hsv, category)
+
+    # The label can be clipped on the third visible row, and the stylized font
+    # has weak synthetic-template matches. Prefer a strong outer-frame color.
     label = crop[int(crop.shape[0] * 0.56) :, int(crop.shape[1] * 0.54) :]
     digit = _detect_level_digit_from_label(label)
     if digit is not None:
-        color_level, color_confidence = _detect_backpack_level_by_frame_color(hsv)
         if color_level == digit:
             return digit, max(0.78, color_confidence)
+        if color_level is not None and color_confidence >= 0.60:
+            return color_level, color_confidence
         return digit, 0.74
 
-    color_level, color_confidence = _detect_backpack_level_by_frame_color(hsv)
     if color_level is not None and color_confidence >= 0.42:
         return color_level, color_confidence
 
@@ -2002,7 +2696,10 @@ def _detect_backpack_level(crop: np.ndarray) -> tuple[int, float]:
     return 1, 0.55
 
 
-def _detect_backpack_level_by_frame_color(hsv: np.ndarray) -> tuple[int | None, float]:
+def _detect_backpack_level_by_frame_color(
+    hsv: np.ndarray,
+    category: PaintCategory = PaintCategory.UNKNOWN,
+) -> tuple[int | None, float]:
     if hsv.size == 0:
         return None, 0.0
     h = hsv[:, :, 0]
@@ -2019,19 +2716,30 @@ def _detect_backpack_level_by_frame_color(hsv: np.ndarray) -> tuple[int | None, 
     circle_radius = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2) / max(1.0, min(width, height) * 0.40)
     circle_frame = np.abs(circle_radius - 1.0) < 0.050
     label_area = (xx > width * 0.56) & (yy > height * 0.58)
-    frame = (diamond_frame | circle_frame) & ~label_area & (v > 45)
+    if category == PaintCategory.GAMEPLAY:
+        frame_shape = diamond_frame
+    elif category == PaintCategory.MONSTER:
+        frame_shape = circle_frame
+    else:
+        frame_shape = diamond_frame | circle_frame
+    frame = frame_shape & ~label_area & (v > 45)
     if np.mean(frame) < 0.012:
         return None, 0.0
 
     total = max(1, int(np.sum(frame)))
     ratios = {
-        1: float(np.sum(frame & (s < 78) & (v > 70)) / total),
+        1: float(np.sum(frame & (s < 120) & (v > 70)) / total),
         2: float(np.sum(frame & (h >= 45) & (h <= 85) & (s > 50) & (v > 60)) / total),
         3: float(np.sum(frame & (h >= 88) & (h <= 118) & (s > 50) & (v > 60)) / total),
         4: float(np.sum(frame & (h >= 120) & (h <= 165) & (s > 45) & (v > 60)) / total),
         5: float(np.sum(frame & (h >= 8) & (h <= 30) & (s > 50) & (v > 70)) / total),
         6: float(np.sum(frame & (((h <= 8) | (h >= 170)) & (s > 50) & (v > 60))) / total),
     }
+    # Silver Lv1 borders can surround highly saturated blue artwork. Once the
+    # low-saturation frame itself dominates, do not let the inner icon's blue
+    # pixels relabel the slot as Lv3.
+    if ratios[1] >= 0.65:
+        return 1, float(np.clip(ratios[1] / 0.72, 0.50, 0.92))
     best_level, best_ratio = max(ratios.items(), key=lambda item: item[1])
     if best_ratio >= 0.18:
         return best_level, float(np.clip(best_ratio / 0.72, 0.50, 0.92))
@@ -2078,6 +2786,19 @@ def _backpack_slot_fingerprint(crop: np.ndarray) -> str:
     hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
     quantized = (hsv[:, :, 0] // 12).astype(np.uint8)
     return "".join(f"{value:02x}" for value in quantized.flatten())
+
+
+def _backpack_fingerprint_distance(first: str, second: str) -> float:
+    if not first or not second or len(first) != len(second):
+        return 1.0
+    try:
+        left = bytes.fromhex(first)
+        right = bytes.fromhex(second)
+    except ValueError:
+        return 1.0
+    if not left or len(left) != len(right):
+        return 1.0
+    return sum(a != b for a, b in zip(left, right)) / len(left)
 
 
 def _brush_stage1_crop(crop: np.ndarray) -> np.ndarray:
@@ -3086,6 +3807,27 @@ def _estimated_board_layout_candidate(image: np.ndarray) -> Rect | None:
 def _estimated_board_layout_candidates(image: np.ndarray) -> list[Rect]:
     height, width = image.shape[:2]
     short = min(width, height)
+    candidates: list[Rect] = []
+    # 先放实测标定出来的版式（``layout.py`` / ``runtime/layout.json``）。
+    # 下面那组硬编码比例只是「大概在这个方向」的兜底，实测值能直接落到正确位置：
+    # 1037x544 实测，兜底比例 (0.620, 0.215, 0.245) 会整体右偏整整一格，
+    # 而标定值 (0.594, 0.187, 0.256) 一格不差。
+    screen = _screen_layout()
+
+    def _add(rect: Rect) -> None:
+        if not _is_rect_inside_image(image.shape, rect):
+            return
+        if not _is_plausible_board_candidate(image.shape, rect):
+            return
+        # 这里不能直接套 ``_dedupe_rects``：它按面积从大到小排、再用 IoU 0.72 去重，
+        # 而「偏一格的兜底框」和「标定框」的 IoU 恰好是 0.77——大框会把标定框吃掉，
+        # 正好把要修的那个位置丢了。只在几乎重合时才去重，并保留插入顺序。
+        if any(_iou(rect, kept) >= 0.93 for kept in candidates):
+            return
+        candidates.append(rect)
+
+    for layout in (*screen.active, *screen.start):
+        _add(layout.resolve(width, height))
     presets = (
         # Common centered-window layout.
         (0.600, 0.303, 0.373),
@@ -3097,13 +3839,10 @@ def _estimated_board_layout_candidates(image: np.ndarray) -> list[Rect]:
         (0.750, 0.135, 0.145),
         (0.620, 0.215, 0.245),
     )
-    candidates: list[Rect] = []
     for side_ratio, x_ratio, y_ratio in presets:
         side = int(round(short * side_ratio))
-        rect = Rect(int(round(width * x_ratio)), int(round(height * y_ratio)), side, side)
-        if _is_rect_inside_image(image.shape, rect) and _is_plausible_board_candidate(image.shape, rect):
-            candidates.append(rect)
-    return _dedupe_rects(candidates)
+        _add(Rect(int(round(width * x_ratio)), int(round(height * y_ratio)), side, side))
+    return candidates
 
 
 def _best_estimated_board_layout(image: np.ndarray) -> tuple[Rect, float] | None:
@@ -3189,6 +3928,40 @@ def _left_board_anchor_candidates(image: np.ndarray, edges: np.ndarray) -> list[
     return candidates
 
 
+def _board_grid_score(
+    image: np.ndarray,
+    rect: Rect,
+    *,
+    margin: int | None = None,
+    outer_penalty: bool = True,
+) -> float:
+    """只在棋盘附近算边缘，不扫整屏。
+
+    原先每评一个候选框就把整张画面灰度+Canny 一遍，而真正用到的只有棋盘那一块；
+    实时链路一帧要评好几个候选框，这部分是纯浪费。
+
+    margin 默认留出 1.25 格，因为 ``_outer_edge_penalty`` 要看框外一格有没有线。
+    实时链路（布局直接给框、只判断"像不像棋盘"）传 ``outer_penalty=False``：
+    那里只关心网格成不成立，不该因为框外恰好有一条 UI 线就被判成"不是棋盘"。
+    """
+    height, width = image.shape[:2]
+    if margin is None:
+        margin = int(rect.w / BOARD_SIZE * 1.3) + 4
+    x1 = max(0, rect.x - margin)
+    y1 = max(0, rect.y - margin)
+    x2 = min(width, rect.right + margin)
+    y2 = min(height, rect.bottom + margin)
+    if x2 - x1 < 8 or y2 - y1 < 8:
+        return 0.0
+    gray = cv2.cvtColor(image[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 40, 110)
+    local = Rect(rect.x - x1, rect.y - y1, rect.w, rect.h)
+    score = _score_edges_grid(edges, local)
+    if outer_penalty:
+        score *= _outer_edge_penalty(edges, local)
+    return score
+
+
 def _score_board_rect(image: np.ndarray, rect: Rect) -> float:
     if not _is_rect_inside_image(image.shape, rect):
         return 0.0
@@ -3197,13 +3970,10 @@ def _score_board_rect(image: np.ndarray, rect: Rect) -> float:
     if position_score <= 0.02 or size_score <= 0.02:
         return 0.0
 
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(gray, 40, 110)
-    grid_score = _score_edges_grid(edges, rect)
+    grid_score = _board_grid_score(image, rect)
     if grid_score < 0.16:
         return grid_score * position_score * size_score
-    color_score = _score_tile_color_diversity(image, rect)
-    completeness_score = _score_board_cell_completeness(image, rect)
+    color_score, completeness_score = _board_tile_scores(image, rect)
     return (
         grid_score * 0.46
         + color_score * 0.22
@@ -3212,24 +3982,318 @@ def _score_board_rect(image: np.ndarray, rect: Rect) -> float:
     ) * position_score
 
 
+def _board_scoring_arrays(image: np.ndarray, rect: Rect) -> tuple[np.ndarray, np.ndarray]:
+    """整块棋盘只转一次 HSV、只做一次 Canny，36 个格子共用。
+
+    原先每格各做一次 cvtColor（有的函数一格里还做两次），一帧下来一百多次，
+    是实时链路里最大的浪费。裁剪时把边长裁成 6 的倍数，之后按下标切片即可。
+    """
+    height, width = image.shape[:2]
+    x1 = max(0, min(width, rect.x))
+    y1 = max(0, min(height, rect.y))
+    x2 = max(x1, min(width, rect.right))
+    y2 = max(y1, min(height, rect.bottom))
+    crop = image[y1:y2, x1:x2]
+    h, w = crop.shape[:2]
+    h -= h % BOARD_SIZE
+    w -= w % BOARD_SIZE
+    if h <= 0 or w <= 0:
+        return np.empty((0, 0, 3), dtype=np.uint8), np.empty((0, 0), dtype=np.uint8)
+    crop = crop[:h, :w]
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    edges = cv2.Canny(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY), 35, 100)
+    return hsv, edges
+
+
+def _tile_view(array: np.ndarray, index: int, pad_divisor: int = 0) -> np.ndarray:
+    """按下标取第 index 格（0..35）的视图；``pad_divisor`` 与原来按格尺寸内缩的比例一致。"""
+    row, col = divmod(index, BOARD_SIZE)
+    height, width = array.shape[:2]
+    tile_h = height // BOARD_SIZE
+    tile_w = width // BOARD_SIZE
+    if tile_h <= 0 or tile_w <= 0:
+        return array[0:0, 0:0]
+    y1, y2 = row * tile_h, (row + 1) * tile_h
+    x1, x2 = col * tile_w, (col + 1) * tile_w
+    if pad_divisor:
+        pad_y = max(2, tile_h // pad_divisor)
+        pad_x = max(2, tile_w // pad_divisor)
+        if tile_h - 2 * pad_y > 0 and tile_w - 2 * pad_x > 0:
+            y1, y2 = y1 + pad_y, y2 - pad_y
+            x1, x2 = x1 + pad_x, x2 - pad_x
+    return array[y1:y2, x1:x2]
+
+
+def _tile_state_from_hsv(hsv: np.ndarray) -> TileState:
+    """按 HSV 判断格子类型。调用方负责先转好 HSV，避免每格重复 cvtColor。"""
+    if hsv.size == 0:
+        return TileState.UNKNOWN
+
+    h = hsv[:, :, 0]
+    s = hsv[:, :, 1]
+    v = hsv[:, :, 2]
+    mean_v = float(np.mean(v)) / 255.0
+    mean_s = float(np.mean(s)) / 255.0
+    dark_ratio = float(np.mean(v < 65))
+    very_dark_ratio = float(np.mean(v < 38))
+    bright_ratio = float(np.mean(v > 150))
+    low_sat_ratio = float(np.mean(s < 45))
+    blue_ratio = float(np.mean((h >= 82) & (h <= 112) & (s > 70) & (v > 80)))
+    cyan_ratio = float(np.mean((h >= 75) & (h <= 100) & (s > 95) & (v > 120)))
+    non_blue_saturated = float(np.mean((s > 70) & (v > 120) & ~((h >= 75) & (h <= 112))))
+    purple_ratio = float(np.mean((h >= 120) & (h <= 170) & (s > 70) & (v > 90)))
+    gold_ratio = float(np.mean((h >= 15) & (h <= 45) & (s > 70) & (v > 110)))
+    gray_mid_ratio = float(np.mean((s < 55) & (v >= 55) & (v <= 145)))
+
+    center = hsv[
+        hsv.shape[0] // 4 : hsv.shape[0] * 3 // 4,
+        hsv.shape[1] // 4 : hsv.shape[1] * 3 // 4,
+    ]
+    if center.size == 0:
+        center = hsv
+    center_blue = float(
+        np.mean(
+            (center[:, :, 0] >= 75)
+            & (center[:, :, 0] <= 112)
+            & (center[:, :, 1] > 80)
+            & (center[:, :, 2] > 80)
+        )
+    )
+    center_dark = float(np.mean(center[:, :, 2] < 70))
+
+    if very_dark_ratio > 0.34 and mean_v < 0.33:
+        return TileState.VOID
+    if dark_ratio > 0.62 and mean_v < 0.38:
+        return TileState.VOID
+    if bright_ratio > 0.45 and low_sat_ratio > 0.44:
+        return TileState.BLANK
+    if cyan_ratio >= 0.34 and center_blue >= 0.58 and mean_s >= 0.50:
+        return TileState.BLOCKED
+    if non_blue_saturated > 0.20 or purple_ratio > 0.08 or gold_ratio > 0.06:
+        return TileState.PAINT
+    if center_dark > 0.18 and (cyan_ratio > 0.06 or mean_s > 0.26):
+        return TileState.PAINT
+    if gray_mid_ratio > 0.38 and bright_ratio < 0.42:
+        return TileState.FADED
+    if blue_ratio > 0.72 and center_blue > 0.70:
+        return TileState.BLOCKED
+    if dark_ratio > 0.35:
+        return TileState.VOID
+    return TileState.UNKNOWN
+
+
+def _tile_texture_from_arrays(hsv: np.ndarray, edges: np.ndarray) -> bool:
+    """用已经算好的 HSV / 边缘图判断这一格是否有棋盘纹理。"""
+    if hsv.size == 0 or edges.size == 0:
+        return False
+    v = hsv[:, :, 2]
+    s = hsv[:, :, 1]
+    edge_ratio = float(np.mean(edges > 0))
+    contrast = float(np.std(v)) / 255.0
+    bright_ratio = float(np.mean(v > 145))
+    low_sat_ratio = float(np.mean(s < 55))
+    dark_ratio = float(np.mean(v < 70))
+    # Empty blue background is smooth and has little contrast/edge content.
+    if edge_ratio < 0.018 and contrast < 0.085 and bright_ratio < 0.24 and dark_ratio < 0.24:
+        return False
+    if low_sat_ratio < 0.12 and edge_ratio < 0.012 and contrast < 0.06:
+        return False
+    return True
+
+
+def _core_stacks(array: np.ndarray, pad_divisor: int = 10) -> np.ndarray:
+    """把整块棋盘重排成 (36, H, W[, C])，一次算完所有格子。
+
+    这是"能批量处理就不逐个处理"的具体做法：36 格各自做 cvtColor / 均值，
+    改成整块做一次、再按格切片。
+    """
+    height, width = array.shape[:2]
+    tile_h = height // BOARD_SIZE
+    tile_w = width // BOARD_SIZE
+    if tile_h <= 0 or tile_w <= 0:
+        return np.empty((0, 0, 0), dtype=array.dtype)
+    pad_y = max(2, tile_h // pad_divisor)
+    pad_x = max(2, tile_w // pad_divisor)
+    if tile_h - 2 * pad_y <= 0 or tile_w - 2 * pad_x <= 0:
+        pad_y = pad_x = 0
+    usable_h = tile_h * BOARD_SIZE
+    usable_w = tile_w * BOARD_SIZE
+    trimmed = array[:usable_h, :usable_w]
+    if trimmed.ndim == 2:
+        blocks = trimmed.reshape(BOARD_SIZE, tile_h, BOARD_SIZE, tile_w)
+        inner = blocks[:, pad_y : tile_h - pad_y, :, pad_x : tile_w - pad_x]
+        return inner.transpose(0, 2, 1, 3).reshape(
+            BOARD_SIZE * BOARD_SIZE, tile_h - 2 * pad_y, tile_w - 2 * pad_x
+        )
+    channels = trimmed.shape[2]
+    blocks = trimmed.reshape(BOARD_SIZE, tile_h, BOARD_SIZE, tile_w, channels)
+    inner = blocks[:, pad_y : tile_h - pad_y, :, pad_x : tile_w - pad_x, :]
+    return inner.transpose(0, 2, 1, 3, 4).reshape(
+        BOARD_SIZE * BOARD_SIZE, tile_h - 2 * pad_y, tile_w - 2 * pad_x, channels
+    )
+
+
+def _tile_ratio_vectors(stack: np.ndarray) -> dict[str, np.ndarray]:
+    """一次性算出 36 格的 HSV 比例特征。"""
+    h = stack[..., 0].astype(np.int16)
+    s = stack[..., 1].astype(np.int16)
+    v = stack[..., 2].astype(np.int16)
+    axis = (1, 2)
+    return {
+        "mean_v": v.mean(axis=axis) / 255.0,
+        "mean_s": s.mean(axis=axis) / 255.0,
+        "dark_ratio": (v < 65).mean(axis=axis),
+        "very_dark_ratio": (v < 38).mean(axis=axis),
+        "bright_ratio": (v > 150).mean(axis=axis),
+        "low_sat_ratio": (s < 45).mean(axis=axis),
+        "blue_ratio": ((h >= 82) & (h <= 112) & (s > 70) & (v > 80)).mean(axis=axis),
+        "cyan_ratio": ((h >= 75) & (h <= 100) & (s > 95) & (v > 120)).mean(axis=axis),
+        "non_blue_saturated": ((s > 70) & (v > 120) & ~((h >= 75) & (h <= 112))).mean(axis=axis),
+        "purple_ratio": ((h >= 120) & (h <= 170) & (s > 70) & (v > 90)).mean(axis=axis),
+        "gold_ratio": ((h >= 15) & (h <= 45) & (s > 70) & (v > 110)).mean(axis=axis),
+        "gray_mid_ratio": ((s < 55) & (v >= 55) & (v <= 145)).mean(axis=axis),
+    }
+
+
+def _tile_center_vectors(stack: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """格子中心区域的蓝占比和暗占比。"""
+    height, width = stack.shape[1:3]
+    center = stack[
+        :,
+        height // 4 : height * 3 // 4,
+        width // 4 : width * 3 // 4,
+        :,
+    ]
+    if center.size == 0:
+        center = stack
+    ch = center[..., 0].astype(np.int16)
+    cs = center[..., 1].astype(np.int16)
+    cv = center[..., 2].astype(np.int16)
+    axis = (1, 2)
+    center_blue = ((ch >= 75) & (ch <= 112) & (cs > 80) & (cv > 80)).mean(axis=axis)
+    center_dark = (cv < 70).mean(axis=axis)
+    return center_blue, center_dark
+
+
+def _tile_texture_vector(stack: np.ndarray, edge_stack: np.ndarray) -> np.ndarray:
+    """36 格是否有棋盘纹理（逐格判定，但特征一次算完）。"""
+    axis = (1, 2)
+    v = stack[..., 2].astype(np.int16)
+    s = stack[..., 1].astype(np.int16)
+    edge_ratio = (edge_stack > 0).mean(axis=axis)
+    contrast = v.std(axis=axis) / 255.0
+    bright_ratio = (v > 145).mean(axis=axis)
+    low_sat_ratio = (s < 55).mean(axis=axis)
+    dark_ratio = (v < 70).mean(axis=axis)
+    empty = (
+        (edge_ratio < 0.018)
+        & (contrast < 0.085)
+        & (bright_ratio < 0.24)
+        & (dark_ratio < 0.24)
+    )
+    flat = (low_sat_ratio < 0.12) & (edge_ratio < 0.012) & (contrast < 0.06)
+    return ~(empty | flat)
+
+
+def _board_tile_scores(image: np.ndarray, rect: Rect) -> tuple[float, float]:
+    """一次遍历算完"颜色多样性"和"格子完整度"，两份结果共用同一批数组。"""
+    hsv, edges = _board_scoring_arrays(image, rect)
+    if hsv.size == 0:
+        return 0.0, 0.0
+    stack = _core_stacks(hsv, 10)
+    edge_stack = _core_stacks(edges, 10)
+    if stack.size == 0 or edge_stack.size == 0:
+        return 0.0, 0.0
+    ratios = _tile_ratio_vectors(stack)
+    center_blue, center_dark = _tile_center_vectors(stack)
+    textured = _tile_texture_vector(stack, edge_stack)
+
+    states: list[TileState] = []
+    for index in range(BOARD_SIZE * BOARD_SIZE):
+        states.append(
+            _tile_state_from_ratios(
+                mean_v=float(ratios["mean_v"][index]),
+                mean_s=float(ratios["mean_s"][index]),
+                dark_ratio=float(ratios["dark_ratio"][index]),
+                very_dark_ratio=float(ratios["very_dark_ratio"][index]),
+                bright_ratio=float(ratios["bright_ratio"][index]),
+                low_sat_ratio=float(ratios["low_sat_ratio"][index]),
+                blue_ratio=float(ratios["blue_ratio"][index]),
+                cyan_ratio=float(ratios["cyan_ratio"][index]),
+                non_blue_saturated=float(ratios["non_blue_saturated"][index]),
+                purple_ratio=float(ratios["purple_ratio"][index]),
+                gold_ratio=float(ratios["gold_ratio"][index]),
+                gray_mid_ratio=float(ratios["gray_mid_ratio"][index]),
+                center_blue=float(center_blue[index]),
+                center_dark=float(center_dark[index]),
+            )
+        )
+
+    valid_cells = int(textured.sum())
+    bottom_valid = int(textured[-BOARD_SIZE:].sum())
+    unique = len(set(states))
+    known = sum(1 for state in states if state != TileState.UNKNOWN)
+    color_score = float(np.clip((unique / 5.0) * 0.45 + (known / 36.0) * 0.55, 0.0, 1.0))
+    completeness = float(np.clip((valid_cells / 36.0) * 0.50 + (bottom_valid / 6.0) * 0.50, 0.0, 1.0))
+    return color_score, completeness
+
+
+def _tile_state_from_ratios(
+    *,
+    mean_v: float,
+    mean_s: float,
+    dark_ratio: float,
+    very_dark_ratio: float,
+    bright_ratio: float,
+    low_sat_ratio: float,
+    blue_ratio: float,
+    cyan_ratio: float,
+    non_blue_saturated: float,
+    purple_ratio: float,
+    gold_ratio: float,
+    gray_mid_ratio: float,
+    center_blue: float,
+    center_dark: float,
+) -> TileState:
+    """纯阈值判定，输入是已经算好的比例。"""
+    if very_dark_ratio > 0.34 and mean_v < 0.33:
+        return TileState.VOID
+    if dark_ratio > 0.62 and mean_v < 0.38:
+        return TileState.VOID
+    if bright_ratio > 0.45 and low_sat_ratio > 0.44:
+        return TileState.BLANK
+    if cyan_ratio >= 0.34 and center_blue >= 0.58 and mean_s >= 0.50:
+        return TileState.BLOCKED
+    if non_blue_saturated > 0.20 or purple_ratio > 0.08 or gold_ratio > 0.06:
+        return TileState.PAINT
+    if center_dark > 0.18 and (cyan_ratio > 0.06 or mean_s > 0.26):
+        return TileState.PAINT
+    if gray_mid_ratio > 0.38 and bright_ratio < 0.42:
+        return TileState.FADED
+    if blue_ratio > 0.72 and center_blue > 0.70:
+        return TileState.BLOCKED
+    if dark_ratio > 0.35:
+        return TileState.VOID
+    return TileState.UNKNOWN
+
+
+def _score_tile_color_diversity(image: np.ndarray, rect: Rect) -> float:
+    return _board_tile_scores(image, rect)[0]
+
+
 def _score_board_cell_completeness(image: np.ndarray, rect: Rect) -> float:
-    valid_cells = 0
-    bottom_valid = 0
-    cell_w = rect.w / BOARD_SIZE
-    cell_h = rect.h / BOARD_SIZE
-    for row in range(BOARD_SIZE):
-        for col in range(BOARD_SIZE):
-            x1 = round(rect.x + col * cell_w)
-            y1 = round(rect.y + row * cell_h)
-            x2 = round(rect.x + (col + 1) * cell_w)
-            y2 = round(rect.y + (row + 1) * cell_h)
-            if _tile_has_board_texture(image[y1:y2, x1:x2]):
-                valid_cells += 1
-                if row == BOARD_SIZE - 1:
-                    bottom_valid += 1
-    # A one-row-down candidate often has good internal grid lines but the last
-    # row becomes plain background. Penalize that hard.
-    return float(np.clip((valid_cells / 36.0) * 0.50 + (bottom_valid / 6.0) * 0.50, 0.0, 1.0))
+    return _board_tile_scores(image, rect)[1]
+
+
+def _classify_tile_for_board_score(tile_bgr: np.ndarray) -> TileState:
+    if tile_bgr.size == 0:
+        return TileState.UNKNOWN
+    pad_y = max(2, tile_bgr.shape[0] // 10)
+    pad_x = max(2, tile_bgr.shape[1] // 10)
+    core = tile_bgr[pad_y : tile_bgr.shape[0] - pad_y, pad_x : tile_bgr.shape[1] - pad_x]
+    if core.size == 0:
+        core = tile_bgr
+    return _tile_state_from_hsv(cv2.cvtColor(core, cv2.COLOR_BGR2HSV))
 
 
 def _tile_has_board_texture(tile_bgr: np.ndarray) -> bool:
@@ -3242,20 +4306,7 @@ def _tile_has_board_texture(tile_bgr: np.ndarray) -> bool:
         core = tile_bgr
     gray = cv2.cvtColor(core, cv2.COLOR_BGR2GRAY)
     hsv = cv2.cvtColor(core, cv2.COLOR_BGR2HSV)
-    v = hsv[:, :, 2]
-    s = hsv[:, :, 1]
-    edges = cv2.Canny(gray, 35, 100)
-    edge_ratio = float(np.mean(edges > 0))
-    contrast = float(np.std(v)) / 255.0
-    bright_ratio = float(np.mean(v > 145))
-    low_sat_ratio = float(np.mean(s < 55))
-    dark_ratio = float(np.mean(v < 70))
-    # Empty blue background is smooth and has little contrast/edge content.
-    if edge_ratio < 0.018 and contrast < 0.085 and bright_ratio < 0.24 and dark_ratio < 0.24:
-        return False
-    if low_sat_ratio < 0.12 and edge_ratio < 0.012 and contrast < 0.06:
-        return False
-    return True
+    return _tile_texture_from_arrays(hsv, cv2.Canny(gray, 35, 100))
 
 
 def _is_rect_inside_image(shape: tuple[int, ...], rect: Rect) -> bool:
@@ -3293,10 +4344,16 @@ def _board_size_score(shape: tuple[int, ...], rect: Rect) -> float:
     # normally around 0.55-0.70 of the game-window short side; keep smaller
     # candidates alive, but make them lose to the full board unless their other
     # evidence is overwhelming.
+    #
+    # 0.44~0.50 这一段原来给到 0.65~1.00，等于放行了「棋盘内部一圈」的候选：
+    # 1920x1080 全屏实测，529/1080=0.49 的内部框靠 grid/color 双满分以 0.719
+    # 压过真正框住 6x6 的 632/1080=0.585（0.705），结果整块棋盘偏小一圈，
+    # 连带 current_paint 区域往下滑，颜料面板文字读不到、方向与目标全成 UNKNOWN。
+    # 压到 0.25~0.80，让偏小的框明显吃亏。
     if side_ratio < 0.44:
-        return float(np.interp(side_ratio, [0.32, 0.44], [0.04, 0.65]))
+        return float(np.interp(side_ratio, [0.32, 0.44], [0.04, 0.25]))
     if side_ratio < 0.50:
-        return float(np.interp(side_ratio, [0.44, 0.50], [0.65, 1.0]))
+        return float(np.interp(side_ratio, [0.44, 0.50], [0.25, 0.80]))
     if side_ratio < 0.64:
         return 1.0
     if side_ratio < 0.74:
@@ -3391,14 +4448,12 @@ def _refine_candidate_score(image: np.ndarray, edges: np.ndarray, rect: Rect) ->
     grid = _score_edges_grid(edges, rect)
     position = _board_position_score(image.shape, rect)
     size = _board_size_score(image.shape, rect)
-    return grid * (0.55 + position * 0.35 + size * 0.10)
+    return grid * (0.55 + position * 0.35 + size * 0.10) * _outer_edge_penalty(edges, rect)
 
 
-def _score_edges_grid(edges: np.ndarray, rect: Rect) -> float:
+def _grid_line_strengths(edges: np.ndarray, rect: Rect) -> list[float]:
+    """返回棋盘 7 竖 7 横共 14 条网格线的边缘强度（0~1）。"""
     h, w = edges.shape[:2]
-    if rect.x < 0 or rect.y < 0 or rect.right > w or rect.bottom > h:
-        return 0.0
-
     line_band = max(2, rect.w // 120)
     strengths: list[float] = []
     for i in range(BOARD_SIZE + 1):
@@ -3411,92 +4466,66 @@ def _score_edges_grid(edges: np.ndarray, rect: Rect) -> float:
         y1 = max(0, y - line_band)
         y2 = min(h, y + line_band + 1)
         strengths.append(float(edges[y1:y2, rect.x : rect.right].mean()) / 255.0)
-
-    return float(np.clip(np.mean(strengths) * 3.5, 0.0, 1.0))
-
-
-def _score_tile_color_diversity(image: np.ndarray, rect: Rect) -> float:
-    states = []
-    cell_w = rect.w / BOARD_SIZE
-    cell_h = rect.h / BOARD_SIZE
-    for row in range(BOARD_SIZE):
-        for col in range(BOARD_SIZE):
-            x1 = round(rect.x + col * cell_w)
-            y1 = round(rect.y + row * cell_h)
-            x2 = round(rect.x + (col + 1) * cell_w)
-            y2 = round(rect.y + (row + 1) * cell_h)
-            states.append(_classify_tile_for_board_score(image[y1:y2, x1:x2]))
-    unique = len(set(states))
-    known = sum(1 for state in states if state != TileState.UNKNOWN)
-    return float(np.clip((unique / 5.0) * 0.45 + (known / 36.0) * 0.55, 0.0, 1.0))
+    return strengths
 
 
-def _classify_tile_for_board_score(tile_bgr: np.ndarray) -> TileState:
-    if tile_bgr.size == 0:
-        return TileState.UNKNOWN
-
-    pad_y = max(2, tile_bgr.shape[0] // 10)
-    pad_x = max(2, tile_bgr.shape[1] // 10)
-    core = tile_bgr[pad_y : tile_bgr.shape[0] - pad_y, pad_x : tile_bgr.shape[1] - pad_x]
-    if core.size == 0:
-        core = tile_bgr
-
-    hsv = cv2.cvtColor(core, cv2.COLOR_BGR2HSV)
-    h = hsv[:, :, 0]
-    s = hsv[:, :, 1]
-    v = hsv[:, :, 2]
-    mean_v = float(np.mean(v)) / 255.0
-    mean_s = float(np.mean(s)) / 255.0
-    dark_ratio = float(np.mean(v < 65))
-    very_dark_ratio = float(np.mean(v < 38))
-    bright_ratio = float(np.mean(v > 150))
-    low_sat_ratio = float(np.mean(s < 45))
-    blue_ratio = float(np.mean((h >= 82) & (h <= 112) & (s > 70) & (v > 80)))
-    cyan_ratio = float(np.mean((h >= 75) & (h <= 100) & (s > 95) & (v > 120)))
-    non_blue_saturated = float(np.mean((s > 70) & (v > 120) & ~((h >= 75) & (h <= 112))))
-    purple_ratio = float(np.mean((h >= 120) & (h <= 170) & (s > 70) & (v > 90)))
-    gold_ratio = float(np.mean((h >= 15) & (h <= 45) & (s > 70) & (v > 110)))
-    gray_mid_ratio = float(np.mean((s < 55) & (v >= 55) & (v <= 145)))
-
-    center = core[
-        core.shape[0] // 4 : core.shape[0] * 3 // 4,
-        core.shape[1] // 4 : core.shape[1] * 3 // 4,
-    ]
-    if center.size == 0:
-        center = core
-    center_hsv = cv2.cvtColor(center, cv2.COLOR_BGR2HSV)
-    center_blue = float(
-        np.mean(
-            (center_hsv[:, :, 0] >= 75)
-            & (center_hsv[:, :, 0] <= 112)
-            & (center_hsv[:, :, 1] > 80)
-            & (center_hsv[:, :, 2] > 80)
-        )
-    )
-    center_dark = float(np.mean(center_hsv[:, :, 2] < 70))
-
-    if very_dark_ratio > 0.34 and mean_v < 0.33:
-        return TileState.VOID
-    if dark_ratio > 0.62 and mean_v < 0.38:
-        return TileState.VOID
-    if bright_ratio > 0.45 and low_sat_ratio > 0.44:
-        return TileState.BLANK
-    if cyan_ratio >= 0.34 and center_blue >= 0.58 and mean_s >= 0.50:
-        return TileState.BLOCKED
-    if non_blue_saturated > 0.20 or purple_ratio > 0.08 or gold_ratio > 0.06:
-        return TileState.PAINT
-    if center_dark > 0.18 and (cyan_ratio > 0.06 or mean_s > 0.26):
-        return TileState.PAINT
-    if gray_mid_ratio > 0.38 and bright_ratio < 0.42:
-        return TileState.FADED
-    if blue_ratio > 0.72 and center_blue > 0.70:
-        return TileState.BLOCKED
-    if dark_ratio > 0.35:
-        return TileState.VOID
-    return TileState.UNKNOWN
+def _score_edges_grid(edges: np.ndarray, rect: Rect) -> float:
+    h, w = edges.shape[:2]
+    if rect.x < 0 or rect.y < 0 or rect.right > w or rect.bottom > h:
+        return 0.0
+    return float(np.clip(np.mean(_grid_line_strengths(edges, rect)) * 3.5, 0.0, 1.0))
 
 
-def _classify_tiles(image: np.ndarray, board_rect: Rect) -> list[TileObservation]:
+def _outer_edge_penalty(edges: np.ndarray, rect: Rect) -> float:
+    """框的左/上再往外一格若还压着一条同样强的网格线，说明整体偏了一格。
+
+    6x6 棋盘正好 7 条网格线，所以「棋盘内部任意 6x6 子区域」也能凑出 7 条线，
+    而且周期完全一致——网格分数几乎一样。这正是 1024x576 下棋盘整体右偏一格、
+    结束态最右列读不出东西的根因：候选框落在了棋盘内部偏右的位置。
+
+    真正能区分的是「最外圈」：正确框的左/上外侧是界面背景，没有线；
+    偏一格的框左/上外侧还压着棋盘自己的边框线。右/下不参与判断——那里紧邻
+    颜料与背包面板，竖线本来就多，拿它当证据会把正确的框也判成偏移。
+    """
+    h, w = edges.shape[:2]
+    strengths = _grid_line_strengths(edges, rect)
+    inside = float(np.mean(strengths)) if strengths else 0.0
+    if inside <= 1e-6:
+        return 1.0
+
+    cell = rect.w / BOARD_SIZE
+    worst = 0.0
+    # 左：竖线；上：横线。扫描 [0.45, 1.25] 格，容忍几像素的取整误差。
+    # 用整列/整行均值再取最大，一次向量化算完——这里每帧都要跑，不能写双层循环。
+    lo = max(0, int(rect.x - cell * 1.25))
+    hi = min(w - 1, int(rect.x - cell * 0.45))
+    if hi > lo:
+        worst = float(edges[rect.y : rect.bottom, lo : hi + 1].mean(axis=0).max()) / 255.0
+    lo = max(0, int(rect.y - cell * 1.25))
+    hi = min(h - 1, int(rect.y - cell * 0.45))
+    if hi > lo:
+        worst = max(worst, float(edges[lo : hi + 1, rect.x : rect.right].mean(axis=1).max()) / 255.0)
+
+    ratio = worst / inside
+    # 实测：正确框的比值 ≤0.20，偏一格的框 ≥1.00，留足余量。
+    return float(np.clip(1.0 - (ratio - 0.45) * 0.8, 0.35, 1.0))
+
+
+def _classify_tiles(
+    image: np.ndarray,
+    board_rect: Rect,
+    *,
+    icon_fallback: bool = False,
+) -> list[TileObservation]:
+    """36 格全量分类。
+
+    ``icon_fallback=True`` 才给官方图标兜底开配额。这个开关**默认关**：
+    实时链路（``analyze_realtime``）每帧都可能重跑整盘，而 ORB 单格 26ms、
+    整盘就是 0.9s，直接把 0.75s 的交互预算吃穿。图标兜底留给离线场景——
+    ``analyze_scene`` 单张截图分析、批量采集、命令行体检——那里慢几百毫秒
+    换「不认识也能认出来」完全值得。
+    """
+    paint_icon.reset_budget(allow=icon_fallback)
     tiles: list[TileObservation] = []
     cell_w = board_rect.w / BOARD_SIZE
     cell_h = board_rect.h / BOARD_SIZE
@@ -3508,7 +4537,9 @@ def _classify_tiles(image: np.ndarray, board_rect: Rect) -> list[TileObservation
             y2 = round(board_rect.y + (row + 1) * cell_h)
             rect = Rect(x1, y1, max(1, x2 - x1), max(1, y2 - y1))
             crop = image[y1:y2, x1:x2]
-            tiles.append(_classify_tile_observation(crop, row, col, rect))
+            tiles.append(
+                _classify_tile_observation(crop, row, col, rect, icon_fallback=icon_fallback)
+            )
     return _resolve_board_scope_anchor(tiles)
 
 
@@ -3517,6 +4548,7 @@ def _classify_tiles_quick(
     board_rect: Rect,
     previous_board: BoardObservation,
 ) -> list[TileObservation]:
+    paint_icon.reset_budget(allow=False)
     tiles: list[TileObservation] = []
     cell_w = board_rect.w / BOARD_SIZE
     cell_h = board_rect.h / BOARD_SIZE
@@ -3538,7 +4570,9 @@ def _classify_tiles_quick(
             )
             fast_state = _classify_tile_for_board_score(crop)
             state_compatible = fast_state in {previous.state, TileState.UNKNOWN}
-            if visual_change <= 0.05 and state_compatible:
+            visually_identical = visual_change <= 0.012
+            stable_limit = 0.075 if previous.state == TileState.PAINT else 0.05
+            if visually_identical or (visual_change <= stable_limit and state_compatible):
                 features = dict(previous.features)
                 _store_tile_visual_signature(features, signature)
                 features["visual_change"] = visual_change
@@ -3550,7 +4584,14 @@ def _classify_tiles_quick(
     return _resolve_board_scope_anchor(tiles)
 
 
-def _classify_tile_observation(tile_bgr: np.ndarray, row: int, col: int, rect: Rect) -> TileObservation:
+def _classify_tile_observation(
+    tile_bgr: np.ndarray,
+    row: int,
+    col: int,
+    rect: Rect,
+    *,
+    icon_fallback: bool = False,
+) -> TileObservation:
     state, confidence, features = classify_tile(tile_bgr)
     scope_score, anchor_score = _tile_scope_and_anchor_scores(tile_bgr)
     is_scope_highlight = scope_score >= 0.24 and (
@@ -3565,7 +4606,14 @@ def _classify_tile_observation(tile_bgr: np.ndarray, row: int, col: int, rect: R
         state = TileState.BLANK
         confidence = max(confidence, min(0.98, 0.62 + scope_score * 0.50))
     _store_tile_visual_signature(features, _tile_visual_signature(tile_bgr))
-    if state in {TileState.PAINT, TileState.UNKNOWN}:
+    # 棋盘上每枚颜料都会渲染一个 LvN 角标；空白、冰块、漩涡地块都没有。
+    # 这是判断「这格到底有没有颜料」最可靠的一条证据（入画阶段的空白地块是纯灰蓝，
+    # 没有作画阶段的白色画笔水印，光看颜色会被误判成颜料）。
+    label = tile_reader.read_label(tile_bgr)
+    features["label_present"] = 1.0 if label.present else 0.0
+    features["label_density"] = label.density
+    features["label_score"] = label.level_score
+    if state in {TileState.PAINT, TileState.UNKNOWN} or label.present:
         (
             paint_category,
             paint_category_confidence,
@@ -3573,7 +4621,7 @@ def _classify_tile_observation(tile_bgr: np.ndarray, row: int, col: int, rect: R
             paint_level_confidence,
             paint_subtype,
             paint_is_treasure,
-        ) = _analyze_board_paint_tile(tile_bgr)
+        ) = _analyze_board_paint_tile(tile_bgr, label, icon_fallback=icon_fallback)
     else:
         paint_category = PaintCategory.UNKNOWN
         paint_category_confidence = 0.0
@@ -3600,6 +4648,23 @@ def _classify_tile_observation(tile_bgr: np.ndarray, row: int, col: int, rect: R
     ):
         state = TileState.PAINT
         confidence = max(confidence, min(0.90, paint_detail_score))
+    # 角标做最终仲裁：有角标就是颜料；没有角标、连类别都认不出来，就不是颜料。
+    if state in {TileState.PAINT, TileState.UNKNOWN} and not label.present:
+        if paint_category == PaintCategory.UNKNOWN and not paint_is_treasure:
+            # 这里要区分「作画阶段带白色画笔水印的可放置空白」和
+            # 「入画阶段/不可放置地块的平灰底」——两者都没有角标，但只有前者能落子。
+            # 实测：带画笔水印的空白 mean_v≈0.81、white_ratio≈0.07；
+            # 平灰底 mean_v≈0.33、white_ratio≈0.0。
+            looks_placeable = (
+                float(features.get("white_ratio", 0.0)) > 0.03
+                and float(features.get("mean_v", 0.0)) > 0.60
+            )
+            state = TileState.BLANK if looks_placeable else TileState.VOID
+            confidence = max(confidence, 0.72)
+    elif state in {TileState.BLANK, TileState.UNKNOWN} and label.present:
+        if label.density >= tile_reader.PRESENCE_DENSITY_MIN * 1.25:
+            state = TileState.PAINT
+            confidence = max(confidence, 0.80)
     if state != TileState.PAINT:
         paint_category = PaintCategory.UNKNOWN
         paint_category_confidence = 0.0
@@ -3715,36 +4780,132 @@ def _tile_signature_from_features(features: dict[str, float]) -> tuple[float, ..
 
 def _analyze_board_paint_tile(
     tile_bgr: np.ndarray,
+    label: "tile_reader.LabelReading | None" = None,
+    *,
+    icon_fallback: bool = False,
 ) -> tuple[PaintCategory, float, int | None, float, str | None, bool]:
     if tile_bgr.size == 0:
         return PaintCategory.UNKNOWN, 0.0, None, 0.0, None, False
 
     category, category_confidence = _classify_tile_paint_frame(tile_bgr)
-    level, level_confidence = _detect_board_tile_level(tile_bgr)
+    level, level_confidence = _detect_board_tile_level(tile_bgr, label)
+
+    # 放进虚空的颜料：图案被整个抹掉，只剩一圈彩色框（``斜对角.png`` r3c1
+    # 就是 Lv3 蓝环 + 空中心）。这类格子必须**先**认出来，否则模板库会
+    # 拿它去匹配某个家族——历史上它就以 0.769 分匹配成「邪影」，把整个家族带偏。
+    #
+    # 注意框色代表的是**初始颜料的等级**，不是这格颜料自己的等级：初始颜料升到
+    # Lv5，虚空格的框就跟着变橙。所以这里照读 level（它确实是界面上显示的东西），
+    # 但不给它挂家族，类别留 unknown——图案已经没了，算效果时不能按家族算。
+    # 判据只看中心平不平（拉普拉斯方差 25.6 vs 真图案最低 677.8），并强制要求
+    # 有 LvN 角标：空白格和阻挡地块的中心一样平，但它们没有角标。
+    if label is not None and label.present and paint_frame.looks_voided(tile_bgr):
+        return PaintCategory.UNKNOWN, 0.0, level, level_confidence, paint_frame.VOIDED, False
+
     is_treasure, treasure_confidence = _detect_treasure_icon(tile_bgr)
-    subtype = "宝箱" if is_treasure else None
-    if is_treasure:
+    subtype = None
+    # 种类（家族）靠中央图案认，和等级完全正交——同一个家族在 7 个等级里
+    # 画的是同一张图，只是外框颜色变。认对了种类，类别也顺带确定：
+    # 「鼠人」只可能是怪物颜料，「机械之神」只可能是玩法颜料。
+    #
+    # 顺序上种类优先于「宝箱」启发式：后者只看图标里有没有箱体特征，
+    # 实机上会把金色狮头、红甲战士也报成宝箱（``斜对角`` 那局两格全错），
+    # 而种类识别是拿整张图案跟模板比，分数过了阈值就该它说了算。
+    kind = paint_kind.read_kind(tile_bgr)
+    if kind.present and kind.subtype:
+        subtype = kind.subtype
+        known_category = paint_kind.category_of(kind.subtype)
+        if known_category == "monster":
+            category = PaintCategory.MONSTER
+            category_confidence = max(category_confidence, kind.score)
+        elif known_category == "gameplay":
+            category = PaintCategory.GAMEPLAY
+            category_confidence = max(category_confidence, kind.score)
+    elif is_treasure:
+        subtype = "宝箱"
         category = PaintCategory.GAMEPLAY
         category_confidence = max(category_confidence, treasure_confidence)
+    else:
+        # 模板库只认识「见过并入库」的家族；剩下 11 个家族一直靠实机截图慢慢攒。
+        # 现在有 27 张官方图标，模板认不出时可以直接对着标准照认人（见 paint_icon）。
+        # 实测 56 个「模板也认对了」的格子上，图标与模板零冲突，所以这层兜底是
+        # 加在模板之后的补充，不是替代。
+        match = (
+            paint_icon.identify(tile_bgr, budgeted=True)
+            if icon_fallback and paint_kind.looks_like_paint_tile(tile_bgr)
+            else None
+        )
+        if match is not None:
+            subtype = match.family
+            known_category = paint_kind.category_of(match.family)
+            if known_category == "monster":
+                category = PaintCategory.MONSTER
+            elif known_category == "gameplay":
+                category = PaintCategory.GAMEPLAY
+            category_confidence = max(category_confidence, ICON_FALLBACK_CONFIDENCE)
+            is_treasure = is_treasure or subtype == "宝箱"
     return category, category_confidence, level, level_confidence, subtype, is_treasure
 
 
-def _detect_board_tile_level(tile_bgr: np.ndarray) -> tuple[int | None, float]:
+def _detect_board_tile_level(
+    tile_bgr: np.ndarray,
+    label: "tile_reader.LabelReading | None" = None,
+) -> tuple[int | None, float]:
+    """读取棋盘格子的颜料等级。
+
+    两个来源，优先级明确：
+
+    1. **菱形边框颜色**（``frame_level``）。等级 → 边框色是固定的：
+       银=Lv1、绿=Lv2、青蓝=Lv3、紫=Lv4、橙=Lv5、红=Lv6。
+       32 个带真值的格子实测 **100%**，而且不需要模板库、不受图标内容干扰。
+    2. **右下角 ``LvN`` 角标**（``tile_reader``）。留一法只有 63.6%，
+       降级为交叉校验和兜底（比如 Lv7 边框色还没样本时）。
+
+    没角标 = 没颜料，直接返回 ``None``，不猜。
+    **不再用「边框颜色反推背包等级」那条路**——它在实机上把 Lv3 读成 5、Lv5 读成 1。
+    """
     if tile_bgr.size == 0:
         return None, 0.0
-    h, w = tile_bgr.shape[:2]
-    label_crops = (
-        tile_bgr[int(h * 0.50) :, :],
-        tile_bgr[int(h * 0.54) :, : int(w * 0.55)],
-        tile_bgr[int(h * 0.54) :, int(w * 0.45) :],
+    reading = label if label is not None else tile_reader.read_label(tile_bgr)
+    if not reading.present:
+        return None, 0.0
+
+    frame = frame_level.read_frame_level(tile_bgr)
+    # 银框不是「正向证据」，只是「带内没扫到彩色」的兜底。历史上 Lv7 的彩虹环
+    # 也落进银框判据，靠这里的「角标等级分差」翻案；现在 frame_level 能直接认出
+    # Lv7（圆形彩虹环在菱形带内侧只漏一点饱和），这条路留作双保险：
+    # 真 Lv1 的 Lv1 分是 1.00、别的等级 0.84；Lv7 宝箱的 Lv1 只有 0.73。
+    silver_fallback = (
+        frame.level == 1
+        and frame.mean_saturation < frame_level.SILVER_MEAN_SAT_MAX
+        and frame.sat_ratio < frame_level.SILVER_SAT_RATIO_MAX
     )
-    for label in label_crops:
-        digit = _detect_level_digit_from_label(label)
-        if digit is not None:
-            return digit, 0.76
-    level, confidence = _detect_backpack_level_fast(tile_bgr)
-    if level is not None:
-        return level, confidence
+    if silver_fallback and reading.level not in (None, 1):
+        margin = reading.level_score - reading.scores.get(1, 0.0)
+        if margin >= SILVER_LABEL_MARGIN:
+            return reading.level, reading.level_score
+    # 彩框（Lv7）已有边框侧的正向证据。角标也读成 7 时改采信角标——
+    # 它的分数（1.00）比边框的 0.72 硬；角标把 7 读歪成 5 时（7 只有 0.48 分）
+    # 就不能听它的，交给边框。
+    if (
+        frame.level == 7
+        and reading.level == 7
+        and reading.level_score >= tile_reader.LEVEL_TRUST_SCORE
+    ):
+        return reading.level, reading.level_score
+    if frame.level is not None and frame.confidence >= 0.70:
+        confidence = frame.confidence
+        # 角标和边框色打架时留个痕迹，并把置信度压下来（边框色更可信，仍然采用它）。
+        if reading.level is not None and reading.level != frame.level:
+            confidence = min(confidence, 0.70)
+        return frame.level, confidence
+
+    if reading.level is not None:
+        # 角标确实存在但数字没把握。仍然把最佳猜测交出去，置信度压到一半，
+        # 让它带着「低置信」的标记进入模型，而不是让这枚颜料直接从棋盘上消失。
+        if reading.level_score >= tile_reader.LEVEL_TRUST_SCORE:
+            return reading.level, reading.level_score
+        return reading.level, reading.level_score * 0.5
     return None, 0.0
 
 

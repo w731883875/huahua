@@ -1,0 +1,17 @@
+{
+ "UI_S8Gameplay_ColorPlay2_128": {
+  "role": "voided",
+  "name": "虚空",
+  "note": "放入虚空后的形态：棋盘上图案被整个抹掉，只剩一圈彩色框；框色是本局初始颜料的等级（初始颜料升到 Lv5，框就变橙），不是这格颜料自己的等级。过程中会出现，必须纳入识别。"
+ },
+ "UI_S8Gameplay_ColorPlay16_128": {
+  "role": "pet_trait",
+  "name": "宠物特性",
+  "note": "女性头像，通关结算后才出现（结束--地块全部无空白和入画按钮.png 的三格宠物效果展示）。不是棋盘颜料，不进识别库。"
+ },
+ "UI_S8Gameplay_ColorMonster4_128": {
+  "role": "unconfirmed",
+  "name": null,
+  "note": "白色兜帽像 + 金边，用途待确认。确认前不进识别库，避免误认。"
+ }
+}

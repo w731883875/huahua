@@ -2,4 +2,6 @@ numpy>=2.1
 opencv-python>=4.10
 mss>=10.0
 pillow>=12.0
+# Windows.Graphics.Capture：被遮挡的 DirectX 窗口也能读到自己的画面
+windows-capture>=1.4
 pyinstaller>=6.11

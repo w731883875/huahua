@@ -4,7 +4,10 @@ from dataclasses import replace
 from functools import lru_cache
 from pathlib import Path
 from difflib import SequenceMatcher
+import ctypes
+import queue
 import re
+import threading
 import time
 
 import cv2
@@ -13,7 +16,7 @@ import numpy as np
 from .capture import write_image
 from .game_model import BRUSH_TYPE_ORDER, BrushType, build_affix_catalog
 from .keyword_match import match_keywords
-from .layout import ScreenLayout, load_layout
+from .layout import ScreenLayout, load_layout, save_layout
 from . import frame_level
 from . import brush_panel
 from . import paint_frame
@@ -98,6 +101,21 @@ class VisionTracker:
     def __init__(self) -> None:
         self.board_rect: Rect | None = None
         self.last_scene: SceneObservation | None = None
+        self.frame_size: tuple[int, int] | None = None
+
+    def _frame_size_changed(self, image: np.ndarray) -> bool:
+        """窗口尺寸变了吗（拖窗口 / 最大化 / 换分辨率 / 改 DPI）。
+
+        1x1 的 ``paused:game-not-foreground`` 占位帧不算：游戏最小化时采集会退回它，
+        不能让它把尺寸记录冲掉、也不能触发一次无意义的重新定位。
+        """
+        height, width = image.shape[:2]
+        if width < 100 or height < 100:
+            return False
+        size = (int(width), int(height))
+        changed = self.frame_size is not None and self.frame_size != size
+        self.frame_size = size
+        return changed
 
     def analyze(self, image: np.ndarray) -> SceneObservation | None:
         scene = analyze_scene(image, previous_board_rect=self.board_rect)
@@ -107,6 +125,15 @@ class VisionTracker:
         return scene
 
     def analyze_quick(self, image: np.ndarray) -> SceneObservation | None:
+        if self._frame_size_changed(image):
+            # 快路径会复用上一帧的棋盘矩形。窗口一拖，那个矩形属于旧尺寸，拿它
+            # 裁新画面逐格全错位，却仍返回一个「看起来成功」的 scene：自愈分支
+            # 永远进不去、标定永远落不了盘（2026-11-15 23:34 实机：1536x877 →
+            # 1765x965 后 paint 从 5 掉到 1，layout.json 的 mtime 纹丝不动）。
+            # 尺寸一变必须强制重新定位一次，让自愈按新尺寸落盘标定。
+            self.board_rect = None
+            self.last_scene = None
+            return self.analyze_realtime(image)
         previous_scene = self.last_scene
         scene = analyze_scene_quick(
             image,
@@ -141,6 +168,7 @@ class VisionTracker:
     def reset(self) -> None:
         self.board_rect = None
         self.last_scene = None
+        self.frame_size = None
 
 
 def analyze_frame(image: np.ndarray) -> BoardObservation | None:
@@ -167,6 +195,97 @@ def analyze_scene(
         if scene is not None and scene.board.score >= 0.76:
             return scene
 
+    located = _locate_board_rect(image)
+    if located is None:
+        return None
+    rect, _ = located
+    return _analyze_scene_from_board_rect(image, rect, fast=False, icon_fallback=icon_fallback)
+
+
+#: 棋盘 36 格「格内色彩标准差中位数」的上限。
+#: 真实棋盘每格是一块纯色（颜料/空白/虚空/阻挡）；噪声与花哨 UI 的格内是随机纹理。
+#: 实测（2026-11-15）：真实截图 19.4 / 22.8，纯噪声 73.6 —— 取 45 留两倍余量。
+BOARD_CELL_FLATNESS_MAX = 45.0
+#: 「整张画面根本不像棋盘」的下限。只用于在**全搜索之前**提前收手，不参与候选筛选。
+#: 必须比 ``BOARD_CELL_FLATNESS_MAX`` 松得多：未 refine 的候选框会跨到格子线上，
+#: 真实棋盘的候选实测能到 49.0，拿 45 去筛会误杀；噪声则一律 73 以上。
+BOARD_CELL_SCRAMBLED = 60.0
+
+
+def _board_cell_flatness(image: np.ndarray, rect: Rect) -> float:
+    """36 格各取中心 60% 区域，返回「每格色彩标准差」的中位数。
+
+    用中位数而不是均值：真棋盘上总有一两格压着带细节的图标（实测最大 66~71），
+    均值会被它拉高；噪声图则是**每一格**都乱，中位数直接顶到 73 以上。
+    """
+    height, width = image.shape[:2]
+    cell_w = rect.w / BOARD_SIZE
+    cell_h = rect.h / BOARD_SIZE
+    half_w = cell_w * 0.30
+    half_h = cell_h * 0.30
+    values: list[float] = []
+    for row in range(BOARD_SIZE):
+        for col in range(BOARD_SIZE):
+            cx = rect.x + cell_w * (col + 0.5)
+            cy = rect.y + cell_h * (row + 0.5)
+            x0 = int(max(0, cx - half_w))
+            x1 = int(min(width, cx + half_w))
+            y0 = int(max(0, cy - half_h))
+            y1 = int(min(height, cy + half_h))
+            if x1 - x0 < 2 or y1 - y0 < 2:
+                continue
+            patch = image[y0:y1, x0:x1].reshape(-1, image.shape[2])
+            values.append(float(patch.std(axis=0).mean()))
+    if not values:
+        return 0.0
+    values.sort()
+    return values[len(values) // 2]
+
+
+def _board_cells_look_flat(image: np.ndarray, rect: Rect) -> bool:
+    return _board_cell_flatness(image, rect) <= BOARD_CELL_FLATNESS_MAX
+
+
+def _locate_board_rect(image: np.ndarray) -> tuple[Rect, float] | None:
+    """只回答「棋盘在哪、有多像」，不碰面板 OCR / 笔触 / 背包 / 逐格分类。
+
+    两个调用方都只需要矩形：``analyze_scene``（离线冷启动）和布局自愈
+    （``_recover_board_rect``）。后者原来直接调 ``analyze_scene``，于是窗口一改尺寸
+    就把一万多条文案常量匹配和 1381 次模板匹配也跑一遍——1239x780 实测 10.2 秒，
+    而纯定位只要 3.2 秒。实时采集跑在后台线程，界不冻，但用户要干等十几秒才恢复
+    推荐；这段等待没有任何收益。
+
+    门槛与 ``analyze_scene`` 原逻辑逐字一致，不在此处另行加减。
+    """
+    height, width = image.shape[:2]
+    # 大窗口上 ``_best_estimated_board_layout`` 要对十几个候选逐个跑
+    # ``_refine_board_rect``（全图 Canny + 三重循环）：1765x965 实测 11.5s，
+    # 加全搜索共 15.9s。拖一次窗口十几秒不出帧，玩家只会以为工具死了。
+    # 棋盘是按 UI 比例缩放的固定结构，先在 800 宽缩略图上定位、映射回原图，
+    # 再用**原图**重新过一遍全部判据；实测 3.9s，5 枚颜料与等级全对。
+    if width > 1400:
+        scale = 800.0 / width
+        small = cv2.resize(
+            image, (800, max(1, int(round(height * scale)))), interpolation=cv2.INTER_AREA
+        )
+        small_located = _locate_board_rect(small)
+        if small_located is not None:
+            small_rect, _ = small_located
+            mapped = Rect(
+                x=int(round(small_rect.x / scale)),
+                y=int(round(small_rect.y / scale)),
+                w=int(round(small_rect.w / scale)),
+                h=int(round(small_rect.h / scale)),
+            )
+            score = _score_board_rect(image, mapped)
+            if (
+                score >= 0.68
+                and _board_size_score(image.shape, mapped) >= 0.85
+                and _board_cells_look_flat(image, mapped)
+            ):
+                return mapped, score
+        # 缩略图没定位到、或原图复核不过：完整走下面的原流程，行为不变。
+
     layout_best = _best_estimated_board_layout(image)
     if layout_best is not None:
         refined_layout, layout_score = layout_best
@@ -176,9 +295,15 @@ def analyze_scene(
         # 放宽到 0.68，同时要求尺寸先验过关，避免又把「棋盘内部一圈」的小框放进来。
         layout_size_ok = _board_size_score(image.shape, refined_layout) >= 0.85
         if layout_score >= 0.68 and layout_size_ok:
-            return _analyze_scene_from_board_rect(
-                image, refined_layout, fast=False, icon_fallback=icon_fallback
-            )
+            if _board_cells_look_flat(image, refined_layout):
+                return refined_layout, layout_score
+            # 版式对得上、分数还很高，但格内一塌糊涂 —— 这不是画画界面。
+            # 直接判否：这里再跑一遍全搜索，只会用十几秒换回同样一个错框。
+            return None
+        if _board_cell_flatness(image, refined_layout) > BOARD_CELL_SCRAMBLED:
+            # 分数不够格、格内又是一片杂乱：整张画面不是画画界面。
+            # 提前收手，省掉随后的全搜索（噪声图上实测 12 秒，注定被同一个判据否掉）。
+            return None
 
     rects = _candidate_board_rects(image)
     best: tuple[float, Rect] | None = None
@@ -191,7 +316,9 @@ def analyze_scene(
         return None
 
     rect = _choose_board_rect(image, best[1], best[0])
-    return _analyze_scene_from_board_rect(image, rect, fast=False, icon_fallback=icon_fallback)
+    if not _board_cells_look_flat(image, rect):
+        return None
+    return rect, _score_board_rect(image, rect)
 
 
 def _choose_board_rect(image: np.ndarray, best_rect: Rect, best_score: float) -> Rect:
@@ -259,17 +386,48 @@ def analyze_scene_realtime(
     if not _is_supported_scene_image(image):
         return None
     height, width = image.shape[:2]
-    screen = _screen_layout()
+    screen = _screen_layout(width, height)
 
     active_rect = _pick_board_rect(image, screen, width, height, drawing=True)
+    if active_rect is None:
+        # 「等待开画」是另一套布局（棋盘居中），必须先试它再自愈。
+        # 自愈是按 active 比例做的全搜索，在等待画面上会选中 start 框并吃掉
+        # 6 秒（1239x780 实测，预算是 0.5 秒）；start 布局 + 开画按钮 50ms 就够。
+        waiting = _waiting_scene_if_any(image, screen, width, height, previous_scene)
+        if waiting is not None:
+            return waiting
+        # 布局比例对不上（窗口被最大化/改尺寸/换 DPI）时，固定比例算出的候选会整体
+        # 偏十几像素，网格线全错位。这里在候选附近把棋盘找回来并落盘标定，
+        # 于是「窗口一变就整片不识别」不会重演。
+        recovered = _recover_board_rect(image, screen, width, height, drawing=True)
+        if recovered is not None:
+            _remember_board_layout(width, height, recovered)
+            active_rect = recovered
     if active_rect is not None:
         board_score = _score_board_rect(image, active_rect)
         tracked = previous_scene.board.rect if previous_scene is not None else previous_board_rect
-        if board_score < MIN_BOARD_DETECTION_SCORE:
-            # 布局可信但分数偏低：只有上一帧就在跟踪同一块棋盘时才继续。
-            if tracked is None or not _rect_is_near(tracked, active_rect):
+        accepted = board_score >= MIN_BOARD_DETECTION_SCORE
+        if not accepted:
+            # 布局可信但分数偏低：上一帧就在跟踪同一块棋盘，或网格线足够硬。
+            if tracked is not None and _rect_is_near(tracked, active_rect):
+                board_score = max(board_score, previous_scene.board.score if previous_scene is not None else 0.0)
+                accepted = board_score >= MIN_BOARD_DETECTION_SCORE
+            elif _grid_confirms_board(image, active_rect):
+                # 新画纸（上半还没落子）完整度天然低，综合分比阈值只差千分之几，
+                # 但 6x6 网格线成立——见函数注释。board_score 仍报真实值。
+                accepted = True
+        if not accepted:
+            # 布局勉强被 presence 放过、但棋盘自身不成立，等价于「这个窗口尺寸
+            # 没有标定」。原实现在这里直接 return None，自愈永远没机会跑，于是
+            # 拖过窗口之后每帧都错、点完整识别也一直失败。补一次自愈并落盘：
+            # 限流在 _recover_board_rect 内（失败指数退避），非游戏画面不会
+            # 反复吃 CPU；成功则同一尺寸之后都走快路径。
+            recovered = _recover_board_rect(image, screen, width, height, drawing=True)
+            if recovered is None:
                 return None
-            board_score = max(board_score, previous_scene.board.score if previous_scene is not None else 0.0)
+            _remember_board_layout(width, height, recovered)
+            active_rect = recovered
+            board_score = _score_board_rect(image, active_rect)
             if board_score < MIN_BOARD_DETECTION_SCORE:
                 return None
         scene = _analyze_scene_from_board_rect(
@@ -280,26 +438,13 @@ def analyze_scene_realtime(
             previous_scene=previous_scene,
             board_score=board_score,
         )
-        if scene is not None and scene.board.score >= MIN_BOARD_DETECTION_SCORE:
-            return scene
-        return None
+        return scene
 
-    # 等待开画时棋盘居中，先看这个布局；都不像就看上一帧跟踪到的位置。
-    start_rect = _pick_board_rect(image, screen, width, height, drawing=False)
-    if start_rect is not None:
-        start_button = _find_start_drawing_button_fast(image)
-        start_score = _score_board_rect(image, start_rect)
-        # The centered waiting layout receives a lower position prior than the
-        # active left layout. The independently detected action button keeps
-        # this relaxed threshold specific to the waiting scene.
-        if start_button is not None and start_score >= 0.56:
-            return _analyze_start_drawing_scene(
-                image,
-                start_rect,
-                start_button,
-                previous_scene=previous_scene,
-                board_score=start_score,
-            )
+    # 等待开画时棋盘居中。上面那条「active 不成立」的分支已经试过一次，
+    # 走到这里说明 active 成立过又被否掉；再试一次代价只有几十毫秒。
+    waiting = _waiting_scene_if_any(image, screen, width, height, previous_scene)
+    if waiting is not None:
+        return waiting
 
     tracked = previous_scene.board.rect if previous_scene is not None else previous_board_rect
     if tracked is None:
@@ -328,7 +473,58 @@ def analyze_scene_realtime(
     return None
 
 
+def _waiting_scene_if_any(
+    image: np.ndarray,
+    screen: ScreenLayout,
+    width: int,
+    height: int,
+    previous_scene: SceneObservation | None,
+) -> SceneObservation | None:
+    """「等待开画」画面：棋盘居中 + 独立的开画按钮。不是就返回 None。
+
+    start 布局的棋盘位置比 active 偏右得多（0.354 vs 0.187），单看网格线不够，
+    必须同时认出那个开画按钮 —— 它才是「这一帧是在等开局」的硬证据。
+    """
+    start_rect = _pick_board_rect(image, screen, width, height, drawing=False)
+    if start_rect is None:
+        return None
+    start_button = _find_start_drawing_button_fast(image)
+    if start_button is None:
+        return None
+    start_score = _score_board_rect(image, start_rect)
+    # The centered waiting layout receives a lower position prior than the
+    # active left layout. The independently detected action button keeps
+    # this relaxed threshold specific to the waiting scene.
+    if start_score < 0.56:
+        return None
+    return _analyze_start_drawing_scene(
+        image,
+        start_rect,
+        start_button,
+        previous_scene=previous_scene,
+        board_score=start_score,
+    )
+
+
 GRID_PRESENCE_SCORE = 0.55
+#: 布局自愈的限流：同一窗口尺寸最多每这么久尝试一次。
+#: ``_recover_board_rect`` 一次要跑七八十次网格评分（1902x1010 上约 1.6s），
+#: 在根本不是游戏画面的时候不能每帧都试。
+RECOVER_ATTEMPT_INTERVAL = 5.0
+#: 成功一次之后的静默期。成功会落盘标定，下一帧候选就该对上了；
+#: 再撞进这里说明标定没生效（写失败/别的尺寸），给足时间让它别每帧重跑。
+RECOVER_SUCCESS_INTERVAL = 30.0
+#: 窗口尺寸 → (上次尝试时刻, 下次允许的间隔)。失败指数退避，上限 120s。
+_RECOVER_ATTEMPTS: dict[tuple[int, int], tuple[float, float]] = {}
+#: 布局自愈是否允许写 ``runtime/layout.json``。默认关，界面进程启动时打开；
+#: 测试必须保持关闭，否则跑完一轮就把测试截图的坐标留在文件里。
+_LAYOUT_AUTOSAVE = False
+
+
+def set_layout_autosave(enabled: bool) -> None:
+    """界面进程启动时打开自动标定（见 :func:`_remember_board_layout`）。"""
+    global _LAYOUT_AUTOSAVE
+    _LAYOUT_AUTOSAVE = bool(enabled)
 
 
 def _pick_board_rect(
@@ -352,10 +548,131 @@ def _pick_board_rect(
             best = (rect, score)
     if best[0] is None:
         return None
+    # presence 只回答「这是不是画画界面」，**不回答这个框对不对**：它的阈值只有
+    # 0.15，而模板文件缺失时 load_template() 干脆返回 True（见 presence.py:94）。
+    # 2026-11-15 把窗口拖成 1536x877 后，库里没有这组标定，内置比例算出的候选
+    # (287,225,521) 网格分仅 0.416、棋盘综合分 0.146，却因 presence 相似度
+    # 0.249 被当成真棋盘收下。实时路径拿错框算分不达标就直接 return None，
+    # 自愈分支永远进不去、标定永远落不了盘 —— 玩家看到的就是「改了窗口大小
+    # 之后整片识别错误」，而且点完整识别也救不回来（它走的也是实时路径）。
+    # 所以让 presence 说话之前，必须再用棋盘自身的两条证据复核。
+    if best[1] < GRID_PRESENCE_SCORE - 0.10:
+        return None
+    if _score_board_rect(image, best[0]) < MIN_BOARD_DETECTION_SCORE * 0.8:
+        return None
     present, _ = presence.is_drawing_screen(
         image, screen.presence_rect(best[0]), template=_presence_template()
     )
     return best[0] if present else None
+
+
+def _recover_board_rect(
+    image: np.ndarray,
+    screen: ScreenLayout,
+    width: int,
+    height: int,
+    *,
+    drawing: bool = True,
+) -> Rect | None:
+    """布局候选全都不成立时，把棋盘找回来。
+
+    为什么不用「在候选附近微调」：窗口比例一变，偏差不是十几像素而是在**几十像素**
+    且方向无规律——2026-11-15 同一台机器上，1920x1020 的窗口棋盘在 (341,254,608)，
+    拖到 1239x780 后落在 (177,211,442)：x 差 164、边长差 166。局部搜索
+    （±20px、±16px 边长）根本够不着，实测直接返回 None。
+
+    ``layout.py`` 的比例只是「大概率在这附近」的先验，游戏 UI 的缩放/居中规则既然
+    不透明，就只能用完整搜索兜底。这条路只在**布局失效时跑一次**：成功后调用方
+    把结果按窗口尺寸落盘，同一尺寸之后都走快路径；失败则指数退避，避免在非游戏
+    画面上反复吃 CPU。
+
+    这里调 :func:`_locate_board_rect` 而不是 ``analyze_scene``：只需要矩形，没必要
+    把面板 OCR、笔触、背包和逐格分类也跑一遍（那一段在 1239x780 上就占 6 秒）。
+    """
+    key = (width, height)
+    now = time.monotonic()
+    prev = _RECOVER_ATTEMPTS.get(key)
+    if prev is not None and now - prev[0] < prev[1]:
+        return None
+    # 失败就退避（5s → 10s → 20s … 上限 120s）：一次要跑十几秒，
+    # 在「根本不是游戏画面」的时候不能每 5 秒就吃一遍。
+    _RECOVER_ATTEMPTS[key] = (now, min(RECOVER_ATTEMPT_INTERVAL * 2, 120.0))
+
+    located = _locate_board_rect(image)
+    if located is None:
+        return None
+    rect, score = located
+    # layout 那条路刻意放宽到 0.68（2K 下同一块棋盘 layout 只有 0.712，用 0.70
+    # 会整片判不出）。但自愈要把结果**落盘成标定**，落错一次后面全错，
+    # 所以这里按正式门槛复核。实测两张实机图 0.760 / 0.777，都过。
+    if score < MIN_BOARD_DETECTION_SCORE:
+        return None
+    # 全搜索给的是**格子级粗对齐**，实测会差到 ±8px：1239x780 上自愈落盘过
+    # (181,203,439)，而真框是 (177,211,442)。8px 约等于 6x6 棋盘的 11% 格高，
+    # 实时路径不做 refine，逐格裁剪整体错位 —— 画面上 5 枚颜料只认出 2 枚、
+    # 等级全部丢失，玩家看到的就是「识别不了全部颜料」（2026-11-15 22:50 实机）。
+    # 自愈结果要落盘成标定，错一次后面每帧都错，所以这里必须做亚像素级精修，
+    # 且只在综合分不降时采用（防止精修自己跑偏）。自愈本来就是几秒一次的冷路径，
+    # 这 0.4s 值得花。
+    refined = _refine_board_rect(image, rect)
+    if _score_board_rect(image, refined) + 1e-6 >= _score_board_rect(image, rect):
+        rect = refined
+    # 落盘前最后一道：网格线必须真的成立。
+    # 2026-11-19 实机事故——开局那一帧还在转场，自愈在画面左上角找到一块
+    # 「像棋盘」的东西（综合分过了门槛），于是把 (0,0,548) 当成标定写进
+    # layout.json，之后整局每一帧都按窗口左上角裁格子，识别全错。
+    # 网格线是内容无关的硬证据，转场画面/装饰边框给不出来。
+    if _board_grid_score(image, rect) < GRID_PRESENCE_SCORE:
+        return None
+    _RECOVER_ATTEMPTS[key] = (now, RECOVER_SUCCESS_INTERVAL)
+    return rect
+
+
+def _remember_board_layout(width: int, height: int, rect: Rect) -> None:
+    """把一次可信的棋盘位置落盘，并让下一次识别立刻用上。
+
+    没有这一步，窗口比例一变（最大化、分辨率、DPI）实时路径就整片失效，
+    而完整搜索在 1902x1010 上要 28 秒，绝不能每帧跑。
+
+    **默认不落盘**：只有界面进程显式调用 :func:`set_layout_autosave` 打开它。
+    测试里跑几十帧不同尺寸的截图，如果自动标定生效，最后一次的结果会留在
+    ``runtime/layout.json`` 里污染后续所有测试与真实运行——实测就是这么让
+    两条背包等级用例变红的。
+    """
+    if not _LAYOUT_AUTOSAVE:
+        return
+    try:
+        save_layout(width, height, rect)
+    except OSError:
+        return
+    reset_vision_caches()
+
+
+def remember_board_calibration(image: np.ndarray, scene: SceneObservation) -> None:
+    """把一次可信识别的棋盘位置按窗口尺寸落盘（供完整识别的冷启动兜底调用）。
+
+    ``_remember_board_layout`` 默认不写盘，只有界面进程显式打开
+    :func:`set_layout_autosave` 才生效，所以测试里跑再多帧也不会污染标定文件。
+    """
+    height, width = image.shape[:2]
+    _remember_board_layout(width, height, scene.board.rect)
+
+
+def _grid_confirms_board(image: np.ndarray, rect: Rect) -> bool:
+    """6x6 网格线足够硬 → 这块区域就是棋盘，哪怕综合分差一点。
+
+    为什么需要这条：``_score_board_rect`` 的 ``completeness`` 分量按「格内有内容」
+    算，新画纸（上半还没落子）天然只有 0.43，实测综合分 **0.6985**，比阈值 0.70
+    只差 0.0015 —— 差这么一点就整帧被判「看不到棋盘」，
+    于是 auto 链路既不更新界面、也没机会认新局，日志只剩每秒一条
+    「低置信度」，用户看到的就是「收尾后一直挂着上一局」。
+
+    网格线是内容无关的硬证据：同一帧软网格分 0.668，比满铺局的 0.593 还高。
+    这里要求「明显高于 ``GRID_PRESENCE_SCORE``」是为了不把随便一块带纹理的
+    画面当成棋盘——布局候选本来就只有在网格成立（或 presence 模板成立）时才会返回。
+    """
+
+    return _board_grid_score(image, rect, outer_penalty=False) >= GRID_PRESENCE_SCORE + 0.08
 
 
 def _board_present(image: np.ndarray, rect: Rect, screen: ScreenLayout) -> bool:
@@ -369,14 +686,29 @@ def _board_present(image: np.ndarray, rect: Rect, screen: ScreenLayout) -> bool:
 
 
 _LAYOUT_CACHE: ScreenLayout | None = None
+#: 上面这份缓存是按哪个窗口尺寸算的。尺寸一变就要重读标定。
+_LAYOUT_CACHE_KEY: tuple[int | None, int | None] | None = None
 _PRESENCE_LOADED = False
 _PRESENCE_TEMPLATE: np.ndarray | None = None
 
 
-def _screen_layout() -> ScreenLayout:
-    global _LAYOUT_CACHE
-    if _LAYOUT_CACHE is None:
-        _LAYOUT_CACHE = load_layout()
+def _screen_layout(width: int | None = None, height: int | None = None) -> ScreenLayout:
+    """取布局。
+
+    传了窗口尺寸就按尺寸挑对应的标定：不同大小的窗口里棋盘相对位置并不一样，
+    拿 A 尺寸的标定去算 B 尺寸会整体偏十几像素（2026-11-15 实机事故：
+    1673x878 的标定用在 1920x1020 上，棋盘 6x6 网格线全部错位）。
+    没传尺寸时用文件里第一组（兼容老调用）。
+    """
+    global _LAYOUT_CACHE, _LAYOUT_CACHE_KEY
+    key = (width, height)
+    # 缓存只对「同一个窗口尺寸」有效。原来写成
+    # ``_LAYOUT_CACHE_KEY not in (None, key)``：一旦先来一次不带尺寸的调用，
+    # 缓存键就固定成 (None, None)，之后换成带尺寸的调用也判成「没变」，
+    # 于是拖窗口后再也不重新读标定——典型的「改了窗口大小照样按旧框识别」。
+    if _LAYOUT_CACHE is None or (width is not None and _LAYOUT_CACHE_KEY != key):
+        _LAYOUT_CACHE = load_layout(width, height)
+        _LAYOUT_CACHE_KEY = key
     return _LAYOUT_CACHE
 
 
@@ -390,10 +722,16 @@ def _presence_template() -> np.ndarray | None:
 
 def reset_vision_caches() -> None:
     """布局文件或模板被替换后调用，让下一次识别重新读取。"""
-    global _LAYOUT_CACHE, _PRESENCE_LOADED, _PRESENCE_TEMPLATE
+    global _LAYOUT_CACHE, _LAYOUT_CACHE_KEY, _PRESENCE_LOADED, _PRESENCE_TEMPLATE
+    global _WAITING_BOARD_CACHE
     _LAYOUT_CACHE = None
+    _LAYOUT_CACHE_KEY = None
     _PRESENCE_LOADED = False
     _PRESENCE_TEMPLATE = None
+    _WAITING_BOARD_CACHE = None
+    # 背包家族缓存只在「游戏/窗口/模板变了」时才该清：它省的是 40~60ms/次
+    # 的 ORB 匹配，平时必须留着；测试靠它隔离用例。
+    reset_family_cache()
 
 
 def _rect_is_near(first: Rect, second: Rect) -> bool:
@@ -448,6 +786,23 @@ def _tracked_board_visual_guard(
     return _median(differences) <= 0.26
 
 
+#: 「等待开画」画面在玩家点按钮之前是静止的，而 ``_classify_tiles`` 跑满 36 格
+#: 约 0.27s（1239x780 实测）。实时链路每帧都重跑这一遍纯属浪费：2026-11-15
+#: 受控负载实验里，光这一步就把 0.5s 的交互预算吃掉大半，外部一抢 CPU 就破线。
+#: key 里带棋盘矩形和画面签名，任一变化立即失效，绝不把旧格子状态带到发牌后。
+_WAITING_BOARD_CACHE: tuple[tuple[int, int, int, int, bytes], tuple] | None = None
+_WAITING_SIGNATURE_SIDE = 48
+
+
+def _waiting_board_signature(image: np.ndarray, rect: Rect) -> bytes:
+    """棋盘画面的廉价指纹：缩到 48x48 的 BGR 字节，局部图标变化也会改变它。"""
+    patch = image[rect.y : rect.bottom, rect.x : rect.right]
+    if patch.size == 0:
+        return b""
+    small = cv2.resize(patch, (_WAITING_SIGNATURE_SIDE, _WAITING_SIGNATURE_SIDE), interpolation=cv2.INTER_AREA)
+    return small.tobytes()
+
+
 def _analyze_start_drawing_scene(
     image: np.ndarray,
     rect: Rect,
@@ -456,13 +811,23 @@ def _analyze_start_drawing_scene(
     previous_scene: SceneObservation | None = None,
     board_score: float | None = None,
 ) -> SceneObservation:
+    global _WAITING_BOARD_CACHE
     bounded = _bounded_rect(rect.x, rect.y, rect.w, rect.h, image.shape[1], image.shape[0])
-    previous_board = previous_scene.board if previous_scene is not None and _rect_is_near(previous_scene.board.rect, bounded) else None
-    tiles = tuple(
-        _classify_tiles_quick(image, bounded, previous_board)
-        if previous_board is not None
-        else _classify_tiles(image, bounded)
+    key = (
+        bounded.x, bounded.y, bounded.w, bounded.h,
+        _waiting_board_signature(image, bounded),
     )
+    cached = _WAITING_BOARD_CACHE
+    if cached is not None and cached[0] == key:
+        tiles = cached[1]
+    else:
+        previous_board = previous_scene.board if previous_scene is not None and _rect_is_near(previous_scene.board.rect, bounded) else None
+        tiles = tuple(
+            _classify_tiles_quick(image, bounded, previous_board)
+            if previous_board is not None
+            else _classify_tiles(image, bounded)
+        )
+        _WAITING_BOARD_CACHE = (key, tiles)
     raw_board_score = _score_board_rect(image, bounded) if board_score is None else board_score
     position_score = _board_position_score(image.shape, bounded)
     normalized_board_score = float(np.clip(raw_board_score / max(0.55, position_score), 0.0, 0.96))
@@ -664,6 +1029,7 @@ def _correct_current_paint_from_board_anchor(
         upgrade_amount=current_paint.upgrade_amount,
         keyword_scores=current_paint.keyword_scores,
         raw_text_hint=current_paint.raw_text_hint,
+        effect_text=current_paint.effect_text,
     )
 
 
@@ -760,6 +1126,15 @@ def _sync_single_anchor_tile_from_current_paint(
     if current_paint.category_confidence < 0.55 or current_paint.level_confidence < 0.55:
         return board
 
+    # 盘上不止一枚颜料 = 这局的初始颜料早落完了，面板上这枚是**下一枚**，
+    # 不归它管。原来的 ``paint_indices = marked_indices or [...]`` 一旦判出锚点
+    # 就只看那一格，「唯一一枚」的前提检查被整体绕过：2026-11-15 实机盘上 5 枚
+    # 颜料、锚点指向 r2c2、面板读「机械之神 Lv3」，把 r2c2 的「赛季 Lv4」盖成
+    # 「机械之神 Lv3」。而没有金框的那一帧锚点消失、又走回 ``len != 1`` 不动，
+    # 于是同一格在两帧之间来回翻 —— 玩家看到的就是「4 级赛季未识别」。
+    if sum(1 for tile in board.tiles if tile.state == TileState.PAINT) > 1:
+        return board
+
     marked_indices = [index for index, tile in enumerate(board.tiles) if tile.is_current_anchor]
     paint_indices = marked_indices or [index for index, tile in enumerate(board.tiles) if tile.state == TileState.PAINT]
     if len(paint_indices) != 1:
@@ -767,14 +1142,45 @@ def _sync_single_anchor_tile_from_current_paint(
 
     index = paint_indices[0]
     tile = board.tiles[index]
+    # 「盘上只有一枚颜料」不等于「这枚就是本局的初始颜料」。
+    #
+    # 2026-11-15 实机事故：新画纸开局自带一枚**赛季 Lv4**，而面板上读到的还是
+    # 初始颜料规则「怪物 Lv3」。这里无条件拿面板读数盖上去，结果那一格变成
+    # 「怪物 Lv3、家族空」——家族直接被抹掉，界面上看就是「4 级赛季未识别」。
+    #
+    # 判据：没有锚点高亮、而这一格自己认出了家族、家族类别又和面板规则类别冲突
+    # → 它们是两枚不同的颜料，面板读数没有资格覆盖它。
+    # 面板读出了家族、而和棋盘这格不是同一个 → 两枚不同的颜料，面板没资格覆盖。
+    # 这一条比「类别冲突」严格：赛季与机械之神**同属玩法类别**，只看类别会放过它，
+    # 而实机上正是「赛季 Lv4 被机械之神 Lv3 盖掉」。
+    if tile.paint_subtype and current_paint.subtype and current_paint.subtype != tile.paint_subtype:
+        return board
+    has_initial_marker = float(tile.features.get("initial_marker_score", 0.0)) >= 0.5
+    if tile.paint_subtype and (not marked_indices or has_initial_marker):
+        tile_category = paint_kind.category_of(tile.paint_subtype)
+        if tile_category and tile_category != current_paint.category.value:
+            return board
+    # 面板没读出家族时，别把棋盘已经认出来的家族抹成空。
+    subtype = current_paint.subtype or tile.paint_subtype
+    # 等级：边框色读得够硬（>=0.80）就不拿面板改。
+    # ``frame_level`` 在 32 个带真值格子上实测 100%，而这个函数的前提
+    # 「唯一颜料就是初始颜料」本身就可能不成立（新画纸自带预置颜料）。
+    # 边框勉强能读时才退回面板——那正是面板等级存在的价值。
+    frame_level_is_solid = tile.paint_level is not None and tile.paint_level_confidence >= 0.80
+    level = tile.paint_level if frame_level_is_solid else current_paint.level
+    level_confidence = (
+        tile.paint_level_confidence
+        if frame_level_is_solid
+        else max(tile.paint_level_confidence, current_paint.level_confidence)
+    )
     synced = replace(
         tile,
         paint_category=current_paint.category,
         paint_category_confidence=max(tile.paint_category_confidence, current_paint.category_confidence),
-        paint_level=current_paint.level,
-        paint_level_confidence=max(tile.paint_level_confidence, current_paint.level_confidence),
-        paint_subtype=current_paint.subtype,
-        paint_is_treasure=current_paint.is_treasure,
+        paint_level=level,
+        paint_level_confidence=level_confidence,
+        paint_subtype=subtype,
+        paint_is_treasure=current_paint.is_treasure or subtype == "宝箱",
     )
     tiles = list(board.tiles)
     tiles[index] = synced
@@ -965,13 +1371,21 @@ def _panel_text_overrides(reading: paint_panel.PanelReading | None) -> dict[str,
 
 
 def _current_paint_text_crop(image: np.ndarray, panel: Rect) -> np.ndarray:
-    """给 OCR 用的「当前颜料」文字区，比模板用的裁剪框更宽。
+    """给 OCR 用的「当前颜料」文字区，比模板用的裁剪框更宽也更高。
 
     全屏时这个面板和棋盘顶部基本齐平，窗口化后它会往上挪一大截
     （实测面板顶比棋盘顶还高 0.15h 以上）。原来只按 ``panel.y + 0.08h`` 取，
     窗口化后就只剩「调色效果」那一行，OCR 读不出标题和目标，方向和
     作用颜料全成 UNKNOWN。所以向上多留一截，宁可多读几行——
     :func:`paint_panel.parse_lines` 从标题行开始解析，多余的行会被丢掉。
+
+    **下边界同样放过**（2026-11-15 实机事故）：窗口 1902x1010 下，面板标题落在
+    ``panel.y + 0.83h``、放置目标在 ``+1.1h``、调色效果在 ``+1.4h``、笔触效果在
+    ``+2.4h``，而原来只取到 ``+1.0h``，OCR 只读到标题上半行 → ``reading.confidence``
+    只有 0.40（= 类别 0.24 + 等级 0.16），低于 ``_PANEL_TEXT_MIN_CONFIDENCE`` 0.55，
+    整份覆盖被丢掉，于是「玩法颜料-机械之神 LV3 / 纵向」被认成
+    「怪物 / 方向未知 / 家族空」。现在取到 ``+3.4h``，标题、放置目标、调色效果、
+    笔触效果四行都在框内（实测 151px 的面板高正好卡到笔触效果行）。
     """
     width = image.shape[1]
     height = image.shape[0]
@@ -979,7 +1393,7 @@ def _current_paint_text_crop(image: np.ndarray, panel: Rect) -> np.ndarray:
         panel.x + panel.w * 0.02,
         panel.y - panel.h * 1.20,
         panel.w * 0.96,
-        panel.h * 2.20,
+        panel.h * 4.60,
         width,
         height,
     )
@@ -1056,6 +1470,7 @@ def _analyze_current_paint(
         target_object,
         direction,
         upgrade_amount,
+        getattr(panel_text, "effect_text", None),
     )
 
     return CurrentPaintObservation(
@@ -1075,7 +1490,30 @@ def _analyze_current_paint(
         upgrade_amount=upgrade_amount,
         keyword_scores=keyword_scores,
         raw_text_hint=raw_text_hint,
+        effect_text=getattr(panel_text, "effect_text", None),
     )
+
+
+def _carry_confirmed_target(
+    previous: CurrentPaintObservation,
+    keyword_scores: dict[str, float],
+    detected: PaintObject,
+) -> PaintObject:
+    """上一帧文字确认过「作用对象」时，别让栅格模板把它翻掉。
+
+    实机证据（2026-11-14）：同一块面板，文字 OCR 读出「所有」
+    （``panel_text:target = 1.0``），栅格模板却给「玩法」0.90~0.96、
+    「所有」只有 0.28——差得很远，于是 ``_infer_target_object`` 的 0.88 短路口
+    每次都采信栅格，作用对象就在「所有 / 玩法」之间来回翻。
+    文字才是最终真值（见 ``_analyze_current_paint_fast`` 末尾的 override）；
+    这一帧只是**还没读到文字**（异步 OCR 有节流），所以沿用上一帧的文字结论。
+    """
+    if float(previous.keyword_scores.get("panel_text:target", 0.0)) < 0.5:
+        return detected if detected != PaintObject.UNKNOWN else previous.target_object
+    if float(keyword_scores.get("panel_text:target", 0.0)) >= 0.5:
+        # 本帧自己也读到文字了，交给 override 定论，这里不抢。
+        return detected if detected != PaintObject.UNKNOWN else previous.target_object
+    return previous.target_object
 
 
 def _analyze_current_paint_fast(
@@ -1127,7 +1565,7 @@ def _analyze_current_paint_fast(
         if level is None or level_confidence < 0.40:
             level = previous.level
             level_confidence = max(0.36, previous.level_confidence * 0.72)
-        target_object = detected_target if detected_target != PaintObject.UNKNOWN else previous.target_object
+        target_object = _carry_confirmed_target(previous, keyword_scores, detected_target)
         direction = detected_direction if detected_direction != PaintDirection.UNKNOWN else previous.direction
         match_current = previous.match_current
         match_required = previous.match_required
@@ -1177,6 +1615,7 @@ def _analyze_current_paint_fast(
         target_object,
         direction,
         upgrade_amount,
+        getattr(panel_text, "effect_text", None),
     )
     if previous is not None and not panel_changed:
         raw_text_hint = f"{raw_text_hint} fast"
@@ -1198,6 +1637,7 @@ def _analyze_current_paint_fast(
         upgrade_amount=upgrade_amount,
         keyword_scores=keyword_scores,
         raw_text_hint=raw_text_hint,
+        effect_text=getattr(panel_text, "effect_text", None),
     )
 
 
@@ -1863,6 +2303,7 @@ def _build_raw_text_hint(
     target_object: PaintObject,
     direction: PaintDirection,
     upgrade_amount: int | None,
+    effect_text: str | None = None,
 ) -> str:
     parts = [f"category={category.value}"]
     if level is not None:
@@ -1875,6 +2316,9 @@ def _build_raw_text_hint(
         parts.append(f"direction={direction.value}")
     if upgrade_amount is not None:
         parts.append(f"upgrade={upgrade_amount}")
+    # 笔触（调色效果）原文。以前这一行解析完就扔了，复盘时查不到「这笔吃的是哪条效果」。
+    if effect_text:
+        parts.append(f"effect={effect_text}")
     return " ".join(parts)
 
 
@@ -2222,6 +2666,64 @@ def _aligned_binary_template_score(target: np.ndarray, template: np.ndarray) -> 
     return float(max(0.0, score))
 
 
+#: 背包面板「自证存在」的三条阈值。
+#:
+#: BACKPACK 区域不是检测出来的，是按棋盘尺寸推出的相对矩形（右侧面板中部）。
+#: 没开背包时这块正好压在「选择笔触方向」的两张宽卡片上，`_calibrated_backpack_slots`
+#: 会照样切出 3×5 个 88px 方框，于是凭空产出 15 枚「怪物 Lv3」——实机表现为
+#: 「背包里根本不是这些颜料」。
+#:
+#: 阈值来自实测（6 张真背包截图 vs 笔触选择面板误判）：
+#:   真背包   V<85 占比 0.316~0.357，15 格指纹两两距离均值 0.555~0.674
+#:   笔触卡片 0.135 / 0.265
+#: 取偏严的一侧：漏判只丢一次背包读数（界面会显示「本帧未看到背包」），
+#: 误判却会把假颜料喂进估值与录制。
+BACKPACK_PANEL_MIN_DARK85 = 0.26
+BACKPACK_PANEL_MIN_FP_MEAN = 0.40
+BACKPACK_PANEL_MIN_SLOTS = 5
+
+
+def backpack_panel_evidence(
+    image: np.ndarray,
+    panel: Rect,
+    slots: tuple[Rect, ...],
+) -> dict[str, float]:
+    """量这块矩形像不像真的背包面板。
+
+    ``dark85``：背包格是深色底，面板内应有大比例暗像素。
+    ``fp_mean``：真背包 15 格装的是不同颜料，指纹两两距离大；笔触卡片被切成的
+    15 个假格是同一块连续画面的切片，彼此高度相似。
+    """
+    crop = image[panel.y : panel.bottom, panel.x : panel.right]
+    if crop.size == 0:
+        return {"dark85": 0.0, "fp_mean": 0.0, "slots": 0.0}
+    value = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)[:, :, 2]
+    dark85 = float(np.mean(value < 85))
+    fingerprints = [
+        _backpack_slot_fingerprint(image[slot.y : slot.bottom, slot.x : slot.right])
+        for slot in slots
+    ]
+    distances = [
+        _backpack_fingerprint_distance(fingerprints[i], fingerprints[j])
+        for i in range(len(fingerprints))
+        for j in range(i + 1, len(fingerprints))
+    ]
+    return {
+        "dark85": dark85,
+        "fp_mean": float(np.mean(distances)) if distances else 0.0,
+        "slots": float(len(slots)),
+    }
+
+
+def backpack_panel_present(image: np.ndarray, panel: Rect, slots: tuple[Rect, ...]) -> bool:
+    evidence = backpack_panel_evidence(image, panel, slots)
+    return (
+        evidence["slots"] >= BACKPACK_PANEL_MIN_SLOTS
+        and evidence["dark85"] >= BACKPACK_PANEL_MIN_DARK85
+        and evidence["fp_mean"] >= BACKPACK_PANEL_MIN_FP_MEAN
+    )
+
+
 def _analyze_backpack(
     image: np.ndarray,
     regions: tuple[RegionObservation, ...],
@@ -2232,6 +2734,9 @@ def _analyze_backpack(
 
     panel = region.rect
     slots = _locate_backpack_slots(image, panel)
+    if not backpack_panel_present(image, panel, slots):
+        return None
+    _reset_family_sync_budget()
     paints = tuple(
         observation
         for slot in slots
@@ -2254,6 +2759,9 @@ def _analyze_backpack_fast(
 
     panel = region.rect
     slots = _locate_backpack_slots_fast(image, panel, previous)
+    if not backpack_panel_present(image, panel, slots):
+        return None
+    _reset_family_sync_budget()
     previous_by_rect = {
         (paint.slot_rect.x, paint.slot_rect.y, paint.slot_rect.w, paint.slot_rect.h): paint
         for paint in (previous.paints if previous is not None else ())
@@ -2265,11 +2773,54 @@ def _analyze_backpack_fast(
             continue
         fingerprint = _backpack_slot_fingerprint(crop)
         cached = previous_by_rect.get((slot.x, slot.y, slot.w, slot.h))
-        if cached is not None and _backpack_fingerprint_distance(cached.fingerprint, fingerprint) <= 0.14:
+        unchanged = (
+            cached is not None
+            and _backpack_fingerprint_distance(cached.fingerprint, fingerprint)
+            <= FAMILY_MATCH_DISTANCE
+        )
+        # 内容没变、家族也已认出来的话整格沿用上一帧。
+        # 但家族可能是「后台刚认出来」的：这时要补算一次，否则空框永远不会变成图案。
+        if unchanged and not (cached.subtype is None and _family_lookup(fingerprint) is not None):
             is_selected, selection_confidence = _detect_selected_backpack_slot(crop)
             paints.append(
                 replace(
                     cached,
+                    slot_rect=slot,
+                    fingerprint=fingerprint,
+                    is_selected=is_selected,
+                    selection_confidence=selection_confidence,
+                )
+            )
+            continue
+        if unchanged:
+            observation = _analyze_backpack_slot_fast(
+                image,
+                slot,
+                assume_visible=True,
+                fingerprint=fingerprint,
+                identify_family=True,
+            )
+            if observation is not None:
+                paints.append(observation)
+            continue
+        # 长得一样的格子就是同一款颜料（同家族、同等级）：认一次就够。
+        # 指纹是 8×8 的 HSV 量化，同款两格实测距离 0.06~0.16，不同款都在 0.25 以上。
+        # 背包里「3 枚存活 Lv1」「4 枚狩猎之神 Lv1」这种重复很常见。
+        twin = next(
+            (
+                item
+                for item in paints
+                if item.subtype is not None
+                and _backpack_fingerprint_distance(item.fingerprint, fingerprint)
+                <= FAMILY_MATCH_DISTANCE
+            ),
+            None,
+        )
+        if twin is not None:
+            is_selected, selection_confidence = _detect_selected_backpack_slot(crop)
+            paints.append(
+                replace(
+                    twin,
                     slot_rect=slot,
                     fingerprint=fingerprint,
                     is_selected=is_selected,
@@ -2282,6 +2833,7 @@ def _analyze_backpack_fast(
             slot,
             assume_visible=True,
             fingerprint=fingerprint,
+            identify_family=True,
         )
         if observation is not None:
             paints.append(observation)
@@ -2296,19 +2848,32 @@ def _locate_backpack_slots_fast(
     panel: Rect,
     previous: BackpackObservation | None = None,
 ) -> tuple[Rect, ...]:
+    # 上一帧的格子坐标是**绝对坐标**，用之前必须按面板的位移/缩放映射过来。
+    # 直接用旧坐标会出事：面板整体挪 2 像素，裁出来的就是隔壁的边，指纹跟着全变，
+    # 缓存命中率从 99.9% 掉到个位数（实机观测里「同一 slot 矩形」的跨帧指纹距离
+    # mean=0.446，就是这么来的）。
     if previous is not None and previous.paints:
-        slots = tuple(
-            _bounded_rect(
-                paint.slot_rect.x,
-                paint.slot_rect.y,
-                paint.slot_rect.w,
-                paint.slot_rect.h,
-                image.shape[1],
-                image.shape[0],
+        base = previous.panel_rect
+        if base.w > 0 and base.h > 0:
+            scale_x = panel.w / float(base.w)
+            scale_y = panel.h / float(base.h)
+            mapped = tuple(
+                _bounded_rect(
+                    panel.x + (paint.slot_rect.x - base.x) * scale_x,
+                    panel.y + (paint.slot_rect.y - base.y) * scale_y,
+                    paint.slot_rect.w * scale_x,
+                    paint.slot_rect.h * scale_y,
+                    image.shape[1],
+                    image.shape[0],
+                )
+                for paint in previous.paints
             )
-            for paint in previous.paints
-        )
-        visible_slots = tuple(slot for slot in slots if _slot_has_icon(image, slot))
+        else:
+            mapped = tuple(
+                _bounded_rect(paint.slot_rect.x, paint.slot_rect.y, paint.slot_rect.w, paint.slot_rect.h, image.shape[1], image.shape[0])
+                for paint in previous.paints
+            )
+        visible_slots = tuple(slot for slot in mapped if _slot_has_icon(image, slot))
         if visible_slots:
             return visible_slots
     calibrated = _calibrated_backpack_slots(image, panel)
@@ -2342,19 +2907,37 @@ def _analyze_backpack_slot_fast(
     *,
     assume_visible: bool = False,
     fingerprint: str | None = None,
+    identify_family: bool = True,
 ) -> BackpackPaintObservation | None:
     crop = image[slot.y : slot.bottom, slot.x : slot.right]
     if crop.size == 0 or (not assume_visible and not _slot_has_icon(image, slot)):
         return None
 
-    category, category_confidence = _classify_backpack_category(crop)
+    if identify_family:
+        subtype, family_category, family_confidence = _identify_backpack_family(crop)
+    else:
+        subtype, family_category, family_confidence = None, PaintCategory.UNKNOWN, 0.0
+    if subtype is not None:
+        # 家族认出来了，类别和等级口径都跟着家族走（框形/框色只用来读等级）。
+        category, category_confidence = family_category, family_confidence
+    elif identify_family:
+        category, category_confidence = _classify_backpack_category(crop)
+    else:
+        # 这一帧没分到认家族的额度：**先不猜类别**，下一帧补认（指纹没变的会重试）。
+        # 框形状那一层每格 2.7ms，而实测 15 格背包清一色判成 ``gameplay 0.64``
+        # ——猜了等于没猜，不如空着让界面显示"待识别"。
+        category, category_confidence = PaintCategory.UNKNOWN, 0.0
     level, level_confidence = _detect_backpack_level_fast(crop, category)
     is_selected, selection_confidence = _detect_selected_backpack_slot(crop)
-    is_treasure, treasure_confidence = _detect_treasure_icon(crop)
-    if category == PaintCategory.MONSTER and category_confidence >= 0.55:
-        is_treasure = False
-    subtype = "宝箱" if is_treasure else None
+    is_treasure, treasure_confidence = _resolve_backpack_treasure(
+        crop,
+        subtype,
+        level,
+        category,
+        category_confidence,
+    )
     if is_treasure:
+        subtype = "宝箱"
         category = PaintCategory.GAMEPLAY
         category_confidence = max(category_confidence, treasure_confidence)
     return BackpackPaintObservation(
@@ -2487,6 +3070,14 @@ def _slot_has_icon(image: np.ndarray, slot: Rect) -> bool:
     crop = image[slot.y : slot.bottom, slot.x : slot.right]
     if crop.size == 0:
         return False
+    # 下面五项全是**比例**（占比、方差），跟分辨率无关，没必要在 94px 上算：
+    # 缩到 56px 后 Canny 和五个 mean 便宜三倍，判据值反而更稳
+    # （边缘占比 0.17~0.22 → 0.22~0.28，阈值不用动）。背包一帧 15 格，
+    # 省下来的是每帧实打实的几十毫秒。
+    longest = max(crop.shape[:2])
+    if longest > 56:
+        scale = 56.0 / longest
+        crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
     s = hsv[:, :, 1]
     v = hsv[:, :, 2]
@@ -2513,19 +3104,400 @@ def _slot_has_icon(image: np.ndarray, slot: Rect) -> bool:
     )
 
 
-def _analyze_backpack_slot(image: np.ndarray, slot: Rect) -> BackpackPaintObservation | None:
+def _family_category(family: str | None) -> PaintCategory:
+    """家族名 → 颜料大类。不在官方目录里返回 ``UNKNOWN``。
+
+    **类别由家族决定，不由框形状猜**：官方目录里每个家族只属于一类
+    （``ColorMonster*`` 是怪物、``ColorPlay*`` 是玩法），而框形状判据在 90px
+    的小格上很不稳——实测那张 15 格背包里，4 个圆形框（征战之神）全被判成
+    菱形，15 格清一色 ``gameplay 0.64``。
+    """
+    known = paint_kind.category_of(family)
+    if known == "monster":
+        return PaintCategory.MONSTER
+    if known == "gameplay":
+        return PaintCategory.GAMEPLAY
+    return PaintCategory.UNKNOWN
+
+
+#: 家族识别结果的**跨帧缓存**：内容指纹 → ``(家族, 类别, 置信度)``。
+#:
+#: 背包里同一款颜料会反复出现在同一格（换列、换页、重开面板），每次重认要花
+#: 40~60ms 的 ORB 匹配。指纹是 8×8 的 HSV 量化，实测「同一款颜料」距离 ≤0.16、
+#: 「不同款」≥0.25（见 ``test_backpack_family``）。
+#:
+#: **必须按距离查、不能按字符串精确查**：捕获到的画面每帧都会有 1~3 像素的位移
+#: 和亮度微变（组合器缩放、格内动画），同一格的指纹几乎从不逐字节相同——实机
+#: ``observations.jsonl`` 里 3156 对「同一个 slot 矩形」的相邻读数，精确相同只有
+#: 68.6%，但距离 ≤0.14 的占 **99.9%**。原先用 ``fingerprint in _FAMILY_CACHE``
+#: 精确查，等于每帧都判「没认出」，后台认出来的结果永远接不上：3402 次读数里
+#: ``subtype`` 非空 **0 次**，界面上就只剩等级框。
+#:
+#: 只缓存认出来的结果：认不出就下一轮重试，别让一次失败变成永久结论。
+_FAMILY_CACHE: dict[str, tuple[str, "PaintCategory", float]] = {}
+_FAMILY_CACHE_ORDER: list[str] = []
+FAMILY_CACHE_MAX = 512
+
+#: 指纹距离上限：同一格跨帧、同一款颜料之间的最大距离。
+#: 实测「同一 slot 矩形」相邻读数 99.9% ≤0.14，「不同款」≥0.25，取 0.14 两边都留余量。
+FAMILY_MATCH_DISTANCE = 0.14
+
+#: 最近邻查找用的指纹矩阵（惰性重建）。逐格线性扫 512 条 hex 字符串太慢，
+#: 转成 ``(N, 64) uint8`` 之后一次比较就是微秒级。
+_FAMILY_INDEX: "np.ndarray | None" = None
+_FAMILY_INDEX_KEYS: list[str] = []
+
+#: 每帧「同步认一格」的额度。后台线程是主路，这条只是保险：万一 ``family-id``
+#: 线程在某个环境里安静地死了（构造图标库失败、ORB 抛异常……），原先的表现是
+#: **永远**认不出来。留一格额度，最坏情况也能几秒内补完一页 15 格。
+FAMILY_SYNC_PER_FRAME = 1
+#: 队列积压到这个量才动同步通道：正常情况后台 22 格/秒足够，没必要抢帧预算。
+FAMILY_SYNC_PENDING_TRIGGER = 24
+_FAMILY_SYNC_LEFT = 0
+
+#: 后台线程最近几次异常。``except Exception: pass`` 会让「线程一直失败」
+#: 伪装成「没认出来」，出问题时至少能从这里看到真因。
+_FAMILY_WORKER_ERRORS: list[str] = []
+FAMILY_ERROR_LOG_MAX = 8
+
+#: 待认的格子队列。**认家族永远不在帧里做**：一格 40~60ms（27 个家族逐个 ORB
+#: 匹配），15 格就是 0.9 秒，比增量帧 0.2 秒的整帧预算还长——分帧认也就变成
+#: 「面板挂五六帧空框」。改成丢给后台线程后，帧内只查一次字典（微秒级），
+#: 认出来的那一刻下一次取场景就有图案。
+_FAMILY_QUEUE: "queue.Queue[tuple[str, np.ndarray]]" = queue.Queue()
+_FAMILY_PENDING: set[str] = set()
+_FAMILY_PENDING_LOCK = threading.Lock()
+#: 队列上限。画面在快速变化（动画、翻页）时别把队列堆成内存泄漏。
+FAMILY_QUEUE_MAX = 96
+_FAMILY_WORKER: threading.Thread | None = None
+_FAMILY_WORKER_GALLERY: "paint_icon.IconGallery | None" = None
+
+
+def reset_family_cache() -> None:
+    """清空家族缓存与待认队列（换游戏、换窗口尺寸、跑测试时用）。"""
+
+    global _FAMILY_INDEX
+    _FAMILY_CACHE.clear()
+    _FAMILY_CACHE_ORDER.clear()
+    _FAMILY_INDEX = None
+    _FAMILY_INDEX_KEYS.clear()
+    with _FAMILY_PENDING_LOCK:
+        _FAMILY_PENDING.clear()
+
+
+def _remember_family(fingerprint: str, family: str, category: "PaintCategory", confidence: float) -> None:
+    if not fingerprint:
+        return
+    global _FAMILY_INDEX
+    if fingerprint not in _FAMILY_CACHE:
+        _FAMILY_CACHE_ORDER.append(fingerprint)
+        # 追加而不是整表重建：后台线程每认出一格就会走到这里，而认一格只要 45ms，
+        # 重建一次 512 行的矩阵（每个键都要 fromhex 一遍）反而比识别本身还贵，
+        # 实测把一帧从 0.4s 顶到 1.6s（process_time 2.5s，多出来的都在重建上）。
+        if _FAMILY_INDEX is not None:
+            vector = _fingerprint_vector(fingerprint)
+            if vector is not None and vector.shape[0] == _FAMILY_INDEX.shape[1]:
+                _FAMILY_INDEX = np.vstack([_FAMILY_INDEX, vector[None, :]])
+                _FAMILY_INDEX_KEYS.append(fingerprint)
+            else:
+                _FAMILY_INDEX = None
+        while len(_FAMILY_CACHE_ORDER) > FAMILY_CACHE_MAX:
+            _FAMILY_CACHE.pop(_FAMILY_CACHE_ORDER.pop(0), None)
+            # 淘汰会让矩阵的行序跟键表错开，只能整表重建（很少发生）。
+            _FAMILY_INDEX = None
+    _FAMILY_CACHE[fingerprint] = (family, category, confidence)
+
+
+def _family_cache_size() -> int:
+    return len(_FAMILY_CACHE)
+
+
+def _fingerprint_vector(fingerprint: str) -> "np.ndarray | None":
+    try:
+        raw = bytes.fromhex(fingerprint)
+    except ValueError:
+        return None
+    if not raw:
+        return None
+    return np.frombuffer(raw, dtype=np.uint8).copy()
+
+
+def _family_index() -> "np.ndarray | None":
+    """把缓存里的指纹摊成 ``(N, 64)`` 矩阵，供最近邻查询。"""
+
+    global _FAMILY_INDEX, _FAMILY_INDEX_KEYS
+    if _FAMILY_INDEX is not None:
+        return _FAMILY_INDEX
+    vectors: list[np.ndarray] = []
+    keys: list[str] = []
+    for key in _FAMILY_CACHE:
+        vector = _fingerprint_vector(key)
+        if vector is None:
+            continue
+        vectors.append(vector)
+        keys.append(key)
+    if not vectors:
+        _FAMILY_INDEX_KEYS = []
+        return None
+    _FAMILY_INDEX_KEYS = keys
+    _FAMILY_INDEX = np.stack(vectors).astype(np.uint8)
+    return _FAMILY_INDEX
+
+
+def _family_lookup(fingerprint: str) -> "tuple[str, PaintCategory, float] | None":
+    """按**距离**查缓存，不是按字符串相等。
+
+    精确命中先走（同一张图重复取时占多数，零成本）；不中再拿最近邻比一次。
+    这一步是整条链路的关键：帧间总有 1~3 像素的位移，指纹几乎从不逐字节相同，
+    精确查等于每帧都判「没认出」。
+    """
+
+    if not fingerprint:
+        return None
+    cached = _FAMILY_CACHE.get(fingerprint)
+    if cached is not None:
+        return cached
+    matrix = _family_index()
+    if matrix is None:
+        return None
+    query = _fingerprint_vector(fingerprint)
+    if query is None or query.shape[0] != matrix.shape[1]:
+        return None
+    distances = np.count_nonzero(matrix != query, axis=1) / float(matrix.shape[1])
+    best = int(np.argmin(distances))
+    if distances[best] > FAMILY_MATCH_DISTANCE:
+        return None
+    return _FAMILY_CACHE.get(_FAMILY_INDEX_KEYS[best])
+
+
+def family_worker_status() -> dict[str, object]:
+    """后台认家族线程的状态（诊断用：异常计数 + 最近一条异常 + 缓存规模）。"""
+
+    with _FAMILY_PENDING_LOCK:
+        pending = len(_FAMILY_PENDING)
+    return {
+        "cache": len(_FAMILY_CACHE),
+        "pending": pending,
+        "queued": _FAMILY_QUEUE.qsize(),
+        "worker_alive": bool(_FAMILY_WORKER is not None and _FAMILY_WORKER.is_alive()),
+        "errors": list(_FAMILY_WORKER_ERRORS),
+    }
+
+
+def _record_family_error(text: str) -> None:
+    _FAMILY_WORKER_ERRORS.append(text)
+    while len(_FAMILY_WORKER_ERRORS) > FAMILY_ERROR_LOG_MAX:
+        _FAMILY_WORKER_ERRORS.pop(0)
+
+
+def _worker_gallery() -> "paint_icon.IconGallery":
+    """后台线程专用的图标库实例。
+
+    **必须和主线程分开**：``IconGallery`` 里的 ORB 和 BFMatcher 都有内部状态，
+    两个线程同时用同一个实例会拿到脏结果（而且主线程正在拿它认棋盘格）。
+    多一个实例的代价只是描述子数组，从缓存的 npz 载入不到 10ms。
+    """
+
+    global _FAMILY_WORKER_GALLERY
+    if _FAMILY_WORKER_GALLERY is None:
+        _FAMILY_WORKER_GALLERY = paint_icon.IconGallery()
+    return _FAMILY_WORKER_GALLERY
+
+
+def _lower_current_thread_priority() -> None:
+    """把「认家族」线程降到 ``THREAD_PRIORITY_BELOW_NORMAL``。
+
+    认完 15 格要跑 0.9 秒的 ORB，而交互帧也在算 OpenCV。同进程两个线程抢同一个
+    物理核时，帧延迟会被顶高——实测 11 张实机图里有 6 张因此超过 0.75 秒的
+    首帧预算（降到低优先级后回到 0.4~0.7 秒）。识别晚几十毫秒没人看得出来，
+    帧掉一下是能感觉到的。
+    """
+
+    try:
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenThread(0x0020, False, kernel32.GetCurrentThreadId())
+        if handle:
+            kernel32.SetThreadPriority(handle, -1)
+            kernel32.CloseHandle(handle)
+    except Exception:
+        pass
+
+
+def _family_worker_loop() -> None:
+    _lower_current_thread_priority()
+    while True:
+        fingerprint, crop = _FAMILY_QUEUE.get()
+        try:
+            if _family_lookup(fingerprint) is None:
+                match = _worker_gallery().identify(crop, center_ratio=paint_frame.ICON_SCALE)
+                if match is not None:
+                    category = _family_category(match.family)
+                    if category != PaintCategory.UNKNOWN:
+                        _remember_family(fingerprint, match.family, category, ICON_FALLBACK_CONFIDENCE)
+        except Exception as exc:  # 后台线程不能因为一张图崩掉就安静地死掉
+            _record_family_error(f"{type(exc).__name__}: {exc}")
+        finally:
+            with _FAMILY_PENDING_LOCK:
+                _FAMILY_PENDING.discard(fingerprint)
+            _FAMILY_QUEUE.task_done()
+
+
+def _ensure_family_worker() -> None:
+    global _FAMILY_WORKER
+    if _FAMILY_WORKER is not None and _FAMILY_WORKER.is_alive():
+        return
+    _FAMILY_WORKER = threading.Thread(target=_family_worker_loop, name="family-id", daemon=True)
+    _FAMILY_WORKER.start()
+
+
+def wait_for_family_identification(timeout: float = 10.0) -> bool:
+    """等后台把队列认完（测试与「点开背包立刻要结果」的场景用）。"""
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with _FAMILY_PENDING_LOCK:
+            pending = len(_FAMILY_PENDING)
+        if pending == 0:
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def _identify_backpack_family(
+    crop: np.ndarray,
+) -> tuple[str | None, PaintCategory, float]:
+    """认背包格里的家族，返回 ``(家族, 类别, 置信度)``。
+
+    认出来的走缓存直接给；认不出的**丢给后台线程**，本次返回「未知」，
+    下一次取场景时就有结果了。
+
+    为什么是「官方图标」而不是「模板库」：模板库（``paint_kind``）是 NCC，
+    要求同一块图案、同一个取景比例；它的模板采自**棋盘格**，而背包格只有 90 来
+    像素、外面套着品质框，取景比例对不上——实测 15 格只认出 7 格。官方图标
+    （``paint_icon``）用 ORB 比局部纹理，按官方 ``ICON_SCALE`` 裁掉外框后
+    15 格全中（good 55~93、领先亚军 5.4~11 倍）。数字见
+    :func:`paint_icon._center_crop`。
+    """
+    if crop.size == 0:
+        return None, PaintCategory.UNKNOWN, 0.0
+    fingerprint = _backpack_slot_fingerprint(crop)
+    cached = _family_lookup_for_crop(crop, fingerprint)
+    if cached is not None:
+        return cached
+    # 保险通道：后台线程万一在这个环境里认不动，攒下来的额度每帧补认一格。
+    # 只在「这一格从没认过」时消耗，认出来的结果照样进缓存，后面所有帧直接命中。
+    if _take_family_sync_budget():
+        identified = _identify_family_synchronously(crop)
+        if identified is not None:
+            family, category = identified
+            _remember_family(fingerprint, family, category, ICON_FALLBACK_CONFIDENCE)
+            return _FAMILY_CACHE[fingerprint]
+    with _FAMILY_PENDING_LOCK:
+        already_queued = fingerprint in _FAMILY_PENDING
+        if not already_queued and len(_FAMILY_PENDING) < FAMILY_QUEUE_MAX:
+            _FAMILY_PENDING.add(fingerprint)
+        else:
+            already_queued = True
+    if not already_queued:
+        _ensure_family_worker()
+        # crop 是调用方图像的视图，入队必须拷贝：那一帧之后就会被回收/复写。
+        _FAMILY_QUEUE.put((fingerprint, crop.copy()))
+    return None, PaintCategory.UNKNOWN, 0.0
+
+
+def _family_lookup_for_crop(
+    crop: np.ndarray,
+    fingerprint: str,
+) -> "tuple[str, PaintCategory, float] | None":
+    """查缓存。
+
+    这里刻意**不做「挪一像素再试」的多变体查询**：实机 ``observations.jsonl``
+    回放显示，只要 slot 坐标跟着面板一起平移（``_locate_backpack_slots_fast``
+    已经按面板位移映射上一帧的格子），同一格的模糊命中率就是 99.2%，
+    多变体只多出 8 倍指纹计算和最近邻扫描，收益不到一格。
+    """
+
+    return _family_lookup(fingerprint)
+
+
+def _take_family_sync_budget() -> bool:
+    """要不要在这一帧里直接认一格（抢 45ms 帧预算）。
+
+    只有后台通道明显不正常时才放行——否则等于把识别偷偷搬回帧里，
+    首帧就会因为认一格而变慢，而首帧不阻塞正是 ``test_backpack_family`` 锁住的语义。
+    """
+
+    global _FAMILY_SYNC_LEFT
+    if _FAMILY_SYNC_LEFT <= 0:
+        return False
+    if not _family_sync_needed():
+        return False
+    _FAMILY_SYNC_LEFT -= 1
+    return True
+
+
+def _family_sync_needed() -> bool:
+    if _FAMILY_WORKER_ERRORS:
+        return True
+    if _FAMILY_WORKER is not None and not _FAMILY_WORKER.is_alive():
+        return True
+    with _FAMILY_PENDING_LOCK:
+        pending = len(_FAMILY_PENDING)
+    return pending >= FAMILY_SYNC_PENDING_TRIGGER
+
+
+def _reset_family_sync_budget() -> None:
+    global _FAMILY_SYNC_LEFT
+    _FAMILY_SYNC_LEFT = FAMILY_SYNC_PER_FRAME
+
+
+def _identify_family_synchronously(crop: np.ndarray) -> "tuple[str, PaintCategory] | None":
+    """帧内直接认一格（40~60ms），只在后台通道失灵时兜底用。"""
+
+    try:
+        match = paint_icon.gallery().identify(crop, center_ratio=paint_frame.ICON_SCALE)
+    except Exception as exc:
+        _record_family_error(f"sync {type(exc).__name__}: {exc}")
+        return None
+    if match is None:
+        return None
+    category = _family_category(match.family)
+    if category == PaintCategory.UNKNOWN:
+        return None
+    return match.family, category
+
+
+
+def _analyze_backpack_slot(
+    image: np.ndarray,
+    slot: Rect,
+    *,
+    identify_family: bool = True,
+) -> BackpackPaintObservation | None:
     crop = image[slot.y : slot.bottom, slot.x : slot.right]
     if crop.size == 0 or not _slot_has_icon(image, slot):
         return None
 
-    category, category_confidence = _classify_backpack_category(crop)
+    if identify_family:
+        subtype, family_category, family_confidence = _identify_backpack_family(crop)
+    else:
+        subtype, family_category, family_confidence = None, PaintCategory.UNKNOWN, 0.0
+    if subtype is not None:
+        # 家族认出来了，类别和等级口径都跟着家族走（框形/框色只用来读等级）。
+        category, category_confidence = family_category, family_confidence
+    else:
+        category, category_confidence = _classify_backpack_category(crop)
     level, level_confidence = _detect_backpack_level(crop, category)
     is_selected, selection_confidence = _detect_selected_backpack_slot(crop)
-    is_treasure, treasure_confidence = _detect_treasure_icon(crop)
-    if category == PaintCategory.MONSTER and category_confidence >= 0.55:
-        is_treasure = False
-    subtype = "宝箱" if is_treasure else None
+    is_treasure, treasure_confidence = _resolve_backpack_treasure(
+        crop,
+        subtype,
+        level,
+        category,
+        category_confidence,
+    )
     if is_treasure:
+        subtype = "宝箱"
         category = PaintCategory.GAMEPLAY
         category_confidence = max(category_confidence, treasure_confidence)
     fingerprint = _backpack_slot_fingerprint(crop)
@@ -2541,6 +3513,31 @@ def _analyze_backpack_slot(image: np.ndarray, slot: Rect) -> BackpackPaintObserv
         is_selected=is_selected,
         selection_confidence=selection_confidence,
     )
+
+
+def _resolve_backpack_treasure(
+    crop: np.ndarray,
+    subtype: str | None,
+    level: int | None,
+    category: PaintCategory,
+    category_confidence: float,
+) -> tuple[bool, float]:
+    """这一格是不是宝箱。
+
+    家族认出来就只信家族（宝箱在官方目录里就是一个正常家族 ``ColorPlay1``）；
+    认不出来才回头看颜色，而且必须过棋盘那条**同样的闸**
+    （:func:`_color_treasure_allowed`）：Lv5 橙框本身就有 0.23 的金色占比、
+    等级读不出来、已判成怪物——三种一律不采信。
+
+    以前这里直接用 ``_detect_treasure_icon`` 的原始结论，没有闸也没有家族优先，
+    实机上「Lv5 橙框的空格」和「金色家族」都会被翻成宝箱。
+    """
+    if subtype is not None:
+        return subtype == "宝箱", 0.0
+    colored, treasure_confidence = _detect_treasure_icon(crop)
+    if colored and _color_treasure_allowed(level, category, category_confidence):
+        return True, treasure_confidence
+    return False, 0.0
 
 
 def _detect_selected_backpack_slot(crop: np.ndarray) -> tuple[bool, float]:
@@ -2663,18 +3660,15 @@ def _detect_backpack_level(
 
     color_level, color_confidence = _detect_backpack_level_by_frame_color(hsv, category)
 
-    # The label can be clipped on the third visible row, and the stylized font
-    # has weak synthetic-template matches. Prefer a strong outer-frame color.
+    # 角标 "LvN" 只能拿来**确认**，不能拿来翻案：
+    # ``_detect_level_digit_from_label`` 的模板是 OpenCV 合成字体，而卡片用的是
+    # 游戏自己的圆角粗体，实测同一格会读出 7、3 这种明显错值。框色（品质色）现在是
+    # 15/15 准的，所以以框色为准，角标只用来把同一结论的置信度抬上去。
     label = crop[int(crop.shape[0] * 0.56) :, int(crop.shape[1] * 0.54) :]
     digit = _detect_level_digit_from_label(label)
-    if digit is not None:
-        if color_level == digit:
-            return digit, max(0.78, color_confidence)
-        if color_level is not None and color_confidence >= 0.60:
-            return color_level, color_confidence
-        return digit, 0.74
-
-    if color_level is not None and color_confidence >= 0.42:
+    if digit is not None and color_level == digit:
+        return digit, max(0.78, color_confidence)
+    if color_level is not None:
         return color_level, color_confidence
 
     border = (
@@ -2696,54 +3690,142 @@ def _detect_backpack_level(
     return 1, 0.55
 
 
+#: 卡片外框是**纯色品质框**，等级就看它的色相：银白 1 / 绿 2 / 青 3 / 紫 4 / 橙 5 / 红 6。
+#:
+#: 这套「色相=等级」判据只在**框线本体的像素**上成立。卡片底纹是半透明的深青
+#: （h≈95~105、v 只有 60~80），一旦混进环带就会把绿框读成青框——也就是把 Lv2
+#: 读成 Lv3。2026-11-17 实拍 15 格（其中 11 格右下角 "LvN" 文字可读，当真值）：
+#:
+#: - 旧口径（s>50 & v>60，环带 0.050）：矮人绿框 Lv2 读成 **3**（cyan 0.42 > green 0.38）
+#: - 新口径（只收 v≥105，彩色要 s≥100、银白要 s<55）：15 格全部自洽，11/11 真值命中
+#: - 矮人绿框 green 0.62、cyan 0.00；紫菱形 purple 0.96；青菱形 cyan 0.96；绿菱形 green 0.95
+#:
+#: 环带同时收窄到 0.038：0.050 会同时套住框线外侧的背景。
+FRAME_BRIGHT_V = 105
+FRAME_COLOR_S = 100
+FRAME_GRAY_S = 55
+FRAME_RING_HALF = 0.038
+#: 橙/红读数的「成环」判据：主色必须覆盖这么多个角度段才算框线。
+#: 12 段取 0.55（≈7 段）：整圈框线通常铺满 10~12 段，图案穿角只有 2~4 段。
+RING_ANGULAR_BINS = 12
+RING_SPREAD_MIN = 0.55
+#: 色相 → 等级。区间左闭右开，单位是 OpenCV 的 0~179。
+FRAME_HUE_LEVELS: dict[int, tuple[tuple[int, int], ...]] = {
+    2: ((45, 86),),
+    3: ((86, 119),),
+    4: ((119, 166),),
+    5: ((8, 31),),
+    6: ((166, 180), (0, 8)),
+}
+
+
+def _ring_angular_spread(
+    hsv: np.ndarray,
+    ring: np.ndarray,
+    level: int,
+) -> float:
+    """主色像素在这个环带上覆盖了多少个角度段（0~1）。
+
+    用来区分「整圈的框线」和「穿过环带的图案」。机械之神的图案本身就是金橙色，
+    菱形环带在四个角上会切进图案里，于是读到橙色 → 被当成 Lv5（实机报过
+    「几个 5 级机械之神」）。整圈框线是均匀铺开的，图案穿角只覆盖少数几段。
+    """
+    if level not in FRAME_HUE_LEVELS:
+        return 0.0
+    h = hsv[:, :, 0]
+    s = hsv[:, :, 1]
+    v = hsv[:, :, 2]
+    colored = ring & (v >= FRAME_BRIGHT_V) & (s >= FRAME_COLOR_S)
+    hit = np.zeros(h.shape, dtype=bool)
+    for low, high in FRAME_HUE_LEVELS[level]:
+        hit |= colored & (h >= low) & (h < high)
+    ys, xs = np.nonzero(hit)
+    if ys.size == 0:
+        return 0.0
+    height, width = h.shape[:2]
+    angles = np.arctan2(ys - (height - 1) / 2.0, xs - (width - 1) / 2.0)
+    bins = ((angles + np.pi) / (2 * np.pi) * RING_ANGULAR_BINS).astype(np.int32) % RING_ANGULAR_BINS
+    return float(np.unique(bins).size / RING_ANGULAR_BINS)
+
+
+def _frame_color_reading(
+    hsv: np.ndarray,
+    ring: np.ndarray,
+) -> tuple[int, float]:
+    """在给定环带上读「主色 → 等级」，返回 ``(等级, 该色的占比)``。
+
+    色相统计走一次 ``bincount`` 再按区间求和，而不是六个等级各扫一遍全图：
+    背包一帧 15 格 × 2 种环带，这是每帧都要付的钱。
+    """
+    s = hsv[:, :, 1]
+    v = hsv[:, :, 2]
+    frame = ring & (v > 45)
+    total = int(np.count_nonzero(frame))
+    if total <= 0:
+        return 0, 0.0
+    bright = frame & (v >= FRAME_BRIGHT_V)
+    picked = int(np.count_nonzero(bright))
+    # 框线本身很细：整圈里收不到一成半的亮像素，说明这一圈根本没压在框上。
+    if picked < total * 0.15:
+        return 0, 0.0
+
+    gray = int(np.count_nonzero(bright & (s < FRAME_GRAY_S)))
+    colored = bright & (s >= FRAME_COLOR_S)
+    ratios: dict[int, float] = {1: gray / picked}
+    if np.any(colored):
+        hist = np.bincount(hsv[:, :, 0][colored].ravel(), minlength=180)
+        for level, ranges in FRAME_HUE_LEVELS.items():
+            hit = sum(int(hist[low:high].sum()) for low, high in ranges)
+            ratios[level] = hit / picked
+    else:
+        for level in FRAME_HUE_LEVELS:
+            ratios[level] = 0.0
+    best_level, best_ratio = max(ratios.items(), key=lambda item: item[1])
+    # 橙/红最容易被图案本身污染（机械之神、宝箱都是金橙色）。要求它们**成环**：
+    # 主色覆盖不到六成角度段，说明那是图案穿进环带，不是框线，直接不采信这套环带。
+    if best_level in (5, 6) and best_ratio >= 0.30:
+        if _ring_angular_spread(hsv, ring, best_level) < RING_SPREAD_MIN:
+            return 0, 0.0
+    return best_level, best_ratio
+
+
 def _detect_backpack_level_by_frame_color(
     hsv: np.ndarray,
     category: PaintCategory = PaintCategory.UNKNOWN,
 ) -> tuple[int | None, float]:
+    """读卡片品质框的颜色定等级。
+
+    **圆形和菱形两套环带都试，取主色占比高的那个**——不按 ``category`` 选框型。
+    ``category`` 是从家族反推的，而实拍里就有反例：``jietu/初始和背包宝箱.png``
+    15 格全是玩法（``category=gameplay``，该用菱形环带），其中 4 格的框其实是**圆形**，
+    按菱形采样会把 Lv1 读成 Lv3（diamond 0.37 的主色是杂色，circle 0.56 才是银白）。
+    两种都试时，那张图 circle 15/15、diamond 13/15，取大者正好 15/15；
+    本机新截图两种各 15/15，取大者不变。
+    """
     if hsv.size == 0:
         return None, 0.0
-    h = hsv[:, :, 0]
-    s = hsv[:, :, 1]
-    v = hsv[:, :, 2]
-    height, width = h.shape[:2]
-    yy, xx = np.indices(h.shape)
+    height, width = hsv.shape[:2]
+    yy, xx = np.indices((height, width))
     cx = (width - 1) / 2.0
     cy = (height - 1) / 2.0
 
     xnorm = np.abs(xx - cx) / max(1.0, width * 0.43)
     ynorm = np.abs(yy - cy) / max(1.0, height * 0.43)
-    diamond_frame = np.abs(xnorm + ynorm - 1.0) < 0.050
+    diamond_frame = np.abs(xnorm + ynorm - 1.0) < FRAME_RING_HALF
     circle_radius = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2) / max(1.0, min(width, height) * 0.40)
-    circle_frame = np.abs(circle_radius - 1.0) < 0.050
+    circle_frame = np.abs(circle_radius - 1.0) < FRAME_RING_HALF
+    # 角标那块的亮字会污染环带，先剔掉
     label_area = (xx > width * 0.56) & (yy > height * 0.58)
-    if category == PaintCategory.GAMEPLAY:
-        frame_shape = diamond_frame
-    elif category == PaintCategory.MONSTER:
-        frame_shape = circle_frame
-    else:
-        frame_shape = diamond_frame | circle_frame
-    frame = frame_shape & ~label_area & (v > 45)
-    if np.mean(frame) < 0.012:
-        return None, 0.0
 
-    total = max(1, int(np.sum(frame)))
-    ratios = {
-        1: float(np.sum(frame & (s < 120) & (v > 70)) / total),
-        2: float(np.sum(frame & (h >= 45) & (h <= 85) & (s > 50) & (v > 60)) / total),
-        3: float(np.sum(frame & (h >= 88) & (h <= 118) & (s > 50) & (v > 60)) / total),
-        4: float(np.sum(frame & (h >= 120) & (h <= 165) & (s > 45) & (v > 60)) / total),
-        5: float(np.sum(frame & (h >= 8) & (h <= 30) & (s > 50) & (v > 70)) / total),
-        6: float(np.sum(frame & (((h <= 8) | (h >= 170)) & (s > 50) & (v > 60))) / total),
-    }
-    # Silver Lv1 borders can surround highly saturated blue artwork. Once the
-    # low-saturation frame itself dominates, do not let the inner icon's blue
-    # pixels relabel the slot as Lv3.
-    if ratios[1] >= 0.65:
-        return 1, float(np.clip(ratios[1] / 0.72, 0.50, 0.92))
-    best_level, best_ratio = max(ratios.items(), key=lambda item: item[1])
-    if best_ratio >= 0.18:
-        return best_level, float(np.clip(best_ratio / 0.72, 0.50, 0.92))
-    return None, 0.0
+    best_level, best_ratio = 0, 0.0
+    for ring in (diamond_frame, circle_frame):
+        level, ratio = _frame_color_reading(hsv, ring & ~label_area)
+        if ratio > best_ratio:
+            best_level, best_ratio = level, ratio
+    best_level_int = int(best_level)
+    if best_level_int <= 0 or best_ratio < 0.30:
+        return None, 0.0
+    return best_level_int, float(np.clip(best_ratio / 0.75, 0.50, 0.92))
 
 
 def _detect_level_digit_from_label(label_crop: np.ndarray) -> int | None:
@@ -2766,6 +3848,28 @@ def _detect_level_digit_from_label(label_crop: np.ndarray) -> int | None:
     return None
 
 
+#: 「金色占比」判宝箱的两个阈值。
+#:
+#: 2026-11-12 用 ``runtime/s8_paint_icons`` 里的官方图标实测（合成到深色底）：
+#:
+#: ==========  ==========
+#: 家族        金色占比
+#: ==========  ==========
+#: 英灵        0.288
+#: 宝箱        0.266
+#: 机械之神    0.133
+#: 玩偶        0.124
+#: 迷城        0.087
+#: ==========  ==========
+#:
+#: 旧的 0.13 正好卡在「机械之神」上面（0.133 > 0.13），会把金色玩法面料判成
+#: 宝箱；而怪物「英灵」比真宝箱还金，靠颜色根本无法区分。抬到 0.20 后
+#: 机械之神/玩偶/迷城都被排除，真宝箱仍有余量。**这条启发式只信"很金"，
+#: 不负责认人**——认家族一律走 :mod:`paint_kind` 与 :mod:`paint_icon`。
+TREASURE_GOLD_RATIO = 0.20
+TREASURE_CENTER_GOLD = 0.15
+
+
 def _detect_treasure_icon(crop: np.ndarray) -> tuple[bool, float]:
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
     h = hsv[:, :, 0]
@@ -2777,15 +3881,16 @@ def _detect_treasure_icon(crop: np.ndarray) -> tuple[bool, float]:
         return False, 0.0
     center_hsv = cv2.cvtColor(dark_center, cv2.COLOR_BGR2HSV)
     center_gold = float(np.mean((center_hsv[:, :, 0] >= 13) & (center_hsv[:, :, 0] <= 38) & (center_hsv[:, :, 1] > 70) & (center_hsv[:, :, 2] > 95)))
-    confidence = float(np.clip(max(gold_ratio, center_gold) / 0.20, 0.0, 0.85))
-    return (gold_ratio > 0.13 and center_gold > 0.10), confidence
+    confidence = float(np.clip(max(gold_ratio, center_gold) / TREASURE_GOLD_RATIO, 0.0, 0.85))
+    return (gold_ratio > TREASURE_GOLD_RATIO and center_gold > TREASURE_CENTER_GOLD), confidence
 
 
 def _backpack_slot_fingerprint(crop: np.ndarray) -> str:
     small = cv2.resize(crop, (8, 8), interpolation=cv2.INTER_AREA)
     hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
     quantized = (hsv[:, :, 0] // 12).astype(np.uint8)
-    return "".join(f"{value:02x}" for value in quantized.flatten())
+    # ``tobytes().hex()`` 与逐元素 f-string 等价，但快一个数量级——一帧要算几十次。
+    return quantized.tobytes().hex()
 
 
 def _backpack_fingerprint_distance(first: str, second: str) -> float:
@@ -3812,7 +4917,7 @@ def _estimated_board_layout_candidates(image: np.ndarray) -> list[Rect]:
     # 下面那组硬编码比例只是「大概在这个方向」的兜底，实测值能直接落到正确位置：
     # 1037x544 实测，兜底比例 (0.620, 0.215, 0.245) 会整体右偏整整一格，
     # 而标定值 (0.594, 0.187, 0.256) 一格不差。
-    screen = _screen_layout()
+    screen = _screen_layout(width, height)
 
     def _add(rect: Rect) -> None:
         if not _is_rect_inside_image(image.shape, rect):
@@ -4594,6 +5699,8 @@ def _classify_tile_observation(
 ) -> TileObservation:
     state, confidence, features = classify_tile(tile_bgr)
     scope_score, anchor_score = _tile_scope_and_anchor_scores(tile_bgr)
+    # 初始颜料的感叹号：静态 UI 标记，不受「金框在不在」影响。
+    features["initial_marker_score"] = _tile_initial_marker_score(tile_bgr)
     is_scope_highlight = scope_score >= 0.24 and (
         state == TileState.BLANK or _features_look_like_blank_tile(features)
     )
@@ -4648,9 +5755,20 @@ def _classify_tile_observation(
     ):
         state = TileState.PAINT
         confidence = max(confidence, min(0.90, paint_detail_score))
-    # 角标做最终仲裁：有角标就是颜料；没有角标、连类别都认不出来，就不是颜料。
+    # 角标做最终仲裁：有角标就是颜料；没有角标、连家族/等级都读不出来，就不是颜料。
+    #
+    # 旧条件只认 ``paint_category == UNKNOWN``，于是「无角标、无家族、无等级，
+    # 但颜色被判成 monster 0.78」的深色空板会被当成颜料。实测新一局入画后
+    # **18/36 格空板全部变成「怪物」**（v≈0.32、s≈0.36，没有任何图案），
+    # 整盘 blank/void 归零 → 「满铺」判据失效 → 收尾后认不出新局，
+    # 界面一直挂着上一局的规则与推荐。
+    #
+    # 判据换成「有没有读出东西」：家族图案和等级任意一项在，就仍是颜料
+    # （动画帧会漏读角标，不该因此把已经认出来的颜料降级）；
+    # 两者都没有，说明这格提供不了任何颜料信息，颜色像什么都不算数。
     if state in {TileState.PAINT, TileState.UNKNOWN} and not label.present:
-        if paint_category == PaintCategory.UNKNOWN and not paint_is_treasure:
+        detail_known = paint_subtype is not None or paint_level is not None
+        if not detail_known and not paint_is_treasure:
             # 这里要区分「作画阶段带白色画笔水印的可放置空白」和
             # 「入画阶段/不可放置地块的平灰底」——两者都没有角标，但只有前者能落子。
             # 实测：带画笔水印的空白 mean_v≈0.81、white_ratio≈0.07；
@@ -4728,6 +5846,43 @@ def _resolve_board_scope_anchor(tiles: list[TileObservation]) -> list[TileObserv
     ]
 
 
+#: 「初始颜料」标记（格子左上角的感叹号）的判据区间。
+#:
+#: 标记形状是**深灰圆底 + 纯白感叹号**，实测 2026-11-15（1239x780，r2c2）：
+#: 该区域白色占比 0.185、暗色占比 0.459。同盘其它 35 格分两类，都不在区间内：
+#: 浅底格白色 0.42~0.87 且暗色 <0.25，虚空/阻挡格白色 ≈0 且暗色 0.76+。
+#: 两个条件必须**同时**成立 —— 单看白色会命中所有浅底格，单看暗色会命中虚空。
+INITIAL_MARKER_WHITE = (0.08, 0.40)
+INITIAL_MARKER_DARK = (0.25, 0.75)
+
+
+def _tile_initial_marker_score(tile_bgr: np.ndarray) -> float:
+    """左上角有没有那颗感叹号：有则 1.0，没有则 0.0。
+
+    与金色高亮（``_tile_scope_and_anchor_scores``）无关：感叹号是**静态 UI 标记**，
+    新画纸预置的初始颜料一直带着它；金框只在选中作用范围时出现。
+    2026-11-15 实机：金框消失的那一帧 scope/anchor 都归零，感叹号照旧在。
+    """
+    if tile_bgr.size == 0:
+        return 0.0
+    hsv = cv2.cvtColor(tile_bgr, cv2.COLOR_BGR2HSV)
+    height, width = hsv.shape[:2]
+    marker_height = max(1, int(height * 0.32))
+    marker_width = max(1, int(width * 0.28))
+    marker = hsv[:marker_height, :marker_width]
+    value = marker[:, :, 2]
+    saturation = marker[:, :, 1]
+    white = float(np.mean((saturation < 80) & (value > 180)))
+    white_lo, white_hi = INITIAL_MARKER_WHITE
+    if not white_lo <= white <= white_hi:
+        return 0.0
+    dark = float(np.mean(value < 95))
+    dark_lo, dark_hi = INITIAL_MARKER_DARK
+    if not dark_lo <= dark <= dark_hi:
+        return 0.0
+    return 1.0
+
+
 def _tile_scope_and_anchor_scores(tile_bgr: np.ndarray) -> tuple[float, float]:
     if tile_bgr.size == 0:
         return 0.0, 0.0
@@ -4778,6 +5933,42 @@ def _tile_signature_from_features(features: dict[str, float]) -> tuple[float, ..
     return tuple(values)
 
 
+#: 外框本身的金色占比就超过阈值的等级。
+#:
+#: Lv5 是橙色菱形框（``runtime/s8_frames/diamond_Lv5_橙.png`` 实测 0.232），
+#: 一个**没有任何图案**的空 Lv5 框都会被判成宝箱、置信度还顶到 0.85。
+#: 也就是说这一级颜色判据完全不具分辨力，直接不采信。
+TREASURE_COLOR_UNTRUSTED_LEVELS = frozenset({5})
+
+#: 判成怪物后还允许颜色翻成宝箱的最低置信度。与背包面板那条路径的守卫
+#: 同值同义（见 :func:`_read_backpack_slot`），两条路径不能各自一套标准。
+TREASURE_MONSTER_GUARD_CONFIDENCE = 0.55
+
+
+def _color_treasure_allowed(
+    level: int | None,
+    category: "PaintCategory",
+    category_confidence: float,
+) -> bool:
+    """颜色兜底判宝箱的最后两道闸。
+
+    只有「模板库」和「官方 27 图标」**都没认出**这个格子时才会走到这里。
+    颜色本身分不开宝箱和金色家族（英灵比宝箱还金），所以只排除两种
+    "绝不可能是宝箱"的情形：
+
+    * 该等级的外框自己就够金（Lv5 橙框），颜色没有分辨力；
+    * 等级读不出来——外框占比无从扣除，这时候颜色说什么都不能信；
+    * 已经明确判成怪物——升级不会把怪物变成宝箱。
+    """
+    if level is None:
+        return False
+    if level in TREASURE_COLOR_UNTRUSTED_LEVELS:
+        return False
+    if category == PaintCategory.MONSTER and category_confidence >= TREASURE_MONSTER_GUARD_CONFIDENCE:
+        return False
+    return True
+
+
 def _analyze_board_paint_tile(
     tile_bgr: np.ndarray,
     label: "tile_reader.LabelReading | None" = None,
@@ -4808,9 +5999,15 @@ def _analyze_board_paint_tile(
     # 画的是同一张图，只是外框颜色变。认对了种类，类别也顺带确定：
     # 「鼠人」只可能是怪物颜料，「机械之神」只可能是玩法颜料。
     #
-    # 顺序上种类优先于「宝箱」启发式：后者只看图标里有没有箱体特征，
-    # 实机上会把金色狮头、红甲战士也报成宝箱（``斜对角`` 那局两格全错），
-    # 而种类识别是拿整张图案跟模板比，分数过了阈值就该它说了算。
+    # 顺序必须是「模板 → 官方图标 → 颜色」三层，颜色垫底。宝箱本身就是一个
+    # 正常家族（官方 ColorPlay1），而「金色占比高」分不开宝箱和金色家族：
+    # 实测官方图标里英灵 0.288、机械之神 0.133，都不低于真宝箱 0.266 多少。
+    # 更致命的是**等级外框**——Lv5 的橙色菱形框单独就有 0.232 的金色占比，
+    # 一个没有任何图案的空 Lv5 框都会被判成宝箱（conf 顶格 0.85）。
+    # 2026-11-12 的实机记录就是这么错的：r1c1「玩法 Lv5」被翻成「玩法·宝箱」、
+    # 升到 Lv6（红框，金色占比 0.000）又"变回"玩法；r3c4 甚至从「怪物 Lv4」
+    # 被硬翻成「玩法·宝箱 Lv5」。所以官方 27 图标的兜底必须排在颜色之前，
+    # 颜色只留作最后一道弱证据，并且要扣掉等级外框基线。
     kind = paint_kind.read_kind(tile_bgr)
     if kind.present and kind.subtype:
         subtype = kind.subtype
@@ -4821,10 +6018,7 @@ def _analyze_board_paint_tile(
         elif known_category == "gameplay":
             category = PaintCategory.GAMEPLAY
             category_confidence = max(category_confidence, kind.score)
-    elif is_treasure:
-        subtype = "宝箱"
-        category = PaintCategory.GAMEPLAY
-        category_confidence = max(category_confidence, treasure_confidence)
+        is_treasure = subtype == "宝箱"
     else:
         # 模板库只认识「见过并入库」的家族；剩下 11 个家族一直靠实机截图慢慢攒。
         # 现在有 27 张官方图标，模板认不出时可以直接对着标准照认人（见 paint_icon）。
@@ -4843,7 +6037,17 @@ def _analyze_board_paint_tile(
             elif known_category == "gameplay":
                 category = PaintCategory.GAMEPLAY
             category_confidence = max(category_confidence, ICON_FALLBACK_CONFIDENCE)
-            is_treasure = is_treasure or subtype == "宝箱"
+            is_treasure = subtype == "宝箱"
+        elif is_treasure and _color_treasure_allowed(level, category, category_confidence):
+            # 图案两层都没认出来，只剩颜色。这里必须挡住两种情况：
+            # Lv5 的橙色外框（基线 0.23，任何格子都会过线），以及已经明确
+            # 判成怪物的格子（怪物不可能变宝箱，升级也不改类别）。
+            subtype = "宝箱"
+            category = PaintCategory.GAMEPLAY
+            category_confidence = max(category_confidence, treasure_confidence)
+        else:
+            # 颜色说像宝箱但被守卫拦下：不挂"宝箱"，也别谎报真值。
+            is_treasure = False
     return category, category_confidence, level, level_confidence, subtype, is_treasure
 
 
@@ -4884,15 +6088,14 @@ def _detect_board_tile_level(
         margin = reading.level_score - reading.scores.get(1, 0.0)
         if margin >= SILVER_LABEL_MARGIN:
             return reading.level, reading.level_score
-    # 彩框（Lv7）已有边框侧的正向证据。角标也读成 7 时改采信角标——
-    # 它的分数（1.00）比边框的 0.72 硬；角标把 7 读歪成 5 时（7 只有 0.48 分）
-    # 就不能听它的，交给边框。
-    if (
-        frame.level == 7
-        and reading.level == 7
-        and reading.level_score >= tile_reader.LEVEL_TRUST_SCORE
-    ):
-        return reading.level, reading.level_score
+    # 角标自己清晰读出 7（模板分 ≥ LEVEL_TRUST_SCORE）就采信，**不看边框**。
+    #
+    # 7 是最高等级，边框是动画彩虹环：2026-11-18 那局 r2c3 黑帆真实 Lv7，
+    # 逐帧边框读成 6 → 4 → 7 → 5 → 1（彩虹转起来时主色相偏橙就判 Lv5、
+    # 饱和掉下去就判银框 Lv1），只有一帧读到 7。角标是像素级模板匹配，
+    # Lv1~Lv6 的角标读出 7 的分数只有 0.48 左右，碰不到 0.95 这道门槛。
+    if reading.level == 7 and reading.level_score >= tile_reader.LEVEL_TRUST_SCORE:
+        return 7, reading.level_score
     if frame.level is not None and frame.confidence >= 0.70:
         confidence = frame.confidence
         # 角标和边框色打架时留个痕迹，并把置信度压下来（边框色更可信，仍然采用它）。
@@ -5080,6 +6283,21 @@ def classify_tile(tile_bgr: np.ndarray) -> tuple[TileState, float, dict[str, flo
 
     if blocked_ice_like:
         return TileState.BLOCKED, _conf(cyan_ratio + center_blue + mean_s, 1.65, 2.55), features
+
+    # 纯深蓝空板（棋盘底色/不可放置的空洞）：整格几乎同一块蓝，没有任何亮部。
+    # 背包「框形状」分类器会把它当成怪物框（实测 0.78，正好越过下面那道 0.62），
+    # 而棋盘上真正的颜料**一定有亮部**——图案或 Lv 角标，
+    # 实测最低的真颜料 bright_ratio≥0.45，空板则是 0.00（v≈0.32、s≈0.36）。
+    # 不拦的话：新一局入画后 17/36 格深色空板全被认成「怪物 Lv?」，
+    # 整盘 blank/void 归零 → 「满铺」判据失效 → 收尾后认不出新局。
+    if (
+        blue_ratio > 0.90
+        and center_blue > 0.88
+        and bright_ratio < 0.05
+        and white_ratio < 0.03
+        and mean_v < 0.45
+    ):
+        return TileState.VOID, _conf(blue_ratio, 0.90, 1.00), features
 
     # Board paints can be blue/green and look close to ice by color alone, but
     # blank shovel highlights also create weak diamond-like lines. Only trust

@@ -227,6 +227,40 @@ class OutcomeContractTests(unittest.TestCase):
         self.assertEqual(RISK_SCHEMA, stats["outcome_risk"]["schema"])
 
 
+class ObservationSourceGateTests(unittest.TestCase):
+    """学习样本只收真实截图，诊断事件不受这条限制。
+
+    之前这条门对所有事件一律生效，于是游戏日志和自动跟随状态机的现场记录
+    全被静默丢掉——工具「不出声」，事后也没有任何痕迹可查。
+    """
+
+    def test_only_real_capture_reaches_the_learning_log(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            log = root / "observations.jsonl"
+            with patch.multiple(learning, RUNTIME_DIR=root, OBSERVATION_LOG=log):
+                learning.record_observation("quick_capture_step", {"a": 1}, source="replay")
+                learning.record_observation("quick_capture_step", {"a": 1}, source="real_capture")
+
+            events = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+
+        self.assertEqual(1, len(events))
+        self.assertEqual("real_capture", events[0]["source"])
+
+    def test_diagnostic_events_get_through_from_any_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            log = root / "observations.jsonl"
+            with patch.multiple(learning, RUNTIME_DIR=root, OBSERVATION_LOG=log):
+                learning.record_observation("game_log_event", {"name": "pigment"}, source="game_log")
+                learning.record_observation("auto_follow_pause", {"wgc": "x"}, source="auto_follow")
+
+            events = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+
+        self.assertEqual(["game_log_event", "auto_follow_pause"], [item["event"] for item in events])
+        self.assertEqual("game_log", events[0]["source"])
+
+
 class RiskReportTests(unittest.TestCase):
     def test_report_computes_required_distribution_and_resource_metrics(self) -> None:
         events = [_run_event(f"run-{index}", float(index), high=index > 10) for index in range(1, 21)]

@@ -133,7 +133,12 @@ def _paint_changed(previous: FastVisionSnapshot, current: FastVisionSnapshot) ->
 
 
 def _backpack_changed(previous: FastVisionSnapshot, current: FastVisionSnapshot) -> FastVisionEvent:
-    if (
+    previous_selected = tuple(paint.slot_index for paint in previous.backpack if paint.is_selected)
+    current_selected = tuple(paint.slot_index for paint in current.backpack if paint.is_selected)
+    if previous_selected != current_selected:
+        kind = "selection_state_changed"
+        confidence = min(0.9, _snapshot_confidence(current))
+    elif (
         previous.backpack
         and current.backpack
         and len(previous.backpack) == len(current.backpack)
@@ -141,8 +146,8 @@ def _backpack_changed(previous: FastVisionSnapshot, current: FastVisionSnapshot)
         and previous.board_signature == current.board_signature
         and previous.paint_signature == current.paint_signature
     ):
-        kind = "selection_state_changed"
-        confidence = min(0.65, _snapshot_confidence(current))
+        kind = "backpack_visual_changed"
+        confidence = min(0.55, _snapshot_confidence(current))
     elif previous.backpack and not current.backpack:
         kind = "backpack_disappeared"
         confidence = _snapshot_confidence(current)
@@ -160,6 +165,8 @@ def _backpack_changed(previous: FastVisionSnapshot, current: FastVisionSnapshot)
             "previous_count": len(previous.backpack),
             "backpack_signature": current.backpack_signature,
             "previous_backpack_signature": previous.backpack_signature,
+            "selected_slots": current_selected,
+            "previous_selected_slots": previous_selected,
         },
     )
 

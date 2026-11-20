@@ -1,0 +1,61 @@
+{
+  "note": "笔锋面板（选笔触方向 / 选笔触效果）文字真值。rect 是相对整图的 x/y/w/h 比例；affixes 用官方词缀展示名，顺序即卡片从上到下的顺序。",
+  "cases": [
+    {
+      "image": "jietu/其他.png",
+      "rect": [0.52899, 0.39522, 0.45248, 0.28474],
+      "stage": "direction",
+      "brush_types": ["transform", "stack"],
+      "affixes": []
+    },
+    {
+      "image": "jietu/堆砌选择前.png",
+      "rect": [0.52899, 0.39522, 0.45248, 0.28474],
+      "stage": "direction",
+      "brush_types": ["transform", "stack"],
+      "affixes": []
+    },
+    {
+      "image": "jietu/斜对角.png",
+      "rect": [0.52899, 0.39066, 0.45248, 0.28474],
+      "stage": "direction",
+      "brush_types": ["stack", "spread"],
+      "affixes": []
+    },
+    {
+      "image": "jietu/纵向.png",
+      "rect": [0.52899, 0.39294, 0.45248, 0.28474],
+      "stage": "direction",
+      "brush_types": ["transform", "stack"],
+      "affixes": []
+    },
+    {
+      "image": "jietu/堆砌后选择前.png",
+      "rect": [0.52899, 0.39294, 0.45248, 0.28474],
+      "stage": "effect",
+      "brush_types": [],
+      "affixes": ["自身提升2级", "范围内随机1个颜料提升1级"]
+    },
+    {
+      "image": "jietu/扩散后选择前.png",
+      "rect": [0.52899, 0.39522, 0.45248, 0.28474],
+      "stage": "effect",
+      "brush_types": [],
+      "affixes": ["纵向随机阻挡地块变为空白地块", "当前颜料可放置在阻挡地块"]
+    },
+    {
+      "image": "jietu/转锋后选择前.png",
+      "rect": [0.52899, 0.39522, 0.45248, 0.28474],
+      "stage": "effect",
+      "brush_types": [],
+      "affixes": ["随机改变自身的内容，等级不变", "当前颜料等级随机改变"]
+    },
+    {
+      "image": "jietu/重新获取随机调色颜料之前.png",
+      "rect": [0.52899, 0.39522, 0.45248, 0.28474],
+      "stage": "effect",
+      "brush_types": [],
+      "affixes": ["作用方向改为横向", "重新获得一个随机初始颜料"]
+    }
+  ]
+}

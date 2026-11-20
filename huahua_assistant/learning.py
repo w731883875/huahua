@@ -22,14 +22,36 @@ OBSERVATION_LOG = RUNTIME_DIR / "observations.jsonl"
 CORRECTION_LOG = RUNTIME_DIR / "corrected_observations.jsonl"
 TRAJECTORY_LOG = RUNTIME_DIR / "high_score_trajectories.jsonl"
 STATS_PATH = RUNTIME_DIR / "stats.json"
+_RUN_CONTEXT_EVENTS = {
+    "run_session_finished",
+    "compressed_run_summary",
+    "run_session_failed",
+    "run_session_finish_skipped",
+}
+#: 诊断类事件：不参与学习，只记录「刚才发生了什么」的现场。
+#: 它们必须允许来自任何来源——游戏日志、自动跟随状态机——否则出了事
+#: 只能靠猜。学习样本仍然只收 ``real_capture``。
+_DIAGNOSTIC_EVENTS = {
+    "game_log_attached",
+    "game_log_event",
+    "auto_follow_pause",
+    "auto_follow_restart",
+    # 工具窗口什么时候开始「对截屏不可见」。用户报「软件窗口挡住棋盘」时，
+    # 第一件事就是确认这条有没有出现、以及那之后的帧是不是就不脏了。
+    "capture_exclusion",
+}
 
 
 def record_observation(event_type: str, payload: dict[str, Any], *, source: str) -> None:
-    if source != "real_capture":
+    if source != "real_capture" and event_type not in _DIAGNOSTIC_EVENTS:
         return
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-    events = _load_events()
-    normalized_payload = normalize_observation_payload(event_type, _jsonable(payload), session_events=events)
+    session_events = _load_events() if event_type in _RUN_CONTEXT_EVENTS else ()
+    normalized_payload = normalize_observation_payload(
+        event_type,
+        _jsonable(payload),
+        session_events=session_events,
+    )
     event = {
         "ts": time.time(),
         "event": event_type,
@@ -38,8 +60,6 @@ def record_observation(event_type: str, payload: dict[str, Any], *, source: str)
     }
     with OBSERVATION_LOG.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
-    events.append(event)
-    _write_stats(events, _load_corrections(), _load_trajectories())
 
 
 def record_correction(payload: dict[str, Any], *, source: str) -> None:
@@ -84,8 +104,85 @@ def record_high_score_trajectory(payload: dict[str, Any], *, source: str) -> boo
     }
     with TRAJECTORY_LOG.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+    _prune_trajectories()
     _write_stats(_load_events(), _load_corrections(), _load_trajectories())
     return True
+
+
+#: 高分轨迹最多保留多少局。超出后按**内部评分降序**只留前 N 局。
+#: 500 局是用户定下的上限（2026-11-15）：满铺会自动存档，一晚上就能攒几十局，
+#: 不设上限文件会无界增长（当时 14 局 3.5 MB，只因为每局都带 240 步细节）。
+MAX_TRAJECTORY_SESSIONS = 500
+
+
+def trajectory_count() -> int:
+    """高分库里现在有几局。
+
+    只**数行**、不解析 JSON：500 局的文件里每局都带最多 240 步细节（实测 14 局
+    就有 3.5 MB），满库时逐行 ``json.loads`` 要几秒，而调用方（自动存档的门槛
+    判断）只需要一个数字。
+    """
+    if not TRAJECTORY_LOG.exists():
+        return 0
+    count = 0
+    try:
+        with TRAJECTORY_LOG.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.strip():
+                    count += 1
+    except OSError:
+        return 0
+    return count
+
+
+def lowest_trajectory_score() -> float | None:
+    """库内**最低**的内部评分；空库返回 ``None``。
+
+    满库后「能否替换掉一局」就看它——只有分数更高的局才值得写盘。
+    """
+    scores = [_trajectory_sort_key(event)[0] for event in _load_trajectories()]
+    return min(scores) if scores else None
+
+
+def _trajectory_sort_key(event: dict[str, Any]) -> tuple[float, float]:
+    payload = event.get("payload") or {}
+    try:
+        score = float(payload.get("internal_score") or 0.0)
+    except (TypeError, ValueError):
+        score = 0.0
+    try:
+        ts = float(event.get("ts") or 0.0)
+    except (TypeError, ValueError):
+        ts = 0.0
+    # 同分时新的排前面：同样的分数更近的一局信息更新。
+    return score, ts
+
+
+def _prune_trajectories(limit: int = MAX_TRAJECTORY_SESSIONS) -> int:
+    """按内部评分降序只保留前 ``limit`` 局，返回丢掉的条数。
+
+    只在**超限**时才重写文件：正常一局一次 append，不额外付出 IO。
+    先写 ``.tmp`` 再 ``replace``，避免写到一半崩溃把整个高分库搞坏。
+    """
+    if limit <= 0:
+        return 0
+    events = _load_trajectories()
+    if len(events) <= limit:
+        return 0
+    keep = sorted(events, key=_trajectory_sort_key, reverse=True)[:limit]
+    temp = TRAJECTORY_LOG.with_name(TRAJECTORY_LOG.name + ".tmp")
+    try:
+        temp.write_text(
+            "".join(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n" for event in keep),
+            encoding="utf-8",
+        )
+        temp.replace(TRAJECTORY_LOG)
+    except OSError:
+        # 裁剪失败不该影响「这一局已经存下来了」这个事实。
+        if temp.exists():
+            temp.unlink(missing_ok=True)
+        return 0
+    return len(events) - limit
 
 
 def _trajectory_payload_is_trusted(payload: dict[str, Any]) -> bool:

@@ -13,6 +13,7 @@ from typing import Iterable
 
 from PIL import Image, ImageDraw, ImageTk
 
+from .config import config_value, save_strategy_config
 from .game_model import (
     BrushType,
     Paint,
@@ -30,6 +31,7 @@ from .pet_brain import evaluate_pet_state
 TRANSPARENT_COLOR = "#010203"
 TRANSPARENT_RGB = (1, 2, 3)
 CAPTURE_HIDE_SETTLE_MS = 80
+WDA_EXCLUDEFROMCAPTURE = 0x00000011
 PET_IDLE_ASSET = "qnb.png"
 PET_ACTIVE_ASSET = "maonang.png"
 PET_TARGET_HEIGHT = 190
@@ -37,6 +39,19 @@ PET_SCREEN_MARGIN = 18
 PET_TARGET_GAP = 30
 PET_POINTER_SIZE = 76
 PET_POSITION_PATH = Path("runtime/desktop_pet_position.json")
+
+#: 桌宠推荐开关的配置路径。默认开：正经下棋时桌宠就是要给建议的。
+PET_RECOMMEND_CONFIG_PATH = "pet.recommendations"
+
+#: 「推荐关掉」时气泡的配色，按记录状态灯的等级取。
+#: 文案和颜色都来自 ``describe_record_status`` 那一套，桌宠不许自己编状态。
+RECORD_TONE_PALETTES: dict[str, tuple[str, str]] = {
+    "off": ("#101820", "#9fb3c6"),
+    "error": ("#43181a", "#ffd9d6"),
+    "waiting": ("#3a2f10", "#fff3c4"),
+    "recording": ("#143817", "#e7ffe4"),
+    "finished": ("#123047", "#e6f6ff"),
+}
 
 
 @dataclass(frozen=True)
@@ -98,6 +113,7 @@ class DesktopPetMarkerLayer:
             window.deiconify()
             _place_window(window, marker.size, marker.size, left, top)
             window.attributes("-topmost", True)
+            _exclude_widget_from_capture(window)
         except tk.TclError:
             return
         self._draw_marker(canvas, marker)
@@ -203,16 +219,33 @@ class DesktopPetActor:
         self.last_render_key: tuple | None = None
         self.last_pointer_key: tuple | None = None
 
-    def show(self, *, active: bool = False, window_info=None, pet_state=None) -> None:
+    def show(
+        self,
+        *,
+        active: bool = False,
+        window_info=None,
+        pet_state=None,
+        recommendations: bool = True,
+        status_message: str | None = None,
+        status_tone: str | None = None,
+    ) -> None:
         self.active = active
         if not self._ensure_window():
             return
         self._load_image(active)
         if self.window is None or self.label is None or self.bubble_label is None or self.photo is None:
             return
-        target = _active_recommendation_target(pet_state)
-        message = _pet_state_message(pet_state, active, target)
-        bubble_bg, bubble_fg = _pet_state_palette(pet_state)
+        if recommendations:
+            target = _active_recommendation_target(pet_state)
+            message = _pet_state_message(pet_state, active, target)
+            bubble_bg, bubble_fg = _pet_state_palette(pet_state)
+        else:
+            # 推荐关掉时不许任何一个指向性信息漏出去：目标恒为空（于是不落标记、
+            # 不画指向箭头、也不去找「目标上方」那个位置），气泡只报记录状态。
+            # 这条要卡在 ``show`` 里而不是调用方，否则别处再调一次 show 就漏了。
+            target = None
+            message = _status_bubble_text(status_message)
+            bubble_bg, bubble_fg = _record_palette(status_tone)
         self.bubble_label.configure(text=message, bg=bubble_bg, fg=bubble_fg)
         self.bubble_label.update_idletasks()
         image_width = int(self.photo.width())
@@ -251,16 +284,20 @@ class DesktopPetActor:
             getattr(target, "key", None) if placement is not None else None,
             getattr(target, "screen_point", None) if placement is not None else None,
             getattr(placement, "side", None),
+            bool(recommendations),
         )
         if self.last_render_key == render_key:
+            _exclude_widget_from_capture(self.window)
             self._apply_input_mode()
             return
         try:
             self.label.configure(image=self.photo)
             _place_window(self.window, width, height, left, top)
-            self.window.deiconify()
-            self.window.lift()
+            # 同 pointer：只在不可见时显示，且不 lift()，避免反复激活抢焦点。
+            if _window_is_withdrawn(self.window):
+                self.window.deiconify()
             self.window.attributes("-topmost", True)
+            _exclude_widget_from_capture(self.window)
             self.visible = True
             self.last_render_key = render_key
         except tk.TclError:
@@ -384,6 +421,7 @@ class DesktopPetActor:
         except tk.TclError:
             pointer_visible = False
         if self.last_pointer_key == render_key and pointer_visible:
+            _exclude_widget_from_capture(self.pointer_window)
             _make_clickthrough_widgets(
                 (self.pointer_window, self.pointer_canvas),
                 self.pointer_wndprocs,
@@ -405,10 +443,14 @@ class DesktopPetActor:
                 outline=accent,
                 width=2,
             )
-            self.pointer_window.deiconify()
+            # 只在真的不可见时 deiconify，并且不调 lift()。
+            # deiconify + lift 每帧来一次等于每帧激活一次置顶窗口，
+            # 用户切到别的软件会被反复抢焦点，游戏画面也跟着闪。
+            if _window_is_withdrawn(self.pointer_window):
+                self.pointer_window.deiconify()
             _place_window(self.pointer_window, PET_POINTER_SIZE, PET_POINTER_SIZE, left, top)
-            self.pointer_window.lift()
             self.pointer_window.attributes("-topmost", True)
+            _exclude_widget_from_capture(self.pointer_window)
             _make_clickthrough_widgets(
                 (self.pointer_window, self.pointer_canvas),
                 self.pointer_wndprocs,
@@ -608,6 +650,10 @@ def _legacy_install_desktop_pet_markers(app_cls: type) -> None:
 
 
 def _build_markers(app) -> list[PetMarker]:
+    # 推荐关掉时连标记都不生成：这是「记录模式不需要推荐」的唯一权威闸门，
+    # 标记层、指针、气泡三处都从这里或 show() 里收敛到同一判断。
+    if not pet_recommendations_enabled(app):
+        return []
     scene: SceneObservation | None = getattr(app, "current_scene", None)
     window = getattr(app, "last_capture_window", None)
     target = _active_recommendation_target(getattr(app, "last_pet_state", None))
@@ -683,6 +729,17 @@ def _native_toplevel_hwnd(widget: tk.Misc, user32=None) -> int:
         return root_hwnd or raw_hwnd
     except Exception:
         return raw_hwnd
+
+
+def _exclude_widget_from_capture(widget: tk.Misc, user32=None) -> bool:
+    try:
+        native_user32 = user32 or ctypes.windll.user32
+        setter = native_user32.SetWindowDisplayAffinity
+        _set_ctypes_signature(setter, (wintypes.HWND, wintypes.DWORD), wintypes.BOOL)
+        hwnd = _native_toplevel_hwnd(widget, native_user32)
+        return bool(setter(hwnd, WDA_EXCLUDEFROMCAPTURE))
+    except Exception:
+        return False
 
 
 def _make_clickthrough_widgets(widgets: Iterable[tk.Misc], wndprocs: dict[int, tuple[int, object]]) -> None:
@@ -992,6 +1049,30 @@ def _find_toolbar(root: tk.Misc) -> tk.Frame | None:
     return None
 
 
+def _pet_controls_row(root: tk.Misc) -> tk.Frame | None:
+    """桌宠开关单独一行。
+
+    为什么不在 ``install_drag_toggle`` 里直接往工具栏尾部 append：工具栏现在是两行
+    （上行对局操作、下行数据与状态），但它是**一个** Frame，行内已经排到接近窗口宽度，
+    再往里塞就又会溢出。而另起一个兄弟 Frame 是最省事的做法：宽度跟着窗口走，
+    怎么缩都点得到，也不用去动 ``after=toolbar`` 的插入顺序。
+    """
+    existing = getattr(root, "_huahua_pet_controls_row", None)
+    if isinstance(existing, tk.Frame) and existing.winfo_exists():
+        return existing
+    toolbar = _find_toolbar(root)
+    if toolbar is None or toolbar.master is None:
+        return None
+    try:
+        row = tk.Frame(toolbar.master, bg="#101820")
+        row.pack(side=tk.TOP, fill=tk.X, padx=14, pady=(0, 8), after=toolbar)
+    except tk.TclError:
+        return None
+    tk.Label(row, text="桌宠", fg="#8fa6ba", bg="#101820").pack(side=tk.LEFT)
+    setattr(root, "_huahua_pet_controls_row", row)
+    return row
+
+
 def _virtual_screen(root: tk.Tk) -> tuple[int, int, int, int]:
     try:
         return (
@@ -1055,14 +1136,37 @@ def _windows_monitor_bounds(point: tuple[int, int]) -> tuple[int, int, int, int]
         return None
 
 
-def _place_window(window: tk.Toplevel, width: int, height: int, left: int, top: int) -> None:
+def _window_is_withdrawn(window) -> bool:
+    """窗口当前是否处于 withdrawn（完全隐藏）。
+
+    用 ``state()`` 而不是 ``winfo_viewable()``：前者在测试替身上也实现得了，
+    而且只有 withdrawn 才需要 deiconify。反复对已经显示的置顶窗口调
+    deiconify / lift 会把它重新激活，实机表现就是抢焦点 + 画面闪。
+    """
+    try:
+        return str(window.state()) == "withdrawn"
+    except Exception:
+        return False
+
+
+def _place_window(
+    window: tk.Toplevel,
+    width: int,
+    height: int,
+    left: int,
+    top: int,
+    user32=None,
+) -> None:
     window.geometry(f"{int(width)}x{int(height)}")
     try:
-        hwnd = int(window.winfo_id())
-        user32 = ctypes.windll.user32
+        # A newly created Toplevel has no native wrapper until Tk flushes its
+        # pending geometry. Resolving the handle earlier moves only TkChild.
+        window.update_idletasks()
+        native_user32 = user32 or ctypes.windll.user32
+        hwnd = _native_toplevel_hwnd(window, native_user32)
         SWP_NOZORDER = 0x0004
         SWP_NOACTIVATE = 0x0010
-        set_window_pos = user32.SetWindowPos
+        set_window_pos = native_user32.SetWindowPos
         set_window_pos.argtypes = (
             wintypes.HWND,
             wintypes.HWND,
@@ -1245,12 +1349,12 @@ def _desired_backpack_paint(app) -> Paint | None:
 
 
 def _backpack_caption(app) -> str:
-    recommendations = list(getattr(app, "recommendations", []) or [])
-    if recommendations:
-        return _recommendation_caption(recommendations[0]) or "先点背包"
     install_plan = getattr(app, "install_plan", None)
     if install_plan is not None and install_plan.steps:
         return "先点背包"
+    recommendations = list(getattr(app, "recommendations", []) or [])
+    if recommendations:
+        return _recommendation_caption(recommendations[0]) or "先点背包"
     return "背包"
 
 
@@ -1348,6 +1452,61 @@ def _pet_state_is_active(pet_state) -> bool:
     return mode not in {"observing"}
 
 
+def pet_recommendations_enabled(app) -> bool:
+    """桌宠该不该给推荐。
+
+    优先读界面上的复选框（用户刚点了，不该等配置文件往返），没有该控件时
+    退回配置文件里的 ``pet.recommendations``。两处都没有就**默认关**
+    （2026-11-14 用户定调）：桌宠是叠在游戏画面上的浮层，默认开等于默认挡视线；
+    软件主界面上的推荐不受这个开关影响。
+    """
+    var = getattr(app, "desktop_pet_recommend_var", None)
+    if var is not None:
+        try:
+            return bool(var.get())
+        except Exception:
+            pass
+    return bool(config_value(PET_RECOMMEND_CONFIG_PATH, False))
+
+
+def _record_is_active(app) -> bool:
+    """记录状态下桌宠用不用「忙」的立绘。
+
+    只看状态灯给的那一级：真正在写盘才算在干活。``finished`` 也点亮，
+    因为刚收尾那几秒正是用户想知道「这局录到了吗」的时候。
+    """
+    return str(getattr(app, "record_level", "off") or "off") in {"recording", "finished"}
+
+
+def _record_pet_caption(app) -> tuple[str, str]:
+    """把状态灯的文字压成桌宠气泡能放下的样子，返回 ``(文案, 等级)``。"""
+    level = str(getattr(app, "record_level", "off") or "off")
+    text = ""
+    var = getattr(app, "record_var", None)
+    if var is not None:
+        try:
+            text = str(var.get() or "")
+        except Exception:
+            text = ""
+    text = text.strip()
+    if text.startswith("记录"):
+        text = text[2:].strip()
+    # 「录制中 · 8 步 / 12 帧」这种长尾在气泡里放不下：先砍掉 / 之后的部分。
+    text = text.split("/")[0].strip()
+    return _status_bubble_text(text), level
+
+
+def _status_bubble_text(text: str | None, max_chars: int = 12) -> str:
+    normalized = " ".join(str(text or "").split())
+    if not normalized:
+        return "记录中"
+    return normalized[:max_chars]
+
+
+def _record_palette(tone: str | None) -> tuple[str, str]:
+    return RECORD_TONE_PALETTES.get(str(tone or "off"), RECORD_TONE_PALETTES["off"])
+
+
 def _active_recommendation_target(pet_state, *, now: float | None = None) -> RecommendationTarget | None:
     target = getattr(pet_state, "recommendation_target", None)
     if not isinstance(target, RecommendationTarget):
@@ -1421,10 +1580,29 @@ def install_desktop_pet_markers(app_cls: type) -> None:
         try:
             pet_state = evaluate_pet_state(self)
             setattr(self, "last_pet_state", pet_state)
-            active = _pet_state_is_active(pet_state)
+            recommendations = pet_recommendations_enabled(self)
+            if recommendations:
+                active = _pet_state_is_active(pet_state)
+                status_message = None
+                status_tone = None
+            else:
+                # 只报记录状态：立绘按「是否真在写盘」切换，气泡走状态灯的那套文案。
+                active = _record_is_active(self)
+                status_message, status_tone = _record_pet_caption(self)
             if hasattr(self, "desktop_pet_drag_var"):
                 actor(self).set_draggable(bool(self.desktop_pet_drag_var.get()))
-            actor(self).show(active=active, window_info=getattr(self, "last_capture_window", None), pet_state=pet_state)
+            actor(self).show(
+                active=active,
+                window_info=getattr(self, "last_capture_window", None),
+                pet_state=pet_state,
+                recommendations=recommendations,
+                status_message=status_message,
+                status_tone=status_tone,
+            )
+            if not recommendations:
+                existing_layer = getattr(self, "_desktop_pet_layer", None)
+                if existing_layer is not None:
+                    existing_layer.hide()
             setattr(self, "last_desktop_pet_perf", {"render": round(time.perf_counter() - started_at, 3)})
             update_perf = getattr(self, "_update_perf_panel", None)
             if callable(update_perf):
@@ -1447,7 +1625,7 @@ def install_desktop_pet_markers(app_cls: type) -> None:
         if hasattr(self, "desktop_pet_drag_var"):
             return
         self.desktop_pet_drag_var = tk.BooleanVar(value=False)
-        toolbar = _find_toolbar(self)
+        toolbar = _pet_controls_row(self)
         if toolbar is None:
             return
         check = tk.Checkbutton(
@@ -1460,6 +1638,42 @@ def install_desktop_pet_markers(app_cls: type) -> None:
             activebackground="#101820",
             selectcolor="#0d141b",
             command=lambda: toggle_pet_drag(self),
+        )
+        check.pack(side=tk.LEFT, padx=(8, 0))
+
+    def toggle_pet_recommendations(self) -> None:
+        enabled = bool(self.desktop_pet_recommend_var.get())
+        try:
+            save_strategy_config({"pet": {"recommendations": enabled}})
+        except OSError:
+            # 配置写不进去也不该让开关失效：本次会话照用户的意愿生效。
+            pass
+        self._refresh_overlay()
+        show_actor(self)
+        if enabled:
+            self.status_var.set("桌宠推荐已开启：会在地块上标记落点、并在气泡里给理由。")
+            self._set_notice("桌宠推荐已开启。", "success")
+        else:
+            self.status_var.set("桌宠推荐已关闭：桌宠只报记录状态，棋盘上不再盖落点标记。")
+            self._set_notice("桌宠推荐已关闭：适合纯录数据，标记和箭头都不再出现。", "info")
+
+    def install_recommend_toggle(self) -> None:
+        if hasattr(self, "desktop_pet_recommend_var"):
+            return
+        self.desktop_pet_recommend_var = tk.BooleanVar(value=bool(config_value(PET_RECOMMEND_CONFIG_PATH, False)))
+        toolbar = _pet_controls_row(self)
+        if toolbar is None:
+            return
+        check = tk.Checkbutton(
+            toolbar,
+            text="桌宠推荐",
+            variable=self.desktop_pet_recommend_var,
+            fg="#d7e3ee",
+            bg="#101820",
+            activeforeground="#ffffff",
+            activebackground="#101820",
+            selectcolor="#0d141b",
+            command=lambda: toggle_pet_recommendations(self),
         )
         check.pack(side=tk.LEFT, padx=(8, 0))
 
@@ -1477,7 +1691,22 @@ def install_desktop_pet_markers(app_cls: type) -> None:
     def patched_init(self, *args, **kwargs) -> None:
         original_init(self, *args, **kwargs)
         install_drag_toggle(self)
+        install_recommend_toggle(self)
         self.after(250, lambda: show_actor(self))
+
+        def start_pet_mode() -> None:
+            """启动即开自动跟随，但**不**最小化主窗口。
+
+            原来这里有一句 ``self.iconify()``：启动 350ms 后主窗口缩到任务栏，
+            屏幕上只剩一个小桌宠浮窗。实机上看起来就是「窗口闪一下就没了」，
+            很容易被当成闪退。窗口挡到游戏时 ``_app_overlaps_game_window``
+            会自己让位，不需要一上来就硬收。
+            """
+            if not self.auto_follow_var.get():
+                self.auto_follow_var.set(True)
+                self.toggle_auto_follow()
+
+        self.after(350, start_pet_mode)
 
     def patched_on_close(self) -> None:
         existing_actor = getattr(self, "_desktop_pet_actor", None)
@@ -1549,12 +1778,9 @@ def install_desktop_pet_markers(app_cls: type) -> None:
         original_quick_capture_async(self)
 
     def patched_auto_follow_tick(self) -> None:
-        if not self.auto_follow_var.get() or self.auto_follow_busy or self._app_overlaps_game_window():
-            original_auto_follow_tick(self)
-            show_actor(self)
-            return
-        hide_marker_surfaces(self)
         original_auto_follow_tick(self)
+        if not self.auto_follow_var.get() or self.auto_follow_busy or self._app_overlaps_game_window():
+            show_actor(self)
 
     def patched_auto_follow_error(self, *args, **kwargs) -> None:
         original_auto_follow_error(self, *args, **kwargs)

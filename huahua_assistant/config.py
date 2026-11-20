@@ -21,6 +21,13 @@ DEFAULT_STRATEGY_CONFIG: dict[str, Any] = {
         "board_paint_min_level_confidence": 0.36,
     },
     "autosave": {
+        # 入库口径（用户 2026-11-15 定，两轮确认）：
+        #   1. 库里不满 ``max_sessions`` 局 → **全部入库**，先攒样本；
+        #   2. 满了 → 至少一枚 7 级颜料的局直接收；
+        #   3. 满了且没有 7 级 → 只有内部评分高于库内最低分才写入（挤掉最低那局）。
+        # ``require_level7=false`` 表示库满后不再给 7 级局开直通，一律按分数比。
+        "require_level7": True,
+        "max_sessions": 500,
         "min_internal_score": 3000.0,
         "min_treasure7": 1,
         "min_treasure6": 1,
@@ -82,13 +89,63 @@ DEFAULT_STRATEGY_CONFIG: dict[str, Any] = {
         "terrain_prior_max_bonus": 95.0,
         "terrain_prior_max_penalty": 85.0,
     },
+    # 桌宠：屏幕上那只小宠物的行为开关。
+    "pet": {
+        # 桌宠推荐。关掉后桌宠只剩「记录状态」这一件事：不画地块标记、不画指向箭头、
+        # 气泡也只报录制进度。专为「打一局录数据」准备——录数据时建议不但没用，
+        # 还会盖在棋盘上挡住真正要看的东西。
+        # 2026-11-14 用户定调：**默认关**。推荐本身在软件主界面上照样有，桌宠这层
+        # 只是叠在游戏画面上的浮层，默认开等于默认挡视线。
+        "recommendations": False,
+    },
     "debug": {
         "save_fast_captures": False,
     },
     "capture": {
         "backend": "auto",
+        # Windows.Graphics.Capture：直接读窗口自己渲染的表面，别的窗口盖在上面
+        # 不会进帧。DirectX 游戏用不了 PrintWindow，这条是唯一能「被遮挡也读对」的路。
+        # 失败会自动退回原来的截屏方式，所以默认开着。
+        "wgc_enabled": True,
         "highspeed_enabled": False,
         "allow_composited_highspeed": False,
+    },
+    # 游戏日志：按「画面变了」触发识别，而不是按固定节拍盲截图。
+    # 日志里记录着每一次落子/开笔锋/结算/入画，时间戳精确到毫秒。
+    "game_log": {
+        # 留空 = 自动从游戏进程反查（<安装目录>\UE_game\TorchLight\Saved\Logs\UE_game.log）
+        "path": "",
+        # 没有事件时的节拍（秒）。棋盘在两笔之间不会动，没必要高频重读。
+        "idle_interval": 1.5,
+    },
+    # 大模型托管：把「看画面 → 给动作」整体交给视觉语言模型。
+    # 云端（智谱 / 通义 / DeepSeek / OpenAI）和本地 Ollama 都走 OpenAI 兼容协议，
+    # 换 provider 只要改 base_url 和 model。
+    "llm": {
+        "enabled": False,
+        # openai_compat：云端；ollama：本地
+        "provider": "openai_compat",
+        # 智谱 GLM：https://open.bigmodel.cn/api/paas/v4  （glm-4.6v-flash 输入输出全免费）
+        # 通义 Qwen-VL：https://dashscope.aliyuncs.com/compatible-mode/v1
+        # 本地 Ollama：http://127.0.0.1:11434/v1
+        "base_url": "https://open.bigmodel.cn/api/paas/v4",
+        "api_key": "",
+        "model": "glm-4.6v-flash",
+        "timeout": 30.0,
+        # 两次调用至少隔这么久（秒）。大模型单次 2~5 秒，节流防止排队堆积。
+        "min_interval": 2.0,
+        # 送进模型的图先缩到这个边长，省 token 也省时间。
+        "max_image_side": 1280,
+        "temperature": 0.1,
+        # 输出上限。推理型模型（DeepSeek 等）若思考没关掉会把它全烧在思考链上，
+        # 正文一个字都不剩，所以别给太小。
+        "max_tokens": 600,
+        # 原样并进请求体的额外字段，各家私有开关走这里。
+        # 智谱视觉模型默认会「思考」，托管场景只要结论，关掉能快一倍：
+        #   "extra_body": {"thinking": {"type": "disabled"}}
+        "extra_body": {},
+        # 托管模式下是否还并行跑本地链路做降级（强烈建议开）
+        "keep_local_fallback": True,
     },
 }
 
@@ -106,6 +163,27 @@ def reload_strategy_config() -> dict[str, Any]:
     global _CACHE
     _CACHE = _load_strategy_config()
     return _CACHE
+
+
+def save_strategy_config(updates: dict[str, Any]) -> Path:
+    """把改动写回 ``runtime/strategy_config.json`` 并刷新缓存。
+
+    只写 ``updates`` 里出现的键，文件里已有的其他内容原样保留——用户手写的注释性
+    字段不该被程序的默认值覆盖掉。
+    """
+    payload: dict[str, Any] = {}
+    if CONFIG_PATH.exists():
+        try:
+            loaded = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                payload = loaded
+        except (OSError, json.JSONDecodeError):
+            payload = {}
+    _deep_update(payload, updates)
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    reload_strategy_config()
+    return CONFIG_PATH
 
 
 def config_value(path: str, default: Any | None = None) -> Any:

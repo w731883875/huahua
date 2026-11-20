@@ -126,6 +126,7 @@ _LEGAL_TRANSITIONS: dict[GamePhase, frozenset[GamePhase]] = {
     GamePhase.BRUSH_STAGE2: frozenset(
         {
             GamePhase.BRUSH_STAGE1,
+            GamePhase.INITIAL_MAP,
             GamePhase.BACKPACK_SELECT,
             GamePhase.BOARD_PLACE,
             GamePhase.FINISH_READY,
@@ -153,14 +154,25 @@ _LEGAL_TRANSITIONS: dict[GamePhase, frozenset[GamePhase]] = {
 
 
 class GamePhaseStateMachine:
-    def __init__(self, *, stable_frames: int = 2, min_board_confidence: float = 0.5) -> None:
+    def __init__(
+        self,
+        *,
+        stable_frames: int = 2,
+        min_board_confidence: float = 0.5,
+        illegal_tolerance: int = 3,
+    ) -> None:
         self.stable_frames = max(1, int(stable_frames))
         self.min_board_confidence = float(min_board_confidence)
+        # 连续这么多帧都看到同一个「非法」阶段，就认为现实确实变了，强制接受。
+        # 不加这条会死锁：任何一次阶段误判都会让提示永久消失，只能重启。
+        self.illegal_tolerance = max(1, int(illegal_tolerance))
         self._confirmed_phase = GamePhase.WAITING
         self._confirmed_key: tuple[object, ...] | None = None
         self._candidate_phase: GamePhase | None = None
         self._candidate_key: tuple[object, ...] | None = None
         self._candidate_frames: set[str] = set()
+        self._illegal_phase: GamePhase | None = None
+        self._illegal_frames = 0
 
     @property
     def last_trusted_phase(self) -> GamePhase:
@@ -194,6 +206,27 @@ class GamePhaseStateMachine:
             )
 
         if not self._transition_is_legal(self._confirmed_phase, observed):
+            if observed == self._illegal_phase:
+                self._illegal_frames += 1
+            else:
+                self._illegal_phase = observed
+                self._illegal_frames = 1
+            if self._illegal_frames >= self.illegal_tolerance:
+                # 现实确实变了（或者之前判错了）。继续卡着只会让提示永久消失。
+                self._confirmed_phase = observed
+                self._confirmed_key = key
+                self._illegal_phase = None
+                self._illegal_frames = 0
+                self._clear_candidate()
+                return PhaseState(
+                    phase=observed,
+                    observed_phase=observed,
+                    stable=True,
+                    confidence=confidence,
+                    source_frame_id=evidence.frame_id,
+                    reason=f"illegal_transition_accepted:{observed.value}",
+                    last_trusted_phase=observed,
+                )
             self._clear_candidate()
             return PhaseState(
                 phase=GamePhase.UNSTABLE,
@@ -204,6 +237,8 @@ class GamePhaseStateMachine:
                 reason=f"illegal_transition:{self._confirmed_phase.value}->{observed.value}",
                 last_trusted_phase=self._confirmed_phase,
             )
+        self._illegal_phase = None
+        self._illegal_frames = 0
 
         if observed != self._candidate_phase or key != self._candidate_key:
             self._candidate_phase = observed
@@ -251,7 +286,9 @@ class RecommendationTargetStabilizer:
         stable_frames: int = 2,
         min_stable_seconds: float = 0.3,
         ttl_seconds: float = 2.0,
-        min_confidence: float = 0.75,
+        # 综合质量分（棋盘 0.34 + 当前颜料 0.26 + 背包 0.20 + 笔锋 0.10 + 格子 0.10）
+        # 本来就到不了 0.9，0.75 会把「棋盘很清楚、但背包区偏暗」这种正常帧挡掉。
+        min_confidence: float = 0.70,
     ) -> None:
         self.stable_frames = max(1, int(stable_frames))
         self.min_stable_seconds = max(0.0, float(min_stable_seconds))
@@ -294,7 +331,11 @@ class RecommendationTargetStabilizer:
             return None
 
         if self._current is not None and _same_target(self._current, proposal):
-            if self._current.source_frame_id == proposal.source_frame_id:
+            same_source_frame = self._current.source_frame_id == proposal.source_frame_id
+            if same_source_frame and proposal.kind not in {
+                TargetKind.BRUSH_STAGE1,
+                TargetKind.BRUSH_STAGE2,
+            }:
                 return self._current
             self._current = replace(
                 self._current,
@@ -400,9 +441,10 @@ def _phase_from_evidence(
 
 
 def _phase_stability_key(phase: GamePhase, evidence: PhaseEvidence) -> tuple[object, ...]:
+    board_signature = "" if phase in {GamePhase.BRUSH_STAGE1, GamePhase.BRUSH_STAGE2} else evidence.board_signature
     return (
         phase,
-        evidence.board_signature,
+        board_signature,
         evidence.current_rule_pending,
         evidence.brush_visible,
         evidence.brush_stage2_visible,

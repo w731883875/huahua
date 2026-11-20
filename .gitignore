@@ -4,3 +4,13 @@ __pycache__/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# 打包产物按时间戳分目录，每次都不同：进库只会让 git status 变成噪音。
+build_artifacts/
+
+# 逆向/诊断一次性探针脚本：随手写的，没有复用价值，不进库。
+_*.py
+
+# 工具链本地配置
+opencode.json
+.workbuddy-ai/

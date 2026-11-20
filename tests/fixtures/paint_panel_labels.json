@@ -1,0 +1,173 @@
+{
+  "note": "「当前颜料」面板文字真值，rect 是相对整图的 x/y/w/h 比例",
+  "cases": [
+    {
+      "image": "jietu/其他.png",
+      "rect": [
+        0.53796,
+        0.25854,
+        0.43455,
+        0.11048
+      ],
+      "category": "gameplay",
+      "subtype": "怪谈",
+      "level": 5,
+      "target": "all",
+      "direction": "adjacent",
+      "upgrade": 2,
+      "progress": [
+        0,
+        4
+      ]
+    },
+    {
+      "image": "jietu/初始和背包宝箱.png",
+      "rect": [
+        0.53796,
+        0.25399,
+        0.43455,
+        0.11048
+      ],
+      "category": null,
+      "subtype": null,
+      "level": null,
+      "target": "gameplay",
+      "direction": "horizontal",
+      "upgrade": 1,
+      "progress": [
+        0,
+        3
+      ]
+    },
+    {
+      "image": "jietu/堆砌后选择前.png",
+      "rect": [
+        0.53796,
+        0.25626,
+        0.43455,
+        0.11048
+      ],
+      "category": "gameplay",
+      "subtype": "机械之神",
+      "level": 3,
+      "target": "gameplay",
+      "direction": "adjacent",
+      "upgrade": 1,
+      "progress": [
+        0,
+        3
+      ]
+    },
+    {
+      "image": "jietu/堆砌选择前.png",
+      "rect": [
+        0.53796,
+        0.25854,
+        0.43455,
+        0.11048
+      ],
+      "category": "gameplay",
+      "subtype": "赛季",
+      "level": 3,
+      "target": "monster",
+      "direction": "diagonal",
+      "upgrade": 1,
+      "progress": [
+        0,
+        3
+      ]
+    },
+    {
+      "image": "jietu/扩散后选择前.png",
+      "rect": [
+        0.53796,
+        0.25854,
+        0.43455,
+        0.11048
+      ],
+      "category": "gameplay",
+      "subtype": "赛季",
+      "level": 3,
+      "target": "gameplay",
+      "direction": "diagonal",
+      "upgrade": 1,
+      "progress": [
+        0,
+        3
+      ]
+    },
+    {
+      "image": "jietu/斜对角.png",
+      "rect": [
+        0.53796,
+        0.25399,
+        0.43455,
+        0.11048
+      ],
+      "category": "monster",
+      "subtype": "邪影",
+      "level": 3,
+      "target": "monster",
+      "direction": "diagonal",
+      "upgrade": 1,
+      "progress": null
+    },
+    {
+      "image": "jietu/纵向.png",
+      "rect": [
+        0.53796,
+        0.25626,
+        0.43455,
+        0.11048
+      ],
+      "category": "monster",
+      "subtype": "龙骨",
+      "level": 3,
+      "target": "monster",
+      "direction": "vertical",
+      "upgrade": 1,
+      "progress": [
+        0,
+        3
+      ]
+    },
+    {
+      "image": "jietu/转锋后选择前.png",
+      "rect": [
+        0.53796,
+        0.25854,
+        0.43455,
+        0.11048
+      ],
+      "category": "gameplay",
+      "subtype": "赛季",
+      "level": 3,
+      "target": "monster",
+      "direction": "diagonal",
+      "upgrade": 1,
+      "progress": [
+        0,
+        3
+      ]
+    },
+    {
+      "image": "jietu/重新获取随机调色颜料之前.png",
+      "rect": [
+        0.53796,
+        0.25854,
+        0.43455,
+        0.11048
+      ],
+      "category": "monster",
+      "subtype": "矮人",
+      "level": 4,
+      "target": "all",
+      "direction": "vertical",
+      "upgrade": 1,
+      "progress": [
+        0,
+        4
+      ]
+    }
+  ]
+}

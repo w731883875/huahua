@@ -10,7 +10,10 @@ from huahua_assistant.desktop_pet import (
     DesktopPetActor,
     _active_recommendation_target,
     _build_markers,
+    _exclude_widget_from_capture,
     _native_toplevel_hwnd,
+    _place_window,
+    install_desktop_pet_markers,
 )
 from huahua_assistant.guidance import RecommendationTarget, TargetKind
 from huahua_assistant.models import Rect
@@ -48,6 +51,35 @@ class PetLayoutTests(unittest.TestCase):
         user32 = SimpleNamespace(GetAncestor=lambda _hwnd, _mode: 0)
 
         self.assertEqual(123, _native_toplevel_hwnd(widget, user32))
+
+    def test_pet_window_is_excluded_from_screen_capture(self) -> None:
+        setter = Mock(return_value=1)
+        user32 = SimpleNamespace(
+            GetAncestor=lambda hwnd, mode: 456 if (hwnd, mode) == (123, 2) else 0,
+            SetWindowDisplayAffinity=setter,
+        )
+        widget = SimpleNamespace(winfo_id=lambda: 123)
+
+        self.assertTrue(_exclude_widget_from_capture(widget, user32))
+        setter.assert_called_once_with(456, 0x00000011)
+
+    def test_pet_window_position_uses_native_toplevel_handle(self) -> None:
+        setter = Mock(return_value=1)
+        user32 = SimpleNamespace(
+            GetAncestor=lambda hwnd, mode: 456 if (hwnd, mode) == (123, 2) else 0,
+            SetWindowPos=setter,
+        )
+        widget = SimpleNamespace(
+            winfo_id=lambda: 123,
+            geometry=Mock(),
+            update_idletasks=Mock(),
+        )
+
+        _place_window(widget, 94, 181, 1189, 522, user32)
+
+        widget.geometry.assert_called_once_with("94x181")
+        widget.update_idletasks.assert_called_once_with()
+        setter.assert_called_once_with(456, 0, 1189, 522, 94, 181, 0x0014)
 
     def test_prefers_above_and_never_covers_target(self) -> None:
         placement = choose_pet_guidance_placement(
@@ -92,6 +124,51 @@ class PetLayoutTests(unittest.TestCase):
 
 
 class DesktopPetGuidanceTests(unittest.TestCase):
+    def test_auto_follow_poll_does_not_hide_desktop_pet(self) -> None:
+        class TestApp:
+            def _on_close(self) -> None:
+                return None
+
+            def _restore_app_window(self) -> None:
+                return None
+
+            def toggle_overlay(self) -> None:
+                return None
+
+            def _destroy_overlay_window(self) -> None:
+                return None
+
+            def capture_async(self) -> None:
+                return None
+
+            def quick_capture_async(self) -> None:
+                return None
+
+            def _auto_follow_tick(self) -> None:
+                self.poll_count += 1
+
+            def _auto_follow_error(self, *_args, **_kwargs) -> None:
+                return None
+
+            def _render_auto_follow_result(self, *_args, **_kwargs) -> None:
+                return None
+
+            def _app_overlaps_game_window(self) -> bool:
+                return False
+
+        install_desktop_pet_markers(TestApp)
+        actor = Mock()
+        app = TestApp.__new__(TestApp)
+        app.poll_count = 0
+        app.auto_follow_var = SimpleNamespace(get=lambda: True)
+        app.auto_follow_busy = False
+        app._desktop_pet_actor = actor
+
+        app._auto_follow_tick()
+
+        self.assertEqual(1, app.poll_count)
+        actor.hide.assert_not_called()
+
     def test_target_expiry_is_checked_at_render_time(self) -> None:
         live = SimpleNamespace(recommendation_target=_target(expires_at=20.0))
         expired = SimpleNamespace(recommendation_target=_target(expires_at=19.99))
@@ -112,6 +189,7 @@ class DesktopPetGuidanceTests(unittest.TestCase):
         with (
             patch("huahua_assistant.desktop_pet._screen_bounds_for_target", return_value=(0, 0, 1920, 1080)),
             patch("huahua_assistant.desktop_pet._place_window") as place_window,
+            patch("huahua_assistant.desktop_pet._exclude_widget_from_capture") as exclude_capture,
             patch.object(actor, "_show_pointer") as show_pointer,
             patch.object(actor, "_apply_input_mode"),
         ):
@@ -125,6 +203,7 @@ class DesktopPetGuidanceTests(unittest.TestCase):
         self.assertLessEqual(left, 960)
         self.assertLess(top + height, 540)
         self.assertEqual(2, show_pointer.call_count)
+        self.assertEqual(2, exclude_capture.call_count)
 
     def test_guidance_is_clickthrough_by_default_and_explicit_drag_is_interactive(self) -> None:
         actor = DesktopPetActor(SimpleNamespace())
@@ -178,6 +257,7 @@ class DesktopPetGuidanceTests(unittest.TestCase):
 
         with (
             patch("huahua_assistant.desktop_pet._place_window") as place_window,
+            patch("huahua_assistant.desktop_pet._exclude_widget_from_capture") as exclude_capture,
             patch("huahua_assistant.desktop_pet._make_clickthrough_widgets"),
         ):
             actor._show_pointer(target, placement)
@@ -185,6 +265,7 @@ class DesktopPetGuidanceTests(unittest.TestCase):
 
         self.assertEqual(1, place_window.call_count)
         self.assertEqual(1, actor.pointer_canvas.delete_count)
+        self.assertEqual(2, exclude_capture.call_count)
 
     def test_capture_hide_withdraws_both_pet_and_pointer(self) -> None:
         actor = DesktopPetActor(SimpleNamespace())
@@ -213,6 +294,10 @@ class DesktopPetGuidanceTests(unittest.TestCase):
             last_capture_quality={"ok": True},
             last_pet_state=SimpleNamespace(recommendation_target=_target()),
             recommendations=recommendations,
+            # 必须显式给「推荐开关」：不给就会退回读用户机器的
+            # ``runtime/strategy_config.json``，而那个值是他上次点复选框留下的
+            # ——测试结果会跟着他的鼠标变（实测因此红过一次）。
+            desktop_pet_recommend_var=SimpleNamespace(get=lambda: True),
             _screen_point_for_board_cell=lambda row, col: (800 + col * 100, 600 + row * 100),
         )
 
@@ -237,6 +322,9 @@ class DesktopPetGuidanceTests(unittest.TestCase):
             last_capture_quality={"ok": True},
             recommendations=[],
             last_pet_state=SimpleNamespace(recommendation_target=None),
+            # 同上：开关必须显式打开，否则这条测的是「推荐被关掉」而不是
+            # 「没有活的落点目标」——两条路径返回的都是空列表，很容易假绿。
+            desktop_pet_recommend_var=SimpleNamespace(get=lambda: True),
         )
         self.assertEqual([], _build_markers(app))
 

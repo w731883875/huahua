@@ -47,6 +47,7 @@ class PaintObject(str, Enum):
     BLOCKED_TILE = "blocked_tile"
     BLANK_TILE = "blank_tile"
     VOID_TILE = "void_tile"
+    FADED_TILE = "faded_tile"
     UNKNOWN = "unknown"
 
 
@@ -96,12 +97,33 @@ class BoardObservation:
         return self.tiles[row * 6 + col]
 
 
+def is_enter_painting_region(region: object) -> bool:
+    """这颗区域是不是右下角的「入画」按钮。
+
+    它在**作画界面常驻**（实机每帧都检出，置信 0.92，位置 x=1263 y=779），
+    意思是「可以进下一张画纸」，不是「本局已经画完」。判定结算时必须排除它，
+    否则新一局的第一帧就会被当成可结算、自动收尾，整局落子都不进轨迹。
+
+    ``label`` 在实时链路上带 ``" fast"`` 后缀（``enter painting button fast``），
+    所以按前缀比，不要写全等。测试桩偶尔用 ``SimpleNamespace`` 伪造 region，
+    这里按 ``getattr`` 取，缺 label 时当作「不是入画」。
+    """
+
+    return str(getattr(region, "label", "")).startswith("enter painting")
+
+
 @dataclass(frozen=True)
 class RegionObservation:
     kind: RegionKind
     rect: Rect
     confidence: float
     label: str
+
+    @property
+    def is_enter_painting(self) -> bool:
+        """见 :func:`is_enter_painting_region`。"""
+
+        return is_enter_painting_region(self)
 
 
 @dataclass(frozen=True)
@@ -122,6 +144,11 @@ class CurrentPaintObservation:
     upgrade_amount: int | None
     keyword_scores: dict[str, float]
     raw_text_hint: str
+    #: 面板第三行「调色效果」的正文 = 这枚颜料自带的**笔触条目**原文，
+    #: 例如「使自身等级提升1级」「对全图中与自身内容相同的颜料额外提升1级」。
+    #: 过去这一行解析完就扔，复盘只能看到大类（堆砌/扩散/转锋），
+    #: 对不上游戏里那一条（官方 52 条 selectableeffect）。
+    effect_text: str | None = None
 
 
 @dataclass(frozen=True)
@@ -146,6 +173,8 @@ class BackpackPaintObservation:
     subtype: str | None = None
     is_treasure: bool = False
     fingerprint: str = ""
+    is_selected: bool = False
+    selection_confidence: float = 0.0
 
 
 @dataclass(frozen=True)

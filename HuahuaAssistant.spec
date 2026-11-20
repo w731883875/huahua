@@ -6,7 +6,9 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[('huahua_assistant/assets', 'huahua_assistant/assets')],
-    hiddenimports=['huahua_assistant.multi_user'],
+    # windows_capture 是在 _WgcSession 里按需导入的，静态分析看不到，必须显式声明，
+    # 否则打包后的 exe 会退回到「截屏幕」那条路（工具窗口一盖就截到自己）。
+    hiddenimports=['huahua_assistant.multi_user', 'windows_capture'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

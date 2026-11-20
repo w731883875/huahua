@@ -7,6 +7,8 @@ from dataclasses import dataclass, replace
 from .fast_events import FastVisionEvent
 from .game_model import (
     BrushType,
+    assess_finish_mode,
+    current_scope_cells,
     current_rule_is_pending,
     recommend_affixes,
     recommend_brush_types,
@@ -20,7 +22,8 @@ from .guidance import (
     TargetKind,
     TargetProposal,
 )
-from .models import RegionKind
+from .llm.binding import ADVICE_TTL_SECONDS
+from .models import RegionKind, is_enter_painting_region
 
 
 @dataclass(frozen=True)
@@ -37,10 +40,68 @@ class PetBrainState:
 def evaluate_pet_state(app) -> PetBrainState:
     guidance = _evaluate_guidance(app)
     state = _evaluate_immediate_pet_state(app)
-    return replace(
+    result = replace(
         state,
         phase=guidance.phase.phase,
         recommendation_target=guidance.target,
+    )
+    if guidance.phase.phase == GamePhase.FINISH_READY and guidance.target is not None:
+        # 阶段已经稳定判成「可结算」、目标也锁到入画按钮了，提示语要跟上，
+        # 否则会出现「箭头指着入画、文字还写观察中」的割裂。
+        result = replace(result, mode="finish_hint", message="可结算", target="finish")
+
+    # 大模型托管：它给了有效建议就以它为准。本地链路仍在跑，只是这一帧让位——
+    # 模型的建议慢半拍但看得更整体，这正是「各做各的事情」的分工。
+    llm_target = _llm_recommendation(app)
+    if llm_target is not None:
+        result = replace(
+            result,
+            mode="llm_hint",
+            message=llm_target.reason_short or "大模型建议",
+            target="llm",
+            confidence=max(result.confidence, llm_target.confidence),
+            recommendation_target=llm_target,
+        )
+    return result
+
+
+_LLM_KIND = {
+    "place": TargetKind.BOARD,
+    "backpack": TargetKind.BACKPACK,
+    "brush_stage1": TargetKind.BRUSH_STAGE1,
+    "brush_stage2": TargetKind.BRUSH_STAGE2,
+    "finish": TargetKind.FINISH,
+}
+
+
+def _llm_recommendation(app):
+    """把大模型的建议包成和本地链路同构的推荐目标。"""
+    advice = getattr(app, "llm_advice", None)
+    if advice is None or not getattr(advice, "ok", False):
+        return None
+    to_point = getattr(app, "_llm_target_point", None)
+    point = to_point() if callable(to_point) else None
+    if point is None:
+        return None
+    kind = _LLM_KIND.get(advice.action, TargetKind.BOARD)
+    now = time.monotonic()
+    reason = (advice.reason or advice.action_label)[:24]
+    # 截止时刻由**原始帧的采集时刻**决定，不从这次渲染算起：同一张建议无论
+    # 重绘多少次都还是同一个截止点，否则箭头能被"每帧重算 +6 秒"无限续命。
+    deadline_of = getattr(app, "llm_advice_deadline", None)
+    deadline = deadline_of() if callable(deadline_of) else None
+    if deadline is None:
+        deadline = now + ADVICE_TTL_SECONDS
+    return RecommendationTarget(
+        key=f"llm:{advice.action}:{advice.row},{advice.col}:{advice.option or ''}",
+        kind=kind,
+        priority=0,
+        screen_point=(int(point[0]), int(point[1])),
+        confidence=0.9,
+        reason_short=f"大模型·{reason}",
+        source_frame_id="llm",
+        stable_since=now,
+        expires_at=float(deadline),
     )
 
 
@@ -72,25 +133,27 @@ def _evaluate_immediate_pet_state(app) -> PetBrainState:
         if brush_state is not None:
             return brush_state
 
-    selection_event = _first_event(events, "selection_state_changed")
-    if selection_event is not None:
-        return PetBrainState(
-            mode="wait_for_drop",
-            message="等落笔",
-            target="board",
-            confidence=selection_event.confidence,
-            event_kind=selection_event.kind,
-        )
+    # 调色目标已经凑不满：这时候再推「选背包颜料 / 推荐地块」只会把人往
+    # 范围外的空格上带。直接亮「收尾」，提示保住贵重颜料、点完成绘制。
+    if state is not None and scene is not None:
+        finish = assess_finish_mode(state)
+        if finish is not None and not finish.reachable:
+            return PetBrainState(
+                mode="finish_hint",
+                message="凑不满，收尾",
+                target="finish",
+                confidence=0.7,
+            )
 
-    if _has_backpack_target(app):
+    if _backpack_target_needed(app):
         return PetBrainState(
             mode="recommend_backpack",
-            message="先点背包",
+            message="选背包颜料",
             target="backpack",
-            confidence=0.85,
+            confidence=0.8,
         )
 
-    if getattr(app, "recommendations", None):
+    if _board_target_ready(app):
         return PetBrainState(
             mode="recommend_board_cell",
             message="推荐地块",
@@ -136,6 +199,104 @@ def _has_backpack_target(app) -> bool:
     return bool(recommendations and getattr(recommendations[0], "paint", None) is not None)
 
 
+def _desired_backpack_paint(app):
+    install_plan = getattr(app, "install_plan", None)
+    steps = tuple(getattr(install_plan, "steps", ()) or ())
+    if steps:
+        return getattr(steps[0], "paint", None)
+    recommendations = list(getattr(app, "recommendations", ()) or ())
+    if recommendations:
+        return getattr(recommendations[0], "paint", None)
+    return None
+
+
+def _visible_backpack_entries(app) -> tuple[object, ...]:
+    snapshot = getattr(app, "last_fast_snapshot", None)
+    paints = tuple(getattr(snapshot, "backpack", ()) or ())
+    if paints:
+        return paints
+    scene = getattr(app, "current_scene", None)
+    backpack = getattr(scene, "backpack", None)
+    return tuple(getattr(backpack, "paints", ()) or ())
+
+
+def _visible_backpack_index(app, paint) -> int | None:
+    if paint is None:
+        return None
+    function = getattr(app, "_visible_backpack_index_for_paint", None)
+    if not callable(function):
+        return None
+    try:
+        index = function(paint)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+        return None
+    return index
+
+
+def _backpack_paint_is_selected(entry) -> bool:
+    if not bool(getattr(entry, "is_selected", False)):
+        return False
+    value = getattr(entry, "selection_confidence", 0.0)
+    if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        return False
+    return float(value) >= 0.3
+
+
+def _backpack_target_needed(app) -> bool:
+    state = getattr(app, "current_state", None)
+    if state is not None and current_rule_is_pending(state):
+        return False
+    desired = _desired_backpack_paint(app)
+    if desired is None:
+        return False
+    entries = _visible_backpack_entries(app)
+    if not entries:
+        return False
+    index = _visible_backpack_index(app, desired)
+    if index is None or index >= len(entries):
+        return False
+    return not _backpack_paint_is_selected(entries[index])
+
+
+def _board_target_ready(app) -> bool:
+    state = getattr(app, "current_state", None)
+    if state is not None and current_rule_is_pending(state):
+        # 待落初始颜料：用的是手里那枚（「当前颜料」面板），不用先从背包挑，
+        # 所以只要算出了落点就直接提示，别卡在「背包选中」这一步上。
+        return bool(getattr(app, "recommendations", ()) or ())
+    has_request = _has_backpack_target(app) or bool(getattr(app, "recommendations", ()) or ())
+    if not has_request or _backpack_target_needed(app):
+        return False
+    entries = _visible_backpack_entries(app)
+    if not entries:
+        return True
+    desired = _desired_backpack_paint(app)
+    if desired is None:
+        return True
+    index = _visible_backpack_index(app, desired)
+    if index is not None and index < len(entries):
+        return _backpack_paint_is_selected(entries[index])
+    return any(_backpack_paint_is_selected(entry) for entry in entries)
+
+
+def _backpack_reason(paint) -> str:
+    return f"选{_paint_hint_label(paint)}"
+
+
+def _paint_hint_label(paint) -> str:
+    if paint is None:
+        return "背包颜料"
+    level = getattr(paint, "level", None)
+    suffix = f"Lv{level}" if isinstance(level, int) else ""
+    if bool(getattr(paint, "is_treasure", False)):
+        return f"宝箱{suffix}" if suffix else "宝箱"
+    category = getattr(getattr(paint, "category", None), "value", "")
+    prefix = "怪物" if category == "monster" else "玩法" if category == "gameplay" else "颜料"
+    return f"{prefix}{suffix}" if suffix else prefix
+
+
 def _latest_snapshot_is_missing(app) -> bool:
     return getattr(app, "last_fast_snapshot", None) is None and not tuple(getattr(app, "last_fast_events", ()) or ())
 
@@ -143,6 +304,13 @@ def _latest_snapshot_is_missing(app) -> bool:
 def _unstable_capture_state(app) -> PetBrainState | None:
     quality = getattr(app, "last_capture_quality", None)
     if not isinstance(quality, dict) or quality.get("ok", True):
+        return None
+    if _high_confidence_start_visible(app):
+        return None
+    scene = getattr(app, "current_scene", None)
+    if scene is not None and scene.region(RegionKind.FINISH_DRAWING) is not None:
+        # 结束态地块全是颜料/全空，格子状态本来就难分，会被 unknown_tiles 判低。
+        # 但「入画」按钮很明确，这时候不该报「识别不稳」。
         return None
     reason = str(quality.get("reason") or "")
     if "capture_source_composited" in reason:
@@ -218,18 +386,26 @@ def _phase_evidence(app, frame_id: str) -> PhaseEvidence:
     quality_ok = bool(quality.get("ok", True)) if isinstance(quality, dict) else bool(
         getattr(snapshot, "reliable", True)
     )
+    if _high_confidence_start_visible(app):
+        quality_ok = True
+    if scene is not None and scene.region(RegionKind.FINISH_DRAWING) is not None:
+        # 结束态格子状态难分（全空/全颜料），但入画按钮是硬信号，别判成识别不稳。
+        quality_ok = True
     quality_reason = str(quality.get("reason") or "") if isinstance(quality, dict) else ""
     board_confidence = _guidance_confidence(app)
-    brush = getattr(snapshot, "brush", None)
-    brush_visible = brush is not None or getattr(scene, "brush_options", None) is not None
     scenario = getattr(app, "brush_scenario", None)
+    brush = getattr(snapshot, "brush", None)
+    brush_visible = (
+        brush is not None
+        or getattr(scene, "brush_options", None) is not None
+        or scenario is not None
+    )
     selected_type = getattr(app, "selected_brush_type", None)
     selected_affix = getattr(app, "selected_affix", None)
     stage2_visible = bool(
         getattr(brush, "stage2_options", ())
         or getattr(scenario, "stage2_options", ())
     )
-    selection_changed = _first_event(events, "selection_state_changed") is not None
     finish_signals = _finish_signals(app, events)
     current_rule = getattr(state, "current_rule", None)
     rule_pending = bool(state is not None and current_rule_is_pending(state))
@@ -244,10 +420,10 @@ def _phase_evidence(app, frame_id: str) -> PhaseEvidence:
         current_rule_pending=rule_pending,
         brush_visible=brush_visible,
         brush_stage2_visible=stage2_visible,
-        brush_type_selected=selected_type is not None or bool(getattr(brush, "chosen_stage1", None)),
+        brush_type_selected=selected_type is not None,
         affix_selected=selected_affix is not None,
-        backpack_target=_has_backpack_target(app) and not selection_changed,
-        board_target=selection_changed or bool(getattr(app, "recommendations", None)),
+        backpack_target=_backpack_target_needed(app),
+        board_target=_board_target_ready(app),
         start_visible=bool(scene is not None and scene.region(RegionKind.START_DRAWING) is not None),
         finish_signals=frozenset(finish_signals),
     )
@@ -257,7 +433,10 @@ def _finish_signals(app, events: tuple[FastVisionEvent, ...]) -> set[str]:
     signals: set[str] = set()
     scene = getattr(app, "current_scene", None)
     snapshot = getattr(app, "last_fast_snapshot", None)
-    if scene is not None and scene.region(RegionKind.FINISH_DRAWING) is not None:
+    # 「入画」按钮在作画界面常驻（每次都能检出，置信 0.9+），它表示「可以进下一张」，
+    # 不是「本局已画完」。把它算成 finish_button 会让桌宠一直报「可结算」。
+    finish_region = scene.region(RegionKind.FINISH_DRAWING) if scene is not None else None
+    if finish_region is not None and not is_enter_painting_region(finish_region):
         signals.add("finish_button")
     terrain_counts = getattr(snapshot, "terrain_counts", None)
     if _terrain_counts_show_terminal_map(terrain_counts):
@@ -313,7 +492,7 @@ def _target_proposal(app, evidence: PhaseEvidence) -> TargetProposal | None:
                     kind=TargetKind.START,
                     priority=0,
                     screen_point=point,
-                    confidence=min(confidence, float(region.confidence)),
+                    confidence=max(confidence, min(0.90, float(region.confidence))),
                     reason_short="开始绘制",
                     source_frame_id=evidence.frame_id,
                 )
@@ -328,7 +507,8 @@ def _target_proposal(app, evidence: PhaseEvidence) -> TargetProposal | None:
                     kind=TargetKind.FINISH,
                     priority=0,
                     screen_point=point,
-                    confidence=min(confidence, float(region.confidence)),
+                    # 入画按钮是独立的高精度检测，不该被综合质量分（结束态格子本来就难分）拉低。
+                    confidence=max(confidence, min(0.90, float(region.confidence))),
                     reason_short="结束绘制",
                     source_frame_id=evidence.frame_id,
                 )
@@ -339,26 +519,24 @@ def _target_proposal(app, evidence: PhaseEvidence) -> TargetProposal | None:
             return brush_target
 
     if evidence.backpack_target:
-        desired = _desired_backpack_paint(app)
-        visible_index = _call_optional(app, "_visible_backpack_index_for_paint", desired)
-        point = _call_optional(app, "_screen_point_for_backpack_slot", visible_index)
-        if desired is not None and isinstance(visible_index, int) and _target_point_is_safe(app, point):
-            backpack_confidence = float(getattr(getattr(scene, "backpack", None), "confidence", confidence))
+        paint = _desired_backpack_paint(app)
+        index = _visible_backpack_index(app, paint)
+        point = _call_optional(app, "_screen_point_for_backpack_slot", index)
+        if index is not None and _target_point_is_safe(app, point):
             return TargetProposal(
-                key=f"backpack:{visible_index}",
+                key=f"backpack:{index}:{_paint_hint_label(paint)}",
                 kind=TargetKind.BACKPACK,
                 priority=30,
                 screen_point=(int(point[0]), int(point[1])),
-                confidence=min(confidence, backpack_confidence),
-                reason_short="先点背包",
+                confidence=confidence,
+                reason_short=_backpack_reason(paint),
                 source_frame_id=evidence.frame_id,
             )
 
-    recommendations = list(getattr(app, "recommendations", ()) or ())
-    if evidence.board_target and recommendations:
-        rec = recommendations[0]
-        row = getattr(rec, "row", None)
-        col = getattr(rec, "col", None)
+    if evidence.board_target:
+        row, col, rec = _desired_board_placement(app)
+        if not _board_target_is_in_effective_scope(state, row, col):
+            return None
         point = _call_optional(app, "_screen_point_for_board_cell", row, col)
         if isinstance(row, int) and isinstance(col, int) and _target_point_is_safe(app, point):
             return TargetProposal(
@@ -367,10 +545,23 @@ def _target_proposal(app, evidence: PhaseEvidence) -> TargetProposal | None:
                 priority=40,
                 screen_point=(int(point[0]), int(point[1])),
                 confidence=confidence,
-                reason_short=_recommendation_reason(rec),
+                reason_short=_recommendation_reason(rec) if rec is not None else "按方案放置",
                 source_frame_id=evidence.frame_id,
             )
     return None
+
+
+def _brush_card_center(index: int, count: int) -> float:
+    """卡片中心在面板高度上的比例。
+
+    笔锋面板固定两张卡片，8 张实拍量出来中心在 0.30 / 0.71（卡片带 0.108~0.900），
+    比按张数均分的 0.25 / 0.75 更贴。数量不是 2 时退回均分。
+    """
+    if count <= 1:
+        return 0.5
+    if count == 2:
+        return 0.71 if index > 0 else 0.30
+    return (index + 0.5) / count
 
 
 def _brush_target_proposal(
@@ -381,7 +572,11 @@ def _brush_target_proposal(
     scene = getattr(app, "current_scene", None)
     state = getattr(app, "current_state", None)
     scenario = getattr(app, "brush_scenario", None)
-    brush_observation = getattr(scene, "brush_options", None)
+    brush_observation = getattr(scene, "brush_options", None) or getattr(
+        app,
+        "_last_brush_observation",
+        None,
+    )
     panel = getattr(brush_observation, "panel_rect", None)
     if state is None or scenario is None or panel is None:
         return None
@@ -393,9 +588,14 @@ def _brush_target_proposal(
         recommendations = recommend_brush_types(state, options) if options else []
         if not recommendations:
             return None
-        best = recommendations[0]
+        locked_type = getattr(app, "_locked_brush_stage1", None)
+        best = next(
+            (item for item in recommendations if item.brush_type == locked_type),
+            recommendations[0],
+        )
+        setattr(app, "_locked_brush_stage1", best.brush_type)
         index = options.index(best.brush_type)
-        point = _capture_rect_point(app, panel, (index + 0.5) / len(options), 0.34)
+        point = _capture_rect_point(app, panel, 0.55, _brush_card_center(index, len(options)))
         if point is None:
             return None
         return TargetProposal(
@@ -412,9 +612,14 @@ def _brush_target_proposal(
         recommendations = recommend_affixes(state, affixes) if affixes else []
         if not recommendations:
             return None
-        best = recommendations[0]
+        locked_affix = getattr(app, "_locked_brush_stage2", None)
+        best = next(
+            (item for item in recommendations if item.affix == locked_affix),
+            recommendations[0],
+        )
+        setattr(app, "_locked_brush_stage2", best.affix)
         index = affixes.index(best.affix)
-        y_ratio = 0.45 if len(affixes) <= 1 else 0.35 + index * 0.25
+        y_ratio = _brush_card_center(index, len(affixes))
         point = _capture_rect_point(app, panel, 0.58, y_ratio)
         if point is None:
             return None
@@ -457,13 +662,60 @@ def _guidance_context_signature(app) -> tuple[object, ...]:
     )
 
 
-def _desired_backpack_paint(app):
+def _desired_board_placement(app) -> tuple[int | None, int | None, object | None]:
+    recommendations = list(getattr(app, "recommendations", ()) or ())
     install_plan = getattr(app, "install_plan", None)
     steps = tuple(getattr(install_plan, "steps", ()) or ())
     if steps:
-        return steps[0].paint
-    recommendations = list(getattr(app, "recommendations", ()) or ())
-    return getattr(recommendations[0], "paint", None) if recommendations else None
+        step = steps[0]
+        matching = next(
+            (
+                rec
+                for rec in recommendations
+                if getattr(rec, "row", None) == step.row
+                and getattr(rec, "col", None) == step.col
+                and getattr(rec, "paint", None) == step.paint
+            ),
+            None,
+        )
+        return step.row, step.col, matching
+    if recommendations:
+        rec = recommendations[0]
+        return getattr(rec, "row", None), getattr(rec, "col", None), rec
+    return None, None, None
+
+
+def _board_target_is_in_effective_scope(state, row, col) -> bool:
+    if not isinstance(row, int) or not isinstance(col, int):
+        return False
+    if state is None:
+        return True
+    rule = getattr(state, "current_rule", None)
+    if rule is None:
+        return True
+    if current_rule_is_pending(state):
+        return True
+    if getattr(state, "current_anchor", None) is None:
+        # 没有锚点算不出几何，只能信画面金框；连金框都没有就别挡建议。
+        observed = tuple(getattr(state, "observed_scope_cells", ()) or ())
+        return (row, col) in observed if observed else True
+    # 有锚点就一律走纯几何，和 game_model 的调色/笔触范围同口径。
+    # 金框不亮虚空/失色格，而扩散能把它们转成空白地块 —— 那些格子转完就在范围内，
+    # 按金框过滤会把本该有效的落点从建议里剔掉。
+    return (row, col) in current_scope_cells(state, include_anchor=False)
+
+
+def _high_confidence_start_visible(app) -> bool:
+    scene = getattr(app, "current_scene", None)
+    if scene is None:
+        return False
+    region = scene.region(RegionKind.START_DRAWING)
+    board = getattr(scene, "board", None)
+    return (
+        region is not None
+        and float(getattr(region, "confidence", 0.0)) >= 0.90
+        and float(getattr(board, "score", 0.0)) >= 0.68
+    )
 
 
 def _capture_rect_point(app, rect, x_ratio: float, y_ratio: float) -> tuple[int, int] | None:

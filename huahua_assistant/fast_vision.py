@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from .models import (
@@ -12,9 +13,13 @@ from .models import (
     PaintDirection,
     PaintObject,
     Rect,
+    RegionKind,
     SceneObservation,
     TileState,
 )
+
+#: 棋盘边长。``PuzzleState.tiles`` 是行主序的 36 格，坐标靠它换算。
+BOARD_SIZE = 6
 
 
 @dataclass(frozen=True)
@@ -28,6 +33,13 @@ class FastTile:
     paint_subtype: str | None
     paint_is_treasure: bool
     confidence: float
+    #: 地块等级加成（`game_model.Tile.bonus_level`）。
+    #: **视觉上读不到**：棋盘只渲染最终等级，空地上叠的加成完全不可见。
+    #: 这个字段由上层从规则推演出的模型状态回填，用于记录/回放两套数的区别。
+    bonus_level: int = 0
+    #: 「与自身相同的颜料额外提升 x 级」这类光环给这一格带来的等级
+    #: （`game_model.Tile.aura_level`）。同样视觉读不到，只能模型回填。
+    aura_level: int = 0
 
 
 @dataclass(frozen=True)
@@ -40,6 +52,8 @@ class FastBackpackPaint:
     is_treasure: bool
     fingerprint: str
     confidence: float
+    is_selected: bool = False
+    selection_confidence: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -57,6 +71,8 @@ class FastCurrentPaint:
     match_current: int | None
     match_required: int | None
     confidence: float
+    #: 面板「调色效果」正文（笔触条目原文）。None = 没读到这一行。
+    effect_text: str | None = None
 
 
 @dataclass(frozen=True)
@@ -84,12 +100,48 @@ class FastVisionSnapshot:
     regions: dict[str, Rect]
     reliable: bool
     reasons: tuple[str, ...]
+    #: 这一帧背包是按哪个**调色目标**排的（``monster`` / ``gameplay``，读不出就是空）。
+    #: 背包一页只有 3 排 15 格，整包 30 枚要靠切两次排序各记一页；没有这个字段
+    #: 两页的读数会互相覆盖，第二页一来就把第一页挤掉。
+    backpack_page: str = ""
 
 
-def snapshot_from_scene(scene: SceneObservation | None) -> FastVisionSnapshot | None:
+def backpack_page_of(scene: SceneObservation | None) -> str:
+    """这一帧背包属于哪一页：按**当前初始颜料的目标**分页。
+
+    怪物初始颜料 → 背包按怪物排序 → ``monster`` 页；玩法 → ``gameplay`` 页。
+    两页各 15 格、合计最多 30 格（同一枚颜料两页都在是正常的）。
+
+    **目标读不出来时必须返回空串**，不能造 ``unknown`` 页：选色面板刚弹出、
+    ``current_paint`` 还认不出时，造新页会往里写满 15 格空读数。
+    """
+    paint = getattr(scene, "current_paint", None) if scene is not None else None
+    if paint is None:
+        return ""
+    target = getattr(paint, "target_object", None)
+    value = getattr(target, "value", None)
+    if value:
+        return str(value)
+    category = getattr(paint, "category", None)
+    return str(getattr(category, "value", None) or "")
+
+
+def snapshot_from_scene(
+    scene: SceneObservation | None,
+    model: object | None = None,
+    *,
+    backpack_page: str = "",
+) -> FastVisionSnapshot | None:
+    """把一帧观测压成快照。
+
+    ``model`` 是规则推演出的模型状态（``game_model.PuzzleState``）。传进来时，
+    每一格的 ``bonus_level`` / ``aura_level`` 会从模型回填——这两项**视觉上完全读不到**，
+    棋盘只渲染最终等级，空地上叠的加成更是连像素都没有。
+    """
     if scene is None:
         return None
-    tiles = _fast_tiles(scene.board)
+    buffs = _tile_buffs(model)
+    tiles = _fast_tiles(scene.board, buffs)
     terrain_counts = _terrain_counts(tiles)
     board_signature = _stable_hash(
         "|".join(
@@ -119,19 +171,30 @@ def snapshot_from_scene(scene: SceneObservation | None) -> FastVisionSnapshot | 
         backpack=backpack,
         backpack_signature=_stable_hash(
             "|".join(
-                f"{paint.slot_index},{paint.category},{paint.level},{paint.subtype},{int(paint.is_treasure)},{paint.fingerprint}"
+                f"{paint.slot_index},{paint.category},{paint.level},{paint.subtype},{int(paint.is_treasure)},{int(paint.is_selected)},{paint.fingerprint}"
                 for paint in backpack
             )
         ),
         current=current,
         brush=brush,
-        regions={region.kind.value: region.rect for region in scene.regions},
+        # 「入画」按钮在作画界面常驻，不能当成「完成绘制」区域往外报：
+        # ``_finish_visible`` / 录制器 / 桌宠都只看 kind，看到它就以为本局画完了。
+        regions={
+            region.kind.value: region.rect
+            for region in scene.regions
+            if not (region.kind == RegionKind.FINISH_DRAWING and region.is_enter_painting)
+        },
         reliable=not reasons,
         reasons=reasons,
+        backpack_page=backpack_page or backpack_page_of(scene),
     )
 
 
-def _fast_tiles(board: BoardObservation) -> tuple[FastTile, ...]:
+def _fast_tiles(
+    board: BoardObservation,
+    buffs: dict[tuple[int, int], tuple[int, int]] | None = None,
+) -> tuple[FastTile, ...]:
+    buffs = buffs or {}
     return tuple(
         FastTile(
             row=tile.row,
@@ -143,9 +206,44 @@ def _fast_tiles(board: BoardObservation) -> tuple[FastTile, ...]:
             paint_subtype=tile.paint_subtype,
             paint_is_treasure=tile.paint_is_treasure,
             confidence=round(float(tile.confidence), 3),
+            bonus_level=buffs.get((tile.row, tile.col), (0, 0))[0],
+            aura_level=buffs.get((tile.row, tile.col), (0, 0))[1],
         )
         for tile in board.tiles
     )
+
+
+def _tile_buffs(model: object | None) -> dict[tuple[int, int], tuple[int, int]]:
+    """从模型状态里取出每格的 ``(bonus_level, aura_level)``。
+
+    认三种形状，方便调用方（GUI、录制器、测试）各取所需：
+
+    - ``None`` → 全 0；
+    - 有 ``.tiles`` 的对象（``game_model.PuzzleState``）→ 按行主序换算坐标；
+    - 直接给 ``{(row, col): (bonus, aura)}`` 或 ``{(row, col): tile}``。
+    """
+    if model is None:
+        return {}
+    model_tiles = getattr(model, "tiles", None)
+    if model_tiles is not None:
+        buffs: dict[tuple[int, int], tuple[int, int]] = {}
+        for index, tile in enumerate(model_tiles):
+            buffs[divmod(index, BOARD_SIZE)] = (
+                max(0, int(getattr(tile, "bonus_level", 0) or 0)),
+                max(0, int(getattr(tile, "aura_level", 0) or 0)),
+            )
+        return buffs
+    if isinstance(model, Mapping):
+        buffs = {}
+        for key, value in model.items():
+            if isinstance(value, tuple):
+                bonus, aura = value
+            else:
+                bonus = getattr(value, "bonus_level", 0)
+                aura = getattr(value, "aura_level", 0)
+            buffs[(int(key[0]), int(key[1]))] = (max(0, int(bonus or 0)), max(0, int(aura or 0)))
+        return buffs
+    return {}
 
 
 def _fast_backpack(backpack: BackpackObservation | None) -> tuple[FastBackpackPaint, ...]:
@@ -161,6 +259,8 @@ def _fast_backpack(backpack: BackpackObservation | None) -> tuple[FastBackpackPa
             is_treasure=paint.is_treasure,
             fingerprint=paint.fingerprint,
             confidence=round(float(paint.category_confidence) * 0.55 + float(paint.level_confidence) * 0.45, 3),
+            is_selected=paint.is_selected,
+            selection_confidence=round(float(paint.selection_confidence), 3),
         )
         for index, paint in enumerate(backpack.paints)
     )
@@ -188,6 +288,8 @@ def _fast_current(current: CurrentPaintObservation | None) -> FastCurrentPaint |
         match_current=current.match_current,
         match_required=current.match_required,
         confidence=round(sum(confidence_parts) / len(confidence_parts), 3),
+        # 面板第三行「调色效果」，即这笔吃的是哪一条官方笔触。
+        effect_text=getattr(current, "effect_text", None),
     )
 
 

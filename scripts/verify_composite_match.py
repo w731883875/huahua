@@ -1,22 +1,24 @@
-"""验证「蒙版能通过」：合成图当模板，去打实机格子。
+"""验证「合成模板能不能用」：拿实机格子去查**生产用的那个模板库**。
 
-## 判据就是识别器自己的
+## 两段结果，只有第一段算数
 
-不另立标准。直接用 :mod:`huahua_assistant.paint_kind` 的那套：
+**【生产口径】** 直接构造 :class:`paint_kind.KindTemplateBank` 并挂上合成模板
+（``merge_sheet()``），然后对每个实机格子调 ``bank.read()`` ——
+跟软件里跑的**是同一行代码、同一批模板、同一套参数**
+（:data:`paint_kind.SHEET_SCALES` 多尺度 1.0/1.15/1.3/1.45、
+:data:`paint_kind.SHEET_BACKGROUND` 黑底、双向 NCC、按家族取最高分）。
+这一段报的命中率才代表实机表现。
 
-1. :func:`paint_kind.kind_feature` 抽 44×44 灰度窗口 + 30×30 中心模板 + 颜色直方图；
-2. 综合分 = ``KIND_NCC_WEIGHT × NCC + (1-权重) × 直方图相似度``；
-3. 和 ``KIND_MATCH_THRESHOLD``（0.68）比。
-
-对每个实机格子，把**它自己家族的合成图**当模板打进去。分数过线 = 蒙版能通过。
-
-另外跑一遍「全库对打」：把全部 27 家族的合成图当模板库，看每格最高分落在
-自己家族上的比例——这是真正会用在识别里的场景（不能只看自己那一家）。
+**【旧口径对照】** 早期版本是「浅色底 + 单一尺度 + 只拿自己家族的合成图来打」，
+报出来只有 39.7% 通过率。这个数字**不代表现在的能力**，留着只为说明当初为什么
+判定「合成图没用」是错的：合成图里框只占画布 75%（官方 ``frame SizeBox=192`` /
+画布 256），而游戏里框顶满格子（``paint_frame.TARGET_FRAME_OF_CELL``），
+两边中心 54% 搜索窗截到的根本不是同一块内容。放大 1.3 倍才对得上。
 
 用法::
 
     python scripts/verify_composite_match.py
-    python scripts/verify_composite_match.py --threshold 0.68
+    python scripts/verify_composite_match.py --threshold 0.68 --legacy
 """
 
 from __future__ import annotations
@@ -151,15 +153,70 @@ def _rgba(image: np.ndarray) -> np.ndarray:
     return image
 
 
+def _production(samples: list[dict], threshold: float) -> int:
+    """生产口径：用软件里那个库（自学习 + 合成模板都挂着），走它自己的 ``read()``。"""
+    bank = paint_kind.bank()
+    print(f"\n【生产口径 · 与软件同一行代码】")
+    print(
+        f"  {len(bank.kinds())}/{len(paint_kind.known_kinds())} 个家族；"
+        f"合成模板 {bank.sheet_count()} 条，自学习 {len(bank)} 条（{len(bank.templates)} 家族）"
+    )
+    print(f"  缺 {bank.unknown_kinds() or '无'}")
+    print(f"  尺度 {paint_kind.SHEET_SCALES}；底色 {paint_kind.SHEET_BACKGROUND}")
+
+    hits = 0
+    misses: list[str] = []
+    wrong: list[str] = []
+    own_scores: list[float] = []
+    total = 0
+    for sample in samples:
+        reading = bank.read(sample["tile"])
+        if not reading.scores:
+            continue
+        total += 1
+        own = float(reading.scores.get(sample["family"], 0.0))
+        own_scores.append(own)
+        if reading.subtype == sample["family"]:
+            hits += 1
+        elif reading.subtype is not None:
+            wrong.append(f"{sample['family']}→{reading.subtype}({reading.score:.2f})")
+        else:
+            misses.append(f"{sample['family']} Lv{sample['level']} 本家 {own:.3f}")
+    own_scores.sort()
+    print(f"\n  认对 {hits}/{total}  ({hits / max(1, total) * 100:.1f}%)")
+    if own_scores:
+        print(
+            f"  本家分 中位={statistics.median(own_scores):.4f}"
+            f" 最低={own_scores[0]:.4f} 最高={own_scores[-1]:.4f}"
+        )
+    if wrong:
+        print(f"  认错 {len(wrong)} 格：{' / '.join(wrong[:10])}")
+    if misses:
+        print(f"  未过线 {len(misses)} 格：{' / '.join(misses[:10])}")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--threshold", type=float, default=paint_kind.KIND_MATCH_THRESHOLD)
+    parser.add_argument(
+        "--legacy",
+        action="store_true",
+        help="额外跑一遍旧的浅色底+单尺度对照（39.7% 那个数字的出处，不代表现在能力）",
+    )
     args = parser.parse_args()
 
     samples = _samples()
     if not samples:
         raise SystemExit("没取到实机格子")
     print(f"样本 {len(samples)} 格；阈值 {args.threshold}")
+
+    _production(samples, args.threshold)
+    if not args.legacy:
+        return 0
+
+    print("\n【旧口径对照 · 浅色底 + 单尺度 + 只打自己家族】")
+    print("  注意：这一段是历史参数，数字偏低不代表现在识别不了。")
 
     # 预生成合成模板（同一家族+等级只做一次）
     cache: dict[tuple[str, int], paint_kind.KindFeature] = {}

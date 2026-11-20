@@ -41,6 +41,32 @@ def _proposal(frame_id: str, **overrides) -> TargetProposal:
 
 
 class GamePhaseStateMachineTests(unittest.TestCase):
+    def test_brush_phase_stabilizes_even_when_board_signature_changes(self) -> None:
+        machine = GamePhaseStateMachine()
+
+        first = machine.update(
+            _evidence(
+                "f1",
+                board_signature="noisy-a",
+                board_target=False,
+                current_rule_pending=True,
+                brush_visible=True,
+            )
+        )
+        second = machine.update(
+            _evidence(
+                "f2",
+                board_signature="noisy-b",
+                board_target=False,
+                current_rule_pending=True,
+                brush_visible=True,
+            )
+        )
+
+        self.assertEqual(GamePhase.BRUSH_STAGE1, first.observed_phase)
+        self.assertEqual(GamePhase.BRUSH_STAGE1, second.phase)
+        self.assertTrue(second.stable)
+
     def test_start_button_stabilizes_as_initial_map(self) -> None:
         machine = GamePhaseStateMachine()
 
@@ -231,6 +257,36 @@ class RecommendationTargetStabilizerTests(unittest.TestCase):
 
         self.assertEqual(stable.expires_at, repeated.expires_at)
         self.assertIsNone(expired)
+
+    def test_static_brush_target_refreshes_until_player_selects_it(self) -> None:
+        stabilizer = RecommendationTargetStabilizer()
+        context = ("window-a",)
+        proposal = lambda frame: _proposal(
+            frame,
+            key="brush_stage1:stack",
+            kind=TargetKind.BRUSH_STAGE1,
+        )
+        stabilizer.update(
+            proposal("f1"),
+            phase=GamePhase.BRUSH_STAGE1,
+            context_signature=context,
+            now=1.0,
+        )
+        stable = stabilizer.update(
+            proposal("f2"),
+            phase=GamePhase.BRUSH_STAGE1,
+            context_signature=context,
+            now=1.31,
+        )
+        refreshed = stabilizer.update(
+            proposal("f2"),
+            phase=GamePhase.BRUSH_STAGE1,
+            context_signature=context,
+            now=2.5,
+        )
+
+        self.assertIsNotNone(stable)
+        self.assertGreater(refreshed.expires_at, stable.expires_at)
 
     def test_low_confidence_context_change_and_expiry_hide_target(self) -> None:
         stabilizer = RecommendationTargetStabilizer()

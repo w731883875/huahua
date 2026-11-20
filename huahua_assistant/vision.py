@@ -81,6 +81,22 @@ BRUSH_STAGE2_TEXT_RECTS = (
     (85, 42, 555, 76),
     (85, 137, 555, 82),
 )
+#: 光栅模板只在「面板形状接近模板拍摄时」才可信。模板是从 1673x878 窗口上截的
+#: （面板 760x251，宽高比 3.03），文字框是写死的像素坐标；窗口尺寸一换，
+#: 同样的裁剪框就压到别的行上——2026-11-20 在 1607x822 的截图上实测，一张
+#: 明明是「转变自身的作用方向」的卡片被读成「作用方向改为横向 0.88」，是纯粹的
+#: 假匹配。宁可不用模板，也不能把错词缀写进录制。
+BRUSH_STAGE2_CANONICAL_ASPECT = BRUSH_STAGE2_CANONICAL_PANEL_SIZE[0] / BRUSH_STAGE2_CANONICAL_PANEL_SIZE[1]
+BRUSH_STAGE2_ASPECT_TOLERANCE = 0.18
+
+
+def _brush_panel_matches_template_geometry(crop: np.ndarray) -> bool:
+    if crop.size == 0:
+        return False
+    aspect = crop.shape[1] / max(1, crop.shape[0])
+    low = BRUSH_STAGE2_CANONICAL_ASPECT * (1.0 - BRUSH_STAGE2_ASPECT_TOLERANCE)
+    high = BRUSH_STAGE2_CANONICAL_ASPECT * (1.0 + BRUSH_STAGE2_ASPECT_TOLERANCE)
+    return low <= aspect <= high
 
 
 def _warm_numpy_median() -> None:
@@ -195,11 +211,23 @@ def analyze_scene(
         if scene is not None and scene.board.score >= 0.76:
             return scene
 
+    # 标定过的窗口尺寸：直接按标定出框，不再精修、不再搜索。
+    # 2026-11-20 实测（1673x878）：这条 0.15s，走下面的全搜索 4.3s，
+    # 而全搜索最后交出来的还是同一个框——冷启动「完整识别」的一半时间在这里。
+    calibrated = _calibrated_board_rect(image)
+    if calibrated is not None:
+        rect, score = calibrated
+        return _analyze_scene_from_board_rect(
+            image, rect, fast=True, board_score=score, icon_fallback=icon_fallback
+        )
+
     located = _locate_board_rect(image)
     if located is None:
         return None
-    rect, _ = located
-    return _analyze_scene_from_board_rect(image, rect, fast=False, icon_fallback=icon_fallback)
+    rect, score = located
+    return _analyze_scene_from_board_rect(
+        image, rect, fast=False, board_score=score, icon_fallback=icon_fallback
+    )
 
 
 #: 棋盘 36 格「格内色彩标准差中位数」的上限。
@@ -258,6 +286,12 @@ def _locate_board_rect(image: np.ndarray) -> tuple[Rect, float] | None:
     门槛与 ``analyze_scene`` 原逻辑逐字一致，不在此处另行加减。
     """
     height, width = image.shape[:2]
+    # 先按 layout.json 里已经标定过的窗口尺寸直接取框：一次十几毫秒，
+    # 而下面「缩略图定位 + 版式候选逐个精修」实测 3~4s，全搜索更久。
+    # 冷启动只要这个尺寸标定过，就没必要再搜一遍。
+    calibrated = _calibrated_board_rect(image)
+    if calibrated is not None:
+        return calibrated
     # 大窗口上 ``_best_estimated_board_layout`` 要对十几个候选逐个跑
     # ``_refine_board_rect``（全图 Canny + 三重循环）：1765x965 实测 11.5s，
     # 加全搜索共 15.9s。拖一次窗口十几秒不出帧，玩家只会以为工具死了。
@@ -319,6 +353,28 @@ def _locate_board_rect(image: np.ndarray) -> tuple[Rect, float] | None:
     if not _board_cells_look_flat(image, rect):
         return None
     return rect, _score_board_rect(image, rect)
+
+
+def _calibrated_board_rect(image: np.ndarray) -> tuple[Rect, float] | None:
+    """按已标定的布局直接给出棋盘框，不做任何搜索。
+
+    判据与实时路径一致（网格分 ≥ :data:`GRID_PRESENCE_SCORE`，再由
+    ``_pick_board_rect`` 用棋盘自身的分数复核），所以不会因为「快」而放松：
+    窗口尺寸没标定过、或棋盘不在标定位置时，老实返回 ``None`` 让调用方去搜。
+    """
+    height, width = image.shape[:2]
+    screen = _screen_layout(width, height)
+    rect = _pick_board_rect(image, screen, width, height, drawing=True)
+    if rect is None:
+        return None
+    if _board_grid_score(image, rect, outer_penalty=False) < GRID_PRESENCE_SCORE:
+        return None
+    score = _score_board_rect(image, rect)
+    if score < MIN_BOARD_DETECTION_SCORE:
+        return None
+    if not _board_cells_look_flat(image, rect):
+        return None
+    return rect, score
 
 
 def _choose_board_rect(image: np.ndarray, best_rect: Rect, best_score: float) -> Rect:
@@ -1370,6 +1426,23 @@ def _panel_text_overrides(reading: paint_panel.PanelReading | None) -> dict[str,
     return overrides
 
 
+def _panel_text_covers_paint_fields(overrides: dict[str, object]) -> bool:
+    """面板文字是否把「当前颜料」的全部字段都读出来了。
+
+    只有全读出来才敢跳过字形模板匹配：少一个字段（比如界面换了版式、OCR 只读到
+    标题）就得让模板去补，那时省时间等于拿错数值换速度。
+    """
+    required = (
+        "category",
+        "level",
+        "target_object",
+        "direction",
+        "upgrade_amount",
+        "match_required",
+    )
+    return all(key in overrides for key in required)
+
+
 def _current_paint_text_crop(image: np.ndarray, panel: Rect) -> np.ndarray:
     """给 OCR 用的「当前颜料」文字区，比模板用的裁剪框更宽也更高。
 
@@ -1426,10 +1499,22 @@ def _analyze_current_paint(
     is_treasure = False
     level, level_confidence = _detect_level_by_color(image, icon)
     text_crop = image[text.y : text.bottom, text.x : text.right]
-    keyword_scores = _current_paint_keyword_scores(text_crop)
+
+    # 面板文字是最终真值，所以**先** OCR，再决定要不要跑字形模板。
+    #
+    # 2026-11-20：原来顺序是反的——先跑 `_current_paint_keyword_scores`（整套字形
+    # 模板匹配，实测 5.3s），读出来之后再让 OCR 覆盖一遍。既然结果一定是文字说了算，
+    # 文字读全了就完全没必要跑那 5.3s。冷启动「完整识别」15.8s 里这是一半。
+    panel_text = paint_panel.read_panel(_current_paint_text_crop(image, panel))
+    overrides = _panel_text_overrides(panel_text)
+    text_is_complete = _panel_text_covers_paint_fields(overrides)
+
+    keyword_scores: dict[str, float] = (
+        {} if text_is_complete else _current_paint_keyword_scores(text_crop)
+    )
     _store_current_panel_signature(keyword_scores, _current_panel_signature(text_crop))
     match_current, match_required = _infer_match_count(keyword_scores)
-    if match_required is None:
+    if match_required is None and not text_is_complete:
         match_current, match_required = _detect_match_count_hint(text_crop)
     target_object = _infer_target_object(keyword_scores)
     direction = _infer_direction(keyword_scores)
@@ -1441,10 +1526,6 @@ def _analyze_current_paint(
         if upgrade_amount is None:
             upgrade_amount = default_upgrade_amount
 
-    # 面板文字是最终真值：字形模板打分只当兜底。这里同步 OCR 一次（约 70~120ms），
-    # 只走冷启动 / 单张截图分析这条路，实时帧走下面的 _analyze_current_paint_fast。
-    panel_text = paint_panel.read_panel(_current_paint_text_crop(image, panel))
-    overrides = _panel_text_overrides(panel_text)
     if overrides:
         category = overrides.get("category", category)  # type: ignore[assignment]
         category_confidence = overrides.get("category_confidence", category_confidence)  # type: ignore[assignment]
@@ -2517,7 +2598,7 @@ def _analyze_brush_options_realtime(
 
 
 def _match_brush_stage2_raster_templates(crop: np.ndarray) -> tuple[tuple[str, ...], dict[str, float]]:
-    if crop.size == 0:
+    if crop.size == 0 or not _brush_panel_matches_template_geometry(crop):
         return (), {}
     panel = cv2.resize(crop, BRUSH_STAGE2_CANONICAL_PANEL_SIZE, interpolation=cv2.INTER_AREA)
     templates = _brush_stage2_raster_templates()
@@ -2557,7 +2638,7 @@ _BRUSH_STAGE2_UI_ALIASES = {
 
 
 def _match_brush_stage2_windows_ocr(crop: np.ndarray) -> tuple[tuple[str, ...], dict[str, float]]:
-    if crop.size == 0:
+    if crop.size == 0 or not _brush_panel_matches_template_geometry(crop):
         return (), {}
     panel = cv2.resize(crop, BRUSH_STAGE2_CANONICAL_PANEL_SIZE, interpolation=cv2.INTER_AREA)
     text_crops = [panel[y : y + h, x : x + w] for x, y, w, h in BRUSH_STAGE2_TEXT_RECTS]
@@ -4754,11 +4835,17 @@ def _finish_drawing_button_confidence(
     blue_ratio = float(np.mean((h >= 88) & (h <= 112) & (s > 45) & (v > 115)))
     red_text_ratio = float(np.mean((((h <= 12) | (h >= 170)) & (s > 55) & (v > 95))))
     bright_ratio = float(np.mean(v > 145))
+    # 「完成绘制」是红字按钮。没有红字就不可能通过，先判它再跑字形模板匹配：
+    # 那一步是 45 次 matchTemplate（实测 0.7~1.4s），而「入画」是白字蓝底，
+    # 每次都白跑一遍。条件与原来的 `keyword_score < 0.40 or red_text_ratio < 0.010`
+    # 完全等价，只是把便宜的判断提到前面。
+    if red_text_ratio < 0.010:
+        return 0.0
     keyword_score = _finish_button_keyword_score(crop, keywords)
+    if keyword_score < 0.40:
+        return 0.0
     aspect_score = 1.0 - min(1.0, abs(aspect - 3.6) / 3.0)
     area_score = min(1.0, area_ratio / 0.08)
-    if keyword_score < 0.40 or red_text_ratio < 0.010:
-        return 0.0
     return float(
         np.clip(
             blue_ratio * 0.26
@@ -4857,20 +4944,13 @@ def _detect_brush_options_mode(image: np.ndarray, x0: int, board_rect: Rect, pan
 
 
 def _has_brush_card_layout(crop: np.ndarray) -> bool:
-    if crop.size == 0:
-        return False
-    height, width = crop.shape[:2]
-    wide_cards = 0
-    for card in _split_brush_cards(crop):
-        card_height, card_width = card.shape[:2]
-        if not height * 0.12 <= card_height <= height * 0.62:
-            continue
-        if card_width < width * 0.50:
-            continue
-        if card_width / max(1, card_height) < 3.8:
-            continue
-        wide_cards += 1
-    return wide_cards >= 2
+    """这块区域像不像「笔触选择面板」（上下两张宽卡片）。
+
+    2026-11-20 换成 ``brush_panel.card_bands_ok``：原来按「宽高比 ≥3.8 的宽卡片
+    至少两张」判，窗口尺寸一变（1607x822 下卡片 404x116，宽高比 3.48）就全判否，
+    BRUSH_OPTIONS 区域根本不建，整局笔触读数恒为空。
+    """
+    return brush_panel.card_bands_ok(crop)
 
 
 def _candidate_board_rects(image: np.ndarray) -> list[Rect]:

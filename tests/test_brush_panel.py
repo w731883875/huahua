@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import json
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -252,6 +253,24 @@ class PanelCacheTest(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(reader.call_count, 1)
 
+    def test_stale_reading_is_dropped_after_the_window(self) -> None:
+        """面板关掉以后，不能拿几秒前的读数继续解释现在的画面。"""
+        lines = OCR_SAMPLES["方向_转锋堆砌"]
+        with mock.patch.object(
+            brush_panel.windows_ocr, "recognize_chinese_lines", return_value=lines
+        ):
+            brush_panel.read_brush_panel_async(self.crop)
+            self.assertTrue(brush_panel.wait_for_async())
+            self.assertIsNotNone(brush_panel.read_brush_panel_async(self.crop))
+
+            with mock.patch.object(brush_panel, "PANEL_READ_STALE", 0.05), mock.patch.object(
+                brush_panel.windows_ocr, "recognize_chinese_lines", return_value=()
+            ):
+                time.sleep(0.12)
+                other = self.crop.copy()
+                other[:40, :] = (1, 2, 3)  # 面板换成另一张（签名一定会变）
+                self.assertIsNone(brush_panel.read_brush_panel_async(other))
+
     def test_reset_cache_forces_a_fresh_read(self) -> None:
         lines = OCR_SAMPLES["方向_转锋堆砌"]
         with mock.patch.object(
@@ -268,18 +287,45 @@ class PanelCacheTest(unittest.TestCase):
         ):
             self.assertIsNone(brush_panel.read_brush_panel(self.crop))
 
-    def test_async_version_returns_none_until_the_background_read_lands(self) -> None:
+    def test_async_version_returns_none_then_delivers_on_the_next_frame(self) -> None:
+        """第一帧只发起后台读取（返回 None），跑完之后沿用这份结果。"""
         lines = OCR_SAMPLES["方向_转锋堆砌"]
         with mock.patch.object(
-            brush_panel.windows_ocr, "recognize_chinese_lines_async", return_value=None
+            brush_panel.windows_ocr, "recognize_chinese_lines", return_value=lines
         ):
             self.assertIsNone(brush_panel.read_brush_panel_async(self.crop))
-        with mock.patch.object(
-            brush_panel.windows_ocr, "recognize_chinese_lines_async", return_value=lines
-        ):
+            self.assertTrue(brush_panel.wait_for_async())
             reading = brush_panel.read_brush_panel_async(self.crop)
-        self.assertIsNotNone(reading)
-        self.assertEqual(reading.stage, "direction")
+            self.assertIsNotNone(reading)
+            self.assertEqual(reading.stage, "direction")
+            self.assertEqual(
+                set(reading.brush_types), {BrushType.TRANSFORM, BrushType.STACK}
+            )
+
+    def test_animated_panel_still_delivers_a_reading(self) -> None:
+        """卡片在呼吸发光：每帧像素都变，签名每帧都不同。
+
+        旧实现把签名当唯一缓存键，于是每帧都是「新面板」→ 每帧起一个 OCR 线程、
+        当帧永远返回 None，实机表现为整局读不到笔触面板（2026-11-20 事故）。
+        现在按时间节流 + 沿用上次结果：动画帧必须能拿到读数。
+        """
+        lines = OCR_SAMPLES["方向_转锋堆砌"]
+        readings: list[object] = []
+        with mock.patch.object(
+            brush_panel.windows_ocr, "recognize_chinese_lines", return_value=lines
+        ) as reader:
+            with mock.patch.object(brush_panel, "PANEL_READ_INTERVAL", 0.0):
+                for frame in range(6):
+                    crop = self.crop.copy()
+                    crop[frame, :] = (frame * 17) % 255  # 每帧都不一样
+                    readings.append(brush_panel.read_brush_panel_async(crop))
+                    brush_panel.wait_for_async()
+            self.assertTrue(
+                any(reading is not None for reading in readings),
+                "动画帧里必须至少有一次拿到读数",
+            )
+            # 6 帧不能是 6 次 OCR：节流后每帧最多一次，且命中缓存后为 0 次
+            self.assertLessEqual(reader.call_count, 6)
 
 
 class RealScreenshotTest(unittest.TestCase):

@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import hashlib
 import re
+import threading
+import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 
@@ -126,6 +128,57 @@ class BrushPanelReading:
 # 卡片版式（相对面板高度的比例）。实测 8 张截图里两张卡片都落在这一组位置上，
 # 差别不到 2%。亮度剖面切不开时用它兜底。
 CARD_SLOTS: tuple[tuple[float, float], ...] = ((0.108, 0.488), (0.520, 0.900))
+
+# 「这块区域是不是两张笔触卡片」的分带判据（都是相对面板高度的比例）。
+#
+# 2026-11-20 实机事故：原来的判据是「切出 ≥2 张宽卡片，宽高比 ≥3.8」。
+# 用户新窗口 1607x822 下两张卡片切成 404x116 / 390x117，宽高比 3.48 / 3.33，
+# 一个都过不了 —— 于是 `_detect_brush_options_mode` 判否、BRUSH_OPTIONS 区域根本
+# 没建，整局 `brush.stage1/stage2` 恒为空（那一局 61 帧全空）。
+#
+# 换成「左侧图标列的亮度分带」：正例（8 张 1673x878 实拍 + 2 张 1607x822 新截图）
+# 一律恰好 2 条带、高度 0.24~0.40、第二条顶边 0.44~0.56、缝 0.01~0.17；
+# 负例（背包页 / 待开画 / 结束画面）一条带都切不出来。宽高比与宽度不再参与判断。
+BAND_MIN_HEIGHT = 0.15
+BAND_MAX_HEIGHT = 0.50
+BAND_SECOND_TOP_RANGE = (0.35, 0.75)
+BAND_MAX_GAP = 0.20
+#: 卡片本体的最大平均亮度。笔触卡片是一块深青色半透明底板（实测 V 92~113），
+#: 而背包格/空面板的同一位置是更亮的冰蓝背景（V 130+）。
+BAND_BODY_MAX_VALUE = 145.0
+
+
+def card_bands_ok(crop: np.ndarray) -> bool:
+    """这块区域是不是「上下两张宽卡片」的笔触面板。
+
+    只看左侧图标列的亮度分带，不看宽高比：窗口尺寸一变，卡片宽高比就从 4.9
+    掉到 3.3，而分带结构完全不变（见 :data:`BAND_MIN_HEIGHT` 的注释）。
+    """
+    if crop is None or crop.size == 0:
+        return False
+    height, width = crop.shape[:2]
+    if height < 40 or width < 120:
+        return False
+    bands = gutter_bands(crop)
+    if len(bands) != 2:
+        return False
+    height_fractions = [(bottom - top) / height for top, bottom in bands]
+    if not all(BAND_MIN_HEIGHT <= value <= BAND_MAX_HEIGHT for value in height_fractions):
+        return False
+    second_top = bands[1][0] / height
+    if not BAND_SECOND_TOP_RANGE[0] <= second_top <= BAND_SECOND_TOP_RANGE[1]:
+        return False
+    gap = (bands[1][0] - bands[0][1]) / height
+    if gap < -0.02 or gap > BAND_MAX_GAP:
+        return False
+    value = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)[:, :, 2]
+    body_left = int(width * 0.25)
+    body_right = int(width * 0.75)
+    for top, bottom in bands:
+        body = value[top:bottom, body_left:body_right]
+        if body.size and float(body.mean()) > BAND_BODY_MAX_VALUE:
+            return False
+    return True
 
 
 def gutter_bands(crop: np.ndarray) -> list[tuple[int, int]]:
@@ -291,6 +344,26 @@ _SIGNATURE_CACHE: OrderedDict[str, "BrushPanelReading"] = OrderedDict()
 _LINES_CACHE: OrderedDict[str, tuple[str, ...]] = OrderedDict()
 _CACHE_LIMIT = 16
 
+#: 两次面板 OCR 的最小间隔（秒）。面板要发光呼吸，签名每帧都变；按时间节流
+#: 才不会每帧起一个线程。0.35s 的滞后对提示来说完全够——比一轮推荐的计算还短。
+PANEL_READ_INTERVAL = 0.35
+#: 上一次结果最多沿用到这么久（秒）。超过就当作「没有读数」，别拿几秒前的
+#: 词缀去解释当前这一笔。必须大于采集泵的间隔：自动跟随实测 ``pump_interval``
+#: 是 1.5s，取 1.2s 会让「上一帧刚读到、这一帧刚好过期」反复发生，
+#: 读到的面板又变成空——那是 2026-11-20 之前的老毛病。3.0s ≈ 两个泵周期。
+PANEL_READ_STALE = 3.0
+
+_ASYNC_LOCK = threading.Lock()
+_ASYNC_STATE: dict[str, object] = {
+    "key": None,
+    "reading": None,
+    "reading_at": 0.0,
+    "requested_at": 0.0,
+    "pending": False,
+    "thread": None,
+    "generation": 0,
+}
+
 
 def panel_signature(crop: np.ndarray) -> str:
     small = cv2.resize(crop, (32, 12), interpolation=cv2.INTER_AREA)
@@ -314,6 +387,27 @@ def _cache_put(cache: OrderedDict, key: str, value) -> None:
 def reset_cache() -> None:
     _SIGNATURE_CACHE.clear()
     _LINES_CACHE.clear()
+    with _ASYNC_LOCK:
+        _ASYNC_STATE.update(
+            {
+                "key": None,
+                "reading": None,
+                "reading_at": 0.0,
+                "requested_at": 0.0,
+                "pending": False,
+                "generation": int(_ASYNC_STATE["generation"]) + 1,
+            }
+        )
+
+
+def wait_for_async(timeout: float = 2.0) -> bool:
+    """等后台那次面板 OCR 跑完（测试与「点开面板后立即取一次结果」用）。"""
+    with _ASYNC_LOCK:
+        thread = _ASYNC_STATE.get("thread")
+    if isinstance(thread, threading.Thread):
+        thread.join(timeout)
+        return not thread.is_alive()
+    return True
 
 
 def _build_reading(lines: tuple[str, ...], crop: np.ndarray, reader) -> tuple[BrushPanelReading, bool]:
@@ -366,29 +460,75 @@ def read_brush_panel(crop: np.ndarray) -> BrushPanelReading | None:
 
 
 def read_brush_panel_async(crop: np.ndarray) -> BrushPanelReading | None:
-    """异步版：缓存命中立即返回，否则丢后台线程，这一帧返回 ``None``。
+    """异步版：缓存命中立即返回，否则丢后台线程，这一帧返回上一次的结果。
 
-    实时帧用这个。逐卡片读词缀那一步也走异步——第一次返回时可能只有阶段结果、
-    没有词缀，下一帧补上；面板和卡片文本都进缓存，稳定状态下几乎零成本。
+    2026-11-20 重写。原来这里是「面板签名（32x12 缩略图 sha1）命中就复用，不命中就
+    起线程」，而笔触卡片一直在呼吸发光：每帧像素都变 → 签名每帧都是新的 →
+    ① ``_SIGNATURE_CACHE`` 永远不命中，线程每帧新起一个；② OCR 走的是同一个管道，
+    排队越来越长；③ 当帧永远返回 ``None``。实机表现就是**整局笔触面板一条都读不到**
+    （同一局「当前颜料」面板是好的，因为那边早就改成了按时间节流 + 沿用上次结果）。
+
+    现在与 ``paint_panel.read_panel_async`` 同口径：
+    - 同一张签名命中 → 零成本返回；
+    - 面板没换（签名变了但内容还是那两张卡片）→ 沿用最近一次成功结果；
+    - 距上次请求超过 :data:`PANEL_READ_INTERVAL` 才起新线程，一次只允许一个在飞。
     """
     if crop is None or crop.size == 0:
         return None
     key = panel_signature(crop)
     cached = _cache_get(_SIGNATURE_CACHE, key)
     if cached is not None:
+        with _ASYNC_LOCK:
+            _remember_async(key, cached)
         return cached
 
-    lines = _cache_get(_LINES_CACHE, key)
-    if lines is None:
-        panel = cv2.resize(crop, None, fx=PANEL_SCALE, fy=PANEL_SCALE, interpolation=cv2.INTER_CUBIC)
-        lines = windows_ocr.recognize_chinese_lines_async(panel)
-        if not lines:
-            return None
-        _cache_put(_LINES_CACHE, key, lines)
+    now = time.monotonic()
+    with _ASYNC_LOCK:
+        if (
+            _ASYNC_STATE["reading"] is not None
+            and now - float(_ASYNC_STATE["reading_at"]) > PANEL_READ_STALE
+        ):
+            _ASYNC_STATE["reading"] = None
+        if _ASYNC_STATE["key"] == key and _ASYNC_STATE["reading"] is not None:
+            return _ASYNC_STATE["reading"]
+        stale = _ASYNC_STATE["reading"]
+        should_request = not _ASYNC_STATE["pending"] and (
+            now - float(_ASYNC_STATE["requested_at"]) >= PANEL_READ_INTERVAL
+        )
+        if should_request:
+            _ASYNC_STATE["pending"] = True
+            _ASYNC_STATE["requested_at"] = now
+            _ASYNC_STATE["key"] = key
+    if should_request:
+        thread = threading.Thread(
+            target=_async_read_worker,
+            args=(key, crop.copy(), int(_ASYNC_STATE["generation"])),
+            name="huahua-brush-panel-ocr",
+            daemon=True,
+        )
+        with _ASYNC_LOCK:
+            _ASYNC_STATE["thread"] = thread
+        thread.start()
+    return stale
 
-    reading, pending = _build_reading(lines, crop, windows_ocr.recognize_chinese_lines_async)
-    if not pending:
-        _cache_put(_SIGNATURE_CACHE, key, reading)
-    return reading
+
+def _remember_async(key: str, reading: "BrushPanelReading") -> None:
+    _ASYNC_STATE["key"] = key
+    _ASYNC_STATE["reading"] = reading
+    _ASYNC_STATE["reading_at"] = time.monotonic()
+
+
+def _async_read_worker(key: str, crop: np.ndarray, generation: int) -> None:
+    reading: BrushPanelReading | None = None
+    try:
+        reading = read_brush_panel(crop)
+    finally:
+        with _ASYNC_LOCK:
+            # 期间调过 reset_cache（换了面板/换了局）就丢掉这次结果，
+            # 免得旧面板的读数盖到新面板上。
+            if generation == int(_ASYNC_STATE["generation"]):
+                _ASYNC_STATE["pending"] = False
+                if reading is not None:
+                    _remember_async(key, reading)
 
 

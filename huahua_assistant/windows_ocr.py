@@ -23,6 +23,8 @@ _async_pending: set[str] = set()
 _process_lock = threading.RLock()
 _ocr_process: subprocess.Popen[str] | None = None
 _warm_thread: threading.Thread | None = None
+_AVAILABLE: bool | None = None
+_probe_lock = threading.Lock()
 
 _POWERSHELL_OCR = r"""
 $ErrorActionPreference = 'Stop'
@@ -141,6 +143,40 @@ def recognize_chinese_lines(image: np.ndarray, timeout: float = 5.0) -> tuple[st
         while len(_line_cache) > _CACHE_LIMIT:
             _line_cache.popitem(last=False)
     return lines
+
+
+def is_available() -> bool:
+    """真跑一次 OCR 探针，判断这台机器/这个环境到底能不能用。
+
+    WinRT 的 ``OcrEngine`` 在某些环境里恒失败（沙箱里 ``Await`` 直接抛异常，
+    ``recognize_chinese_lines`` 于是静默返回 ``()``，和「这一帧没有文字」分不开）。
+    依赖 OCR 真值的用例必须能区分这两种情况，否则只能长期挂红。
+
+    探针自己画一行「调色效果」再去识别：读出任何一行就算可用。结果缓存。
+    """
+
+    global _AVAILABLE
+    with _probe_lock:
+        if _AVAILABLE is not None:
+            return _AVAILABLE
+        _AVAILABLE = False
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+
+            font = ImageFont.truetype(_probe_font_path(), 28)
+            canvas = Image.new("L", (220, 56), 255)
+            ImageDraw.Draw(canvas).text((8, 8), "调色效果", fill=0, font=font)
+            probe = cv2.cvtColor(np.array(canvas), cv2.COLOR_GRAY2BGR)
+            _AVAILABLE = bool(recognize_chinese_lines(probe, timeout=8.0))
+        except Exception:  # noqa: BLE001 - 探针失败只意味着不可用
+            _AVAILABLE = False
+        return _AVAILABLE
+
+
+def _probe_font_path() -> str:
+    from .keyword_match import _font_path
+
+    return _font_path()
 
 
 def recognize_chinese_lines_async(image: np.ndarray) -> tuple[str, ...] | None:

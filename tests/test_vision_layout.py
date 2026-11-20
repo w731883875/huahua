@@ -4,7 +4,9 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
+import cv2
 import numpy as np
 
 from huahua_assistant import presence, vision
@@ -133,6 +135,18 @@ class PresenceTest(unittest.TestCase):
 
 
 class RealtimePathTest(unittest.TestCase):
+    """实时帧预算：墙钟只做粗上限，真正的回归闸门是模板调用次数。
+
+    墙钟在这台机器上不可靠——同一段代码同一张图，5 帧实测
+    ``0.42 / 3.15 / 0.73 / 0.51 / 0.42``（进程里还有家族识别、面板 OCR 的后台线程，
+    `process_time` 会明显大于 wall，说明帧是被抢占而不是算得慢）。所以墙钟取最小值
+    只当「有没有慢一个量级」的粗闸；精确判据换成 ``matchTemplate`` 调用次数：
+    这张图上稳定 684 次/帧，一旦哪条字形慢路被接回实时路径会立刻涨到几千。
+    """
+
+    #: 684 实测 + 约 30% 余量。
+    REALTIME_TEMPLATE_BUDGET = 900
+
     def test_realtime_recognizes_real_screenshot_quickly(self) -> None:
         image = _screenshot("初始和背包宝箱.png")
         if image is None:
@@ -140,15 +154,42 @@ class RealtimePathTest(unittest.TestCase):
         vision.reset_vision_caches()
         self.assertIsNotNone(vision.analyze_scene_realtime(image))
 
-        started = time.perf_counter()
-        for _ in range(3):
+        timings = []
+        for _ in range(5):
+            frame_started = time.perf_counter()
             scene = vision.analyze_scene_realtime(image)
-        elapsed = (time.perf_counter() - started) / 3
+            timings.append(time.perf_counter() - frame_started)
 
         self.assertIsNotNone(scene)
         self.assertGreaterEqual(scene.board.score, 0.70)
-        # 布局算坐标 + 网格存在性判断后，一帧应明显低于旧的 0.28s。
-        self.assertLess(elapsed, 0.60)
+        self.assertLess(
+            min(timings),
+            0.95,
+            f"单帧最快也要 {min(timings):.2f}s（5 帧：{', '.join(f'{t:.2f}' for t in timings)}）",
+        )
+
+    def test_realtime_frame_does_not_fall_back_to_the_glyph_slow_path(self) -> None:
+        image = _screenshot("初始和背包宝箱.png")
+        if image is None:
+            self.skipTest("缺少实机截图")
+        vision.reset_vision_caches()
+        vision.analyze_scene_realtime(image)
+
+        calls = []
+        original = cv2.matchTemplate
+
+        def counting(*args, **kwargs):
+            calls.append(1)
+            return original(*args, **kwargs)
+
+        with mock.patch.object(cv2, "matchTemplate", counting):
+            vision.analyze_scene_realtime(image)
+        self.assertGreater(len(calls), 0, "一个模板都不跑说明打桩没生效")
+        self.assertLessEqual(
+            len(calls),
+            self.REALTIME_TEMPLATE_BUDGET,
+            f"实时帧跑了 {len(calls)} 次 matchTemplate，慢路被接回实时路径了",
+        )
 
     def test_blank_frame_is_rejected(self) -> None:
         vision.reset_vision_caches()

@@ -147,9 +147,22 @@ class AutomaticRunRecorderTests(unittest.TestCase):
         """
         recorder = AutomaticRunRecorder(path=None)
         tiles = [_blank_tile(index) for index in range(36)]
-        snapshot = _snapshot(
-            tiles, current=_current(), regions=(RegionKind.REFRESH_AFFIX.value,)
+        stage2 = FastBrush(
+            panel_rect=Rect(80, 30, 100, 50),
+            stage1_options=("transform", "stack"),
+            chosen_stage1="transform",
+            stage2_options=("范围内颜料提升1级", "范围内颜料提升2级"),
+            confidence=0.9,
         )
+        snapshot = _snapshot(
+            tiles,
+            current=_current(),
+            brush=stage2,
+            regions=(RegionKind.REFRESH_AFFIX.value,),
+        )
+        # 先给一帧没有笔触面板的画面，再让阶段二出现——`_visible_stage2` 只在
+        # 面板**变化**时更新（见 `_record_brush_transition`）。
+        recorder.process(_snapshot(tiles, current=_current()), observed_at=949.0)
         _feed_stable(recorder, snapshot, 950.0)
         result = recorder.process(snapshot, observed_at=950.3, clicks=((950.25, 5.0, 5.0),))
 
@@ -159,6 +172,23 @@ class AutomaticRunRecorderTests(unittest.TestCase):
         self.assertLess(event["payload"]["confidence"], 0.9)
         self.assertIn("5 级", event["payload"]["note"])
         self.assertEqual([0, 0, 10, 10], event["payload"]["rect"])
+
+    def test_refresh_click_is_ignored_when_stage2_panel_is_closed(self) -> None:
+        """阶段二面板没开时，点在同一片像素上不算刷新词缀。
+
+        2026-11-20：上一局日志里 11 次 ``affix_refresh_clicked``，而那一局宠物 2 级、
+        界面根本没有这个按钮。那块矩形是一条 530x63 的横条，几乎盖住面板一整行，
+        点哪都会命中。刷新按钮只存在于阶段二（词缀三选一）面板里，面板没开就不可能是它。
+        """
+        recorder = AutomaticRunRecorder(path=None)
+        tiles = [_blank_tile(index) for index in range(36)]
+        snapshot = _snapshot(
+            tiles, current=_current(), regions=(RegionKind.REFRESH_AFFIX.value,)
+        )
+        _feed_stable(recorder, snapshot, 960.0)
+        result = recorder.process(snapshot, observed_at=960.3, clicks=((960.25, 5.0, 5.0),))
+
+        self.assertNotIn("affix_refresh_clicked", result.events)
 
     def test_full_run_records_actions_transforms_force_and_finish(self) -> None:
         recorder = AutomaticRunRecorder(path=None)
@@ -431,23 +461,29 @@ class AutomaticRunRecorderTests(unittest.TestCase):
 
         self.assertEqual(15, len(recorder.initial_inventory))
 
-    def test_blocked_to_void_flip_is_dropped_as_bad_frame(self) -> None:
-        """成片 blocked→void 是入画画面的误读，不能污染 final_board。
+    def test_scene_swap_frame_with_paint_breakage_is_dropped_as_bad_frame(self) -> None:
+        """入画/结算画面：成片 blocked→void **且**颜料跟着崩 → 整帧作废。
 
         官方扩散 18 条里阻挡只能变成空白，没有任何一条能让阻挡变虚空。
-        2026-11-18 实测：末帧 4 个阻挡格同时变虚空，连带两枚颜料被读成怪物 Lv3。
+        2026-11-18 实测：末帧 4 个阻挡格同时变虚空，连带两枚颜料被读成怪物 Lv3
+        （用户当场指出「赛季变怪物不成立」）。
+
+        注意判据是**两条同时满足**：格数够多（≥1/3 盘）或伴随颜料崩盘。只靠格数分不开
+        逐格抖动和入画画面——前者 4~6 格、后者也 4~6 格。
         """
         recorder = AutomaticRunRecorder(path=None, stable_frames=1)
         tiles = [_blank_tile(index) for index in range(36)]
         for index in (7, 8, 27, 31):
             tiles[index] = _blank_tile(index, TileState.BLOCKED.value)
+        tiles[19] = _paint_tile(19, "gameplay", 2, subtype="赛季")
         recorder.process(_snapshot(tiles, current=_current()), observed_at=9000.0)
         good = recorder._last_snapshot
 
         broken = list(tiles)
         for index in (7, 8, 27, 31):
             broken[index] = _blank_tile(index, TileState.VOID.value)
-        broken[19] = _blank_tile(19, TileState.VOID.value)  # 第 5 格：把一枚颜料也读成虚空
+        # 颜料也被重读成别的类别：入画画面是整盘重画，颜料不会安然无恙。
+        broken[19] = _paint_tile(19, "monster", 3, subtype="赛季")
         result = recorder.process(_snapshot(broken, current=_current()), observed_at=9001.0)
 
         self.assertIn("unreliable_frame_dropped", result.events)
@@ -456,6 +492,87 @@ class AutomaticRunRecorderTests(unittest.TestCase):
         # 同一张坏画面再来一帧，不能重复报
         again = recorder.process(_snapshot(broken, current=_current()), observed_at=9002.0)
         self.assertNotIn("unreliable_frame_dropped", again.events)
+
+    def test_local_terrain_jitter_does_not_freeze_the_run(self) -> None:
+        """局部地形误读只按旧值压住，**基准照常推进**，整局记录不能停摆。
+
+        2026-11-20 实机：开局把 4 个虚空格读成阻挡（终局 0 阻挡/16 虚空证明了这一点），
+        之后每帧都读到 void，于是相对出错的开局基准帧帧都是 blocked→void。旧逻辑
+        见到 ≥2 格就整帧丢，而丢帧不推进 `_last_snapshot` → 26.6s 起连续 8 次全丢，
+        整局 19 次落笔、10 次笔触一条都没记下来。
+
+        现在：这几格先按旧值上报（`terrain_conflict_held`），连续两帧同向才改判
+        （`terrain_conflict_resolved`），期间**别的格子照样记**。
+        """
+        recorder = AutomaticRunRecorder(path=None, stable_frames=1)
+        tiles = [_blank_tile(index) for index in range(36)]
+        for index in (7, 8, 27, 31):
+            tiles[index] = _blank_tile(index, TileState.BLOCKED.value)
+        recorder.process(_snapshot(tiles, current=_current()), observed_at=9100.0)
+
+        jitter = list(tiles)
+        for index in (7, 8, 27, 31):
+            jitter[index] = _blank_tile(index, TileState.VOID.value)
+        first = recorder.process(_snapshot(jitter, current=_current()), observed_at=9101.0)
+
+        # 第一帧：不丢帧，四格按旧值压住
+        self.assertNotIn("unreliable_frame_dropped", first.events)
+        self.assertEqual(4, first.events.count("terrain_conflict_held"))
+        held_states = {(tile.row, tile.col): tile.state for tile in recorder._last_snapshot.tiles}
+        for index in (7, 8, 27, 31):
+            self.assertEqual(
+                TileState.BLOCKED.value,
+                held_states[(index // 6, index % 6)],
+                "压住期间基准上必须是旧值",
+            )
+
+        # 第二帧仍是 void：连续两帧同向 → 改判，并把这次地形变化记下来
+        second = recorder.process(_snapshot(jitter, current=_current()), observed_at=9102.0)
+        self.assertNotIn("unreliable_frame_dropped", second.events)
+        self.assertEqual(4, second.events.count("terrain_conflict_resolved"))
+        settled = {(tile.row, tile.col): tile.state for tile in recorder._last_snapshot.tiles}
+        for index in (7, 8, 27, 31):
+            self.assertEqual(TileState.VOID.value, settled[(index // 6, index % 6)])
+
+        # 关键：改判之后再落一笔，照常记录（旧实现这里整局都记不到）
+        played = list(jitter)
+        played[0] = _paint_tile(0, "gameplay", 1)
+        third = recorder.process(_snapshot(played, current=_current()), observed_at=9103.0)
+        self.assertTrue(
+            {"initial_paint_placed", "paint_installed"} & set(third.events),
+            f"落笔必须被记下来，实际事件：{third.events}",
+        )
+
+    def test_repeated_scene_swap_frames_eventually_force_the_baseline(self) -> None:
+        """连续多帧都被判"整盘替换"时必须放弃否决，否则记录会永久停摆。
+
+        入画画面只出现在结束那一刻，不需要靠这条；连续 5 帧还在"整盘替换"，更像是
+        识别器彻底坏了或者玩家真把半盘地形改了。此时继续否决 = 静默冻结整局，
+        宁可推进基准并留下 `unreliable_frame_forced`，让复盘时看得见。
+        """
+        recorder = AutomaticRunRecorder(path=None, stable_frames=1)
+        tiles = [_blank_tile(index) for index in range(36)]
+        for index in (7, 8, 27, 31):
+            tiles[index] = _blank_tile(index, TileState.BLOCKED.value)
+        tiles[19] = _paint_tile(19, "gameplay", 2)
+        recorder.process(_snapshot(tiles, current=_current()), observed_at=9200.0)
+        frozen = recorder._last_snapshot
+
+        broken = list(tiles)
+        for index in (7, 8, 27, 31):
+            broken[index] = _blank_tile(index, TileState.VOID.value)
+        broken[19] = _paint_tile(19, "monster", 3)
+        events: list[str] = []
+        for step in range(5):
+            result = recorder.process(
+                _snapshot(broken, current=_current()), observed_at=9201.0 + step
+            )
+            events.extend(result.events)
+            if step < 4:
+                self.assertIs(frozen, recorder._last_snapshot, "前四帧必须仍然否决")
+
+        self.assertIn("unreliable_frame_forced", events)
+        self.assertIsNot(frozen, recorder._last_snapshot, "强制采信后基准必须推进")
 
     def test_per_frame_record_processing_stays_well_under_budget(self) -> None:
         recorder = AutomaticRunRecorder(path=None, stable_frames=1)

@@ -465,6 +465,56 @@ def audit_treasure_claims(run: list[dict[str, Any]]) -> list[tuple[str, list[str
     return findings
 
 
+def audit_frame_reliability(run: list[dict[str, Any]]) -> list[str]:
+    """录制器对每一帧「信不信」的自曝，翻成人能读的提示。
+
+    四类事件：
+
+    * ``terrain_conflict_held``：某格地形读数和上一帧对不上（官方扩散 18 条里阻挡
+      只能变空白、虚空也只能变空白，两者不能互换），先按旧值压住，等下一帧复核；
+    * ``terrain_conflict_resolved``：连续两帧同向，判定先前读数有误，已改判；
+    * ``unreliable_frame_dropped``：整帧被判成入画/结算画面，丢弃且不推进基准；
+    * ``unreliable_frame_forced``：连续多帧都被判成整盘替换，放弃否决、强制采信。
+
+    为什么值得单独看：这些是「日志里怎么没有那一步落笔」的最常见解释。旧版录制器
+    丢弃整帧时**不推进基准**，一次开局误读就能让整局记录停摆（2026-11-20 实测：
+    开局 4 格误读 → 连续 8 次丢帧 → 19 次落笔一条都没进来）。
+    """
+    held: dict[str, int] = {}
+    resolved: list[str] = []
+    dropped = 0
+    forced = 0
+    start = next((r for r in run if r.get("event") == "run_started"), None)
+    t0 = float(start.get("ts") or 0) if start else 0.0
+    for record in run:
+        event = record.get("event")
+        payload = record.get("payload") or {}
+        if event == "terrain_conflict_held":
+            name = _cell_name(int(payload["row"]), int(payload["col"]))
+            held[name] = held.get(name, 0) + 1
+        elif event == "terrain_conflict_resolved":
+            name = _cell_name(int(payload["row"]), int(payload["col"]))
+            resolved.append(f"{name} 改判为{STATE_LABEL.get(payload.get('to'), payload.get('to'))}")
+        elif event == "unreliable_frame_dropped":
+            dropped += 1
+        elif event == "unreliable_frame_forced":
+            forced += 1
+
+    lines: list[str] = []
+    if held:
+        cells = "、".join(f"{name}×{count}" for name, count in sorted(held.items()))
+        lines.append(f"地形读数冲突先按旧值压住：{cells}（官方规则里阻挡与虚空不能互换）")
+    if resolved:
+        lines.append("已改判的格子：" + "；".join(resolved))
+    if dropped:
+        lines.append(f"整帧作废：{dropped} 帧（判成入画/结算画面，没进终局盘面）")
+    if forced:
+        lines.append(
+            f"强制采信：{forced} 次（连续多帧都像整盘替换，已放弃否决并推进基准——这一局可能记错，需人工复核）"
+        )
+    return lines
+
+
 def build_steps(run: list[dict[str, Any]]) -> list[dict[str, Any]]:
     start = next(r for r in run if r.get("event") == "run_started")
     t0 = float(start.get("ts") or 0)
@@ -632,7 +682,10 @@ def build_html(
     session = start.get("session") or "?"
     t0 = float(start.get("ts") or 0)
     started = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t0))
-    duration = payload.get("duration")
+    # 中断局没有 ``run_finished``，payload 是空的 → duration 为 None。
+    # 这里以前直接 ``{duration:.1f}``，一遇到中断局就 TypeError 把整个 HTML 复盘炸掉
+    # （2026-11-20 实测：录制器冻结那一刻起这局就成了中断局）。
+    duration = float(payload.get("duration") or 0.0)
     reason = payload.get("reason") or "未收尾"
 
     status_class = "ok" if not issues else "bad"
@@ -853,7 +906,7 @@ def main() -> None:
     t0 = float(start.get("ts") or 0)
 
     print(f"对局：{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(t0))}")
-    print(f"时长：{payload.get('duration', 0):.1f}s  事件 {len(run)} 条  重建 {len(steps) - 1} 步")
+    print(f"时长：{float(payload.get('duration') or 0.0):.1f}s  事件 {len(run)} 条  重建 {len(steps) - 1} 步")
     print(f"接入方式：{describe_capture_start(run)}")
     if finish is None:
         # 中断局：没有结束事件，就没有终局快照。只能恢复到"最后一条可信记录"。
@@ -904,6 +957,13 @@ def main() -> None:
         else:
             print("逐帧交叉校验：跳过（该时间窗内没有逐帧观测）")
     print()
+
+    reliability = audit_frame_reliability(run)
+    if reliability:
+        print(f"录制可信度：{len(reliability)} 条")
+        for line in reliability:
+            print(f"  - {line}")
+        print()
 
     if not args.quiet:
         for step in steps:

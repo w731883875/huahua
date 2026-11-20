@@ -57,6 +57,37 @@ INITIAL_PAINTS_AT_START = 1
 #: （百线菱形 + 彩色辉光）直接认出来，不再需要这里兜。
 LEVEL_CHANGE_CONFIRM_FRAMES = 2
 
+#: 官方规则里**不可能**出现的地形对调：阻挡 ↔ 虚空。
+#:
+#: 扩散 18 条里阻挡只能变**空白**（3001~3009），虚空也只能变空白（3014/3015），
+#: 没有任何一条能让两者互换。所以看到这对状态，一定是这两格里有读错的。
+TERRAIN_CONFLICT_PAIRS = frozenset({("blocked", "void"), ("void", "blocked")})
+
+#: 逐格地形冲突要连续这么多帧读到同一个新值才改判。
+#:
+#: 与等级去抖同源：一格在「阻挡」和「虚空」之间来回跳，是分类器在冰雪纹理边缘
+#: 抖动，不是游戏在变。单帧跳变一律按旧值上报，连续两帧同向才认为真变了。
+TERRAIN_CONFLICT_CONFIRM_FRAMES = 2
+
+#: 一帧里地形对调达到这么多格，判为「画面被整体替换」（入画/结算画面），整帧作废。
+#:
+#: 36 格的 1/3。定这么高是因为**局部误读和入画画面在格数上分不开**：2026-11-20
+#: 那局开局有 4~6 格 blocked↔void 抖动，2026-11-18 末帧入画画面也是 4~6 格。
+#: 数量区分不了，只能靠「伴随颜料崩盘」这条补充判据（见 _frame_looks_replaced）。
+SCENE_SWAP_CONFLICT_TILES = 12
+
+#: 连续这么多帧都被判成"画面被整体替换"时，放弃否决、强制推进基准。
+#:
+#: 真正的入画画面出现在结束那一刻，不需要靠这里；连续 5 帧还在变，说明是识别器
+#: 彻底坏了或者玩家真把半盘地形改了。此时继续否决只会让整局记录停摆 —— 宁可推进
+#: 基准并留下 `unreliable_frame_forced`，也不要静默冻结（2026-11-20 实测：一次
+#: 开局误读让基准冻死，整局 19 次落笔一条都没记下来）。
+SCENE_SWAP_ESCAPE_FRAMES = 5
+
+#: 同一帧里出现「颜料格崩盘」（颜料消失或类别被改）至少这么多格，配合地形对调
+#: 就判为入画画面。转锋类笔触确实会改颜料类别，但**不会同时**让地形对调。
+SCENE_SWAP_PAINT_BREAKAGE = 1
+
 
 @dataclass(frozen=True)
 class RecorderFrameResult:
@@ -282,6 +313,19 @@ class AutomaticRunRecorder:
         self._missing_frames = 0
         #: 上一条被判「整帧读错」的签名，同一张坏画面只报一次，别每帧刷一条。
         self._dropped_signature: str | None = None
+        #: 连续被判「画面被整体替换」的帧数，达到
+        #: :data:`SCENE_SWAP_ESCAPE_FRAMES` 就强制推进基准，见那条注释。
+        self._scene_swap_frames = 0
+        #: 当前这一帧是否被判成不可信（整帧作废）。结算时用它决定 final_board
+        #: 用当前帧还是退回最后一张可信基准。
+        self._frame_unreliable = False
+        #: 逐格地形冲突 ``{(row, col): (observed_state, base_state, frames)}``。
+        #: 「阻挡 ↔ 虚空」这种官方规则里不存在的对调先按旧值压住，连续
+        #: :data:`TERRAIN_CONFLICT_CONFIRM_FRAMES` 帧同向才改判。**基准照常推进**
+        #: （写回旧值），所以一次误读不会把整局锁死。
+        self._terrain_conflict: dict[tuple[int, int], tuple[str, str, int]] = {}
+        #: 已经报过 `terrain_conflict_held` 的 (格子, 观察值)，同一对只报一次。
+        self._terrain_conflict_reported: set[tuple] = set()
         #: 每格等级状态 ``{(row, col): (kind, level, pending_level, pending_count)}``。
         #: 见 :data:`LEVEL_CHANGE_CONFIRM_FRAMES`——**升和降一视同仁**，都要连续
         #: 若干帧读到同一新值才生效。绝不写死「只升不降」：随机颜料 / 同内容颜料
@@ -362,6 +406,12 @@ class AutomaticRunRecorder:
                 self.phase = "playing"
 
             if self.phase in {"opening", "playing"}:
+                # 地形先结算：把「阻挡 ↔ 虚空」这种官方规则里不存在的逐格抖动压在旧值上，
+                # 否则 `_accept_stable_snapshot` 会把它当成"这一帧瞎了"整帧否决，
+                # 而**基准又不推进**，于是一次开局误读就把整局冻住（2026-11-20 实测：
+                # 开局 4 格误读 → 之后 8 次连续丢帧 → 19 次落笔一条都没记下来）。
+                snapshot, terrain_events = self._settle_terrain(snapshot, now)
+                emitted.extend(terrain_events)
                 snapshot, level_events = self._settle_levels(snapshot, now)
                 emitted.extend(level_events)
                 emitted.extend(self._record_control_clicks(snapshot, clicks))
@@ -371,7 +421,14 @@ class AutomaticRunRecorder:
                 self._finish_frames = self._finish_frames + 1 if finish_visible or no_blank else 0
                 if self.phase == "playing" and self._finish_frames >= self._stable_frames:
                     reason = "finish_button" if finish_visible else "no_blank_tiles"
-                    emitted.extend(self._finish_run(snapshot, now, reason=reason))
+                    # 结算盘面退回最后一张**可信**基准：这一帧若是入画画面（整帧作废），
+                    # 拿它当 final_board 就等于把入画读数当成终局成绩（2026-11-18 实测）。
+                    final_snapshot = (
+                        self._last_snapshot
+                        if self._frame_unreliable and self._last_snapshot is not None
+                        else snapshot
+                    )
+                    emitted.extend(self._finish_run(final_snapshot, now, reason=reason))
 
         return RecorderFrameResult(
             elapsed=time.perf_counter() - started,
@@ -460,6 +517,12 @@ class AutomaticRunRecorder:
         self._level_state = {}
         self._level_peak = {}
         self._level_reported = set()
+        #: 地形冲突同理：上一局压住的格子不能带到新一局，否则新局那块地会被
+        #: 上一局的旧读数压住（棋盘已经重排，同一坐标根本不是同一块地）。
+        self._terrain_conflict = {}
+        self._terrain_conflict_reported = set()
+        self._scene_swap_frames = 0
+        self._frame_unreliable = False
         self._subtype_votes = {}
         self._visible_stage2 = ()
         self._clicked_affix = None
@@ -620,6 +683,110 @@ class AutomaticRunRecorder:
         self._finish_frames = 0
         return emitted
 
+    def _settle_terrain(
+        self, snapshot: FastVisionSnapshot, now: float
+    ) -> tuple[FastVisionSnapshot, list[str]]:
+        """压住「阻挡 ↔ 虚空」的逐格抖动，**并且让基准照常推进**。
+
+        为什么需要这一层（2026-11-20 实机取证）：
+
+        - 那局开局把 4 个虚空格读成阻挡 ``(1,3) (2,5) (3,0) (3,4)``；终局盘面
+          ``0 阻挡 / 16 虚空``，证明开局那 4 个 K 是误读。
+        - 之后每一帧都稳定地读到 void，于是相对出错的开局基准帧帧都是
+          ``blocked→void``。旧逻辑见到 ≥2 格这种对调就**整帧丢弃**，而丢帧时
+          ``_last_snapshot`` **不推进** → 基准永远停在开局那一帧 → 26.6s 起连续
+          8 次全丢，整局 19 次落笔、10 次笔触一条都没进日志。
+        - 判据本身没错（官方扩散 18 条里阻挡只能变空白、虚空也只能变空白，两者
+          不能互换），错在"一刀切丢整帧 + 基准不推进"。
+
+        现在的处理：这些格**按旧值上报**（写回 settled 状态），基准照常推进到修正后
+        的快照上；只有当同一格连续 :data:`TERRAIN_CONFLICT_CONFIRM_FRAMES` 帧都读到
+        同一个新值时才改判，并额外记一条 ``terrain_conflict_resolved``。
+
+        整帧级别的否决仍然保留，但门槛抬到 :data:`SCENE_SWAP_CONFLICT_TILES`，
+        并且要求"伴随颜料崩盘"（见 :func:`_frame_looks_replaced`）——因为局部误读
+        和入画画面的格数完全重叠，只能靠这条补充判据分开。
+        """
+        previous = self._last_snapshot
+        if previous is None:
+            return snapshot, []
+        before = {(tile.row, tile.col): tile for tile in previous.tiles}
+        conflicted: list[tuple[FastTile, FastTile]] = []
+        for tile in snapshot.tiles:
+            old = before.get((tile.row, tile.col))
+            if old is None:
+                continue
+            if (str(old.state), str(tile.state)) in TERRAIN_CONFLICT_PAIRS:
+                conflicted.append((tile, old))
+        if not conflicted:
+            # 这一帧没有任何地形对调：冲突计数全部作废（格子已被颜料覆盖/换成别的东西）。
+            self._terrain_conflict.clear()
+            self._terrain_conflict_reported.clear()
+            return snapshot, []
+        if _frame_looks_replaced(previous, snapshot, len(conflicted)):
+            # 整盘重画（入画/结算画面）：不逐格压，交给 `_accept_stable_snapshot` 整帧否决。
+            return snapshot, []
+
+        conflict_cells = {(tile.row, tile.col) for tile, _ in conflicted}
+        tiles: list[FastTile] = []
+        events: list[str] = []
+        for tile in snapshot.tiles:
+            key = (tile.row, tile.col)
+            if key not in conflict_cells:
+                self._terrain_conflict.pop(key, None)
+                tiles.append(tile)
+                continue
+            old = before[key]
+            base = str(old.state)
+            observed = str(tile.state)
+            record = self._terrain_conflict.get(key)
+            if record is not None and record[0] == observed and record[1] == base:
+                frames = record[2] + 1
+            else:
+                frames = 1
+            if frames >= TERRAIN_CONFLICT_CONFIRM_FRAMES:
+                # 连续同向：认了。这一帧原样放行，`_record_transition` 会把它记成地形变化。
+                self._terrain_conflict.pop(key, None)
+                tiles.append(tile)
+                events.append(
+                    self._emit(
+                        "terrain_conflict_resolved",
+                        {
+                            "row": tile.row,
+                            "col": tile.col,
+                            "from": base,
+                            "to": observed,
+                            "frames": frames,
+                            "note": "连续多帧读到同一个新值，判定先前的读数有误，按新值记录。",
+                        },
+                        now,
+                    )
+                )
+                continue
+            self._terrain_conflict[key] = (observed, base, frames)
+            tiles.append(replace(tile, state=old.state))
+            marker = (key, observed)
+            if marker not in self._terrain_conflict_reported:
+                self._terrain_conflict_reported.add(marker)
+                events.append(
+                    self._emit(
+                        "terrain_conflict_held",
+                        {
+                            "row": tile.row,
+                            "col": tile.col,
+                            "held": base,
+                            "observed": observed,
+                            "note": "官方规则里阻挡与虚空不能互换，暂按上一帧的地形记录，等下一帧复核。",
+                        },
+                        now,
+                    )
+                )
+        return replace(
+            snapshot,
+            tiles=tuple(tiles),
+            terrain_counts=_terrain_counts(tuple(tiles)),
+        ), events
+
     def _settle_levels(
         self, snapshot: FastVisionSnapshot, now: float
     ) -> tuple[FastVisionSnapshot, list[str]]:
@@ -713,17 +880,42 @@ class AutomaticRunRecorder:
         stable = self._candidate_snapshot
         self._candidate_frames = 0
         if self._last_snapshot is not None and _semantic_snapshot_key(self._last_snapshot) == key:
+            self._frame_unreliable = False
             return []
         previous = self._last_snapshot
         if previous is not None:
-            illegal = _illegal_terrain_changes(_tile_changes(previous, stable))
-            if len(illegal) >= 2:
-                # 入画/结算画面把「阻挡」和「虚空」画成同一种暗色，一读就是成片的
-                # blocked→void。官方扩散 18 条里阻挡只能变成**空白**，没有一条能变成
-                # 虚空，所以这不是游戏行为，是这一帧瞎了：丢掉它，别让它污染
-                # final_board（2026-11-18 实测：末帧 4 个阻挡格同时变虚空、连带把
-                # r3c1/r3c2 两枚颜料读成「怪物 Lv3」，用户当场指出不成立）。
+            changes = _tile_changes(previous, stable)
+            illegal = _illegal_terrain_changes(changes)
+            # 逐格抖动已经在 `_settle_terrain` 里压掉了，能走到这里的成片对调只可能是
+            # 画面被整体替换（入画/结算画面把阻挡与虚空画成同一种暗色）。门槛按整盘
+            # 比例算，并且要求同时有颜料崩盘——两者都满足才否掉整帧。
+            if _frame_looks_replaced(previous, stable, len(illegal)):
                 self._candidate_frames = 0
+                self._frame_unreliable = True
+                self._scene_swap_frames += 1
+                if self._scene_swap_frames >= SCENE_SWAP_ESCAPE_FRAMES:
+                    # 逃生阀：连着这么多帧判"整盘被替换"，更像识别器彻底失灵或玩家真把
+                    # 半盘地形改了。再否决下去整局记录就停摆了，宁可推进基准并留证据。
+                    forced = self._scene_swap_frames
+                    self._scene_swap_frames = 0
+                    self._frame_unreliable = False
+                    self._last_snapshot = stable
+                    return [
+                        self._emit(
+                            "unreliable_frame_forced",
+                            {
+                                "cells": illegal,
+                                "count": len(illegal),
+                                "frames": forced,
+                                "reason": "scene_swap_escape",
+                                "note": (
+                                    "连续多帧都被判成整盘替换，已放弃否决并推进基准。"
+                                    "这一局可能从中途开始就记错了，请人工复核盘面。"
+                                ),
+                            },
+                            now,
+                        )
+                    ]
                 if stable.board_signature == self._dropped_signature:
                     return []
                 self._dropped_signature = stable.board_signature
@@ -733,12 +925,17 @@ class AutomaticRunRecorder:
                         {
                             "cells": illegal,
                             "count": len(illegal),
-                            "reason": "blocked_to_void",
-                            "note": "官方规则里阻挡地块只能变成空白，不能变成虚空；成片出现说明这一帧读错了。",
+                            "reason": "scene_swap",
+                            "note": (
+                                "官方规则里阻挡地块只能变成空白，不能变成虚空；"
+                                "成片对调且伴随颜料崩盘，说明这一帧读到的是入画/结算画面。"
+                            ),
                         },
                         now,
                     )
                 ]
+        self._scene_swap_frames = 0
+        self._frame_unreliable = False
         self._last_snapshot = stable
         if previous is None:
             return []
@@ -1107,17 +1304,28 @@ class AutomaticRunRecorder:
                 emitted.append(self._emit("force_complete_clicked", {"confidence": 0.99}, clicked_at))
                 continue
             refresh_rect = snapshot.regions.get(RegionKind.REFRESH_AFFIX.value)
-            if refresh_rect is not None and _point_in_rect(x, y, refresh_rect):
+            if (
+                refresh_rect is not None
+                and self._visible_stage2
+                and _point_in_rect(x, y, refresh_rect)
+            ):
                 # ⚠️ 这块矩形不是"检测到的按钮"，而是按棋盘几何估出来的
                 # （vision 里 x0 ~ panel_w*0.42、b.y+b.h*0.80）。宠物低于 5 级时界面
                 # **没有刷新按钮**（用户 2026-11-19 确认，其宠物 2 级），那块位置是别的
-                # 东西，点击会被记成刷新。所以不谎报 0.99，载荷里写明是几何推断。
+                # 东西，点哪都会被记成一次刷新——上一局就这样凭空多出 6 次"刷新词缀"。
+                #
+                # 两道闸：
+                # 1. 阶段二（词缀三选一）必须**当前可见**。刷新按钮只在那个面板里存在，
+                #    面板没开时点到同一片像素，不可能是刷新。
+                # 2. 即便面板开着，宠物没到 5 级仍然没有这个按钮，所以不谎报 0.99，
+                #    载荷里写明是几何推断，复盘时按 `origin` 剔除。
                 emitted.append(
                     self._emit(
                         "affix_refresh_clicked",
                         {
                             "confidence": 0.55,
                             "origin": "geometry_estimate",
+                            "stage2_visible": True,
                             "rect": [refresh_rect.x, refresh_rect.y, refresh_rect.w, refresh_rect.h],
                             "note": "该区域来自几何估算；宠物未达 5 级时此按钮不存在，需人工复核",
                         },
@@ -1244,6 +1452,66 @@ def _tile_changes(previous: FastVisionSnapshot, current: FastVisionSnapshot) -> 
             }
         )
     return changes
+
+
+def _terrain_counts(tiles: tuple[FastTile, ...]) -> dict[str, int]:
+    """按格子重算地形计数。
+
+    ``FastVisionSnapshot.terrain_counts`` 是构造时算好的独立字段，格子的
+    ``state`` 一旦被改（``_settle_terrain`` 会把抖动的格子写回旧值），它就过期了。
+    而 ``process`` 用 ``terrain_counts['blank'] == 0`` 判"没空白了 → 该结算"，
+    拿过期计数会提前/推迟结算，所以这里跟着重算一遍。
+    """
+    counts = {state.value: 0 for state in TileState}
+    for tile in tiles:
+        counts[tile.state] = counts.get(tile.state, 0) + 1
+    return counts
+
+
+def _frame_looks_replaced(
+    previous: FastVisionSnapshot,
+    current: FastVisionSnapshot,
+    illegal_count: int,
+) -> bool:
+    """这一帧是不是「整盘被替换」（入画/结算画面）？
+
+    只看地形对调格数**不够**：2026-11-20 那局开局有 4~6 格 blocked↔void 的逐格
+    抖动，2026-11-18 末帧的入画画面也是 4~6 格，两者在数量上完全重叠。能分开它们
+    的只有第二条证据——入画/结算画面是**整盘重画**，颜料会跟着一起崩（那次的
+    r3c1/r3c2 两枚颜料被读成「怪物 Lv3」，用户当场指出「赛季变怪物不成立」）。
+
+    而逐格抖动只动地形：玩家没落笔时颜料格是稳定的。转锋类笔触确实会改颜料类别，
+    但**不会同时**让地形对调，所以只要同时满足两条，就归入画画面。
+    """
+    if illegal_count < 2:
+        return False
+    if illegal_count >= SCENE_SWAP_CONFLICT_TILES:
+        return True
+    breakage = _paint_breakage(previous, current)
+    return breakage >= SCENE_SWAP_PAINT_BREAKAGE
+
+
+def _paint_breakage(previous: FastVisionSnapshot, current: FastVisionSnapshot) -> int:
+    """同一格「颜料」崩掉的格数：颜料消失，或颜料类别被告知换成了另一种。
+
+    只数**已经读出类别**的格，``unknown`` 不算——那只是没认出来，不是崩了。
+    """
+    before = {(tile.row, tile.col): tile for tile in previous.tiles}
+    count = 0
+    for tile in current.tiles:
+        old = before.get((tile.row, tile.col))
+        if old is None or old.state != TileState.PAINT.value:
+            continue
+        if tile.state != TileState.PAINT.value:
+            count += 1
+            continue
+        old_category = old.paint_category
+        new_category = tile.paint_category
+        if old_category in {None, "", "unknown"} or new_category in {None, "", "unknown"}:
+            continue
+        if old_category != new_category:
+            count += 1
+    return count
 
 
 def _illegal_terrain_changes(changes: list[dict[str, Any]]) -> list[dict[str, Any]]:

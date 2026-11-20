@@ -212,5 +212,84 @@ class ReplayBrushEventWordingTest(unittest.TestCase):
         self.assertIn("5 级", line)
 
 
+class ReplayFrameReliabilityTest(unittest.TestCase):
+    """录制器对每一帧的「信不信」必须在复盘里看得见。
+
+    2026-11-20：上一局日志里 8 条 ``unreliable_frame_dropped``、19 次落笔一条没记下，
+    但复盘页对此只字未提 —— 用户看到的是「这一局我怎么没落笔」。所以把地形冲突、
+    整帧作废、强制采信四类事件单独汇总出来。
+    """
+
+    def _run(self, *events: tuple[str, dict]) -> list[dict]:
+        return [
+            {"ts": 100.0 + index, "event": name, "payload": payload, "sequence": index}
+            for index, (name, payload) in enumerate(events)
+        ]
+
+    def test_held_and_resolved_terrain_conflicts_are_summarized(self) -> None:
+        run = self._run(
+            ("terrain_conflict_held", {"row": 1, "col": 3, "held": "blocked", "observed": "void"}),
+            ("terrain_conflict_held", {"row": 1, "col": 3, "held": "blocked", "observed": "void"}),
+            ("terrain_conflict_resolved", {"row": 1, "col": 3, "from": "blocked", "to": "void"}),
+        )
+        lines = replay.audit_frame_reliability(run)
+        text = "\n".join(lines)
+        self.assertIn("r2c4", text)
+        self.assertIn("×2", text)
+        self.assertIn("改判", text)
+
+    def test_dropped_and_forced_frames_are_counted(self) -> None:
+        run = self._run(
+            ("unreliable_frame_dropped", {"count": 4}),
+            ("unreliable_frame_dropped", {"count": 4}),
+            ("unreliable_frame_forced", {"frames": 5}),
+        )
+        text = "\n".join(replay.audit_frame_reliability(run))
+        self.assertIn("整帧作废：2 帧", text)
+        self.assertIn("强制采信：1 次", text)
+
+    def test_clean_run_reports_nothing(self) -> None:
+        """没有冲突事件时不能凭空造提示，否则等于噪音。"""
+        run = self._run(("board_transition", {"changes": []}))
+        self.assertEqual([], replay.audit_frame_reliability(run))
+
+
+class ReplayInterruptedRunTest(unittest.TestCase):
+    """中断局（没有 ``run_finished``）也必须能出 HTML。
+
+    2026-11-20：录制器冻结那局就是中断局 —— ``payload`` 是空的，``duration`` 是
+    ``None``，``{duration:.1f}`` 直接 TypeError，整个复盘页生不出来。最需要复盘的时候
+    恰恰是这种局，不能崩。
+    """
+
+    def test_interrupted_run_still_renders_html(self) -> None:
+        board = _board("P" + "B" * 35, [_paint(0, 0, 1, "伊吉")])
+        run = [
+            {"ts": 100.0, "event": "run_started", "payload": {"initial_board": board}},
+            {
+                "ts": 101.0,
+                "event": "board_transition",
+                "payload": {
+                    "changes": [
+                        {
+                            "row": 0,
+                            "col": 0,
+                            "from": {"state": "blank", "category": None, "level": None,
+                                     "subtype": None, "treasure": False,
+                                     "bonus_level": 0, "aura_level": 0},
+                            "to": _paint(0, 0, 1, "伊吉"),
+                        }
+                    ],
+                    "before_signature": "a",
+                    "after_signature": "b",
+                    "board": board,
+                },
+            },
+        ]
+        steps = replay.build_steps(run)
+        html = replay.build_html(run, steps, [], Path("runtime/x.jsonl"), None)
+        self.assertIn("0.0s", html)
+
+
 if __name__ == "__main__":
     unittest.main()

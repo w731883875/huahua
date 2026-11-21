@@ -31,13 +31,16 @@ from dataclasses import dataclass, field, replace
 from .game_model import (
     BOARD_SIZE,
     MAX_LEVEL,
+    AffixEffect,
     AffixRule,
     LevelSource,
     Paint,
     PuzzleState,
     Tile,
     TileState,
+    _affix_scope_cells,
     _apply_current_rule_upgrade,
+    is_cover_affix,
     level_sources,
     scope_upgrade_targets,
     tile_level_breakdown,
@@ -106,6 +109,22 @@ class ReconcileReport:
     uncertain: tuple[tuple[int, int], ...] = ()
     #: 这一笔按来源拆开的表（每个来源自带范围与目标类别），界面直接展示
     sources: tuple[LevelSource, ...] = ()
+    #: 推演时做了哪些妥协（例如覆盖类笔触的类型取画面值）。空 = 纯模型推演。
+    caveat: str = ""
+    #: 模型认为这一笔会升等级的格数（下限 / 上限）。上限 > 下限 是因为
+    #: 「范围里随机 N 个」只能确定区间。
+    upgrade_cells: tuple[int, int] = (0, 0)
+    #: 游戏日志里实际播了几条升级动画（``Anim_PutongShengji`` / ``CaiShengji``），
+    #: ``None`` = 没接日志或这一笔还没播完。由调用方填，模型不猜。
+    animation_upgrades: int | None = None
+
+    @property
+    def animation_matches(self) -> bool | None:
+        """动画条数与模型预期是否吻合。``None`` = 没有可比的数据。"""
+        if self.animation_upgrades is None:
+            return None
+        low, high = self.upgrade_cells
+        return low <= self.animation_upgrades <= high
 
     @property
     def consistent(self) -> bool:
@@ -115,16 +134,25 @@ class ReconcileReport:
         """给界面的一行行来源说明：目标类别 / 范围格数 / 级数。"""
         return tuple(source.describe() for source in self.sources)
 
+    def _animation_text(self) -> str:
+        low, high = self.upgrade_cells
+        span = f"{low}" if low == high else f"{low}~{high}"
+        if self.animation_upgrades is None:
+            return f"，模型预计升{span}格"
+        verdict = "吻合" if self.animation_matches else "**对不上**"
+        return f"，模型预计升{span}格 / 动画播了{self.animation_upgrades}条（{verdict}）"
+
     def summary(self) -> str:
         if not self.ran:
             return self.note or "本帧没有新的落笔，无对账"
         head = f"已推演 {len(self.levels)} 格"
         extra = f"，{len(self.uncertain)} 格随机加成未定" if self.uncertain else ""
+        caveat = f"（{self.caveat}）" if self.caveat else ""
         if not self.mismatches:
-            return f"{head}，模型与画面一致{extra}"
+            return f"{head}，模型与画面一致{extra}{self._animation_text()}{caveat}"
         detail = "；".join(item.describe() for item in self.mismatches[:4])
         more = "" if len(self.mismatches) <= 4 else f" 等{len(self.mismatches)}处"
-        return f"{head}，{len(self.mismatches)} 格对不上（{detail}{more}）{extra}"
+        return f"{head}，{len(self.mismatches)} 格对不上（{detail}{more}）{extra}{self._animation_text()}{caveat}"
 
 
 def _paint_cells(tiles) -> set[tuple[int, int]]:
@@ -170,6 +198,56 @@ def _bump(state: PuzzleState, index: int, amount: int, as_bonus: bool) -> Puzzle
     tiles = list(state.tiles)
     tiles[index] = _tile_with_upgrade(tiles[index], amount, as_bonus=as_bonus)
     return replace(state, tiles=tuple(tiles))
+
+
+def _cover_intermediate(
+    placed: PuzzleState,
+    current: PuzzleState,
+    previous: PuzzleState,
+    rule,
+    affix: AffixRule,
+) -> PuzzleState:
+    """重建「刚被覆盖完、调色还没结算」的中间态。
+
+    覆盖类笔触把范围内颜料的**类型**交给服务端摇，模型无法预测；但**等级基准**能推：
+
+    * 2009~2011「转变为同等级的随机颜料」→ 等级 = 上一帧这一格的等级，地块加成清零；
+    * 2012「等级和内容替换为自身」→ 等级 = 自身等级，地块加成与光环保持不动。
+
+    类型一律取**这一帧画面上**的实测值——它已经是覆盖后的结果。这样对账只会因为
+    「等级基准算错」报红，而不是因为随不到同一个类型就每笔都红，随机性不再是
+    万能挡箭牌（用户 2026-11-22：要能"方便找到问题修改"）。
+    """
+    tiles = list(placed.tiles)
+    scope = set(_affix_scope_cells(placed, affix))
+    self_level = _level(rule.paint)
+    copy_self = getattr(affix, "effect", None) is AffixEffect.COPY_SELF_TO_SCOPE
+    for row, col in scope:
+        index = row * BOARD_SIZE + col
+        if not 0 <= index < len(tiles):
+            continue
+        observed = current.tile(row, col).paint
+        if observed is None:
+            continue
+        if copy_self:
+            base = self_level
+            keep = tiles[index]
+            bonus = tile_bonus_level(keep)
+            aura_amount = max(0, int(keep.aura_amount))
+        else:
+            base = _level(previous.tile(row, col).paint)
+            bonus = 0
+            aura_amount = 0
+        if base <= 0:
+            continue
+        tiles[index] = Tile(
+            state=TileState.PAINT,
+            paint=replace(observed, level=min(MAX_LEVEL, base)),
+            bonus_level=bonus,
+            aura_amount=aura_amount,
+            aura_level=tile_aura_level(tiles[index]) if copy_self else 0,
+        )
+    return replace(placed, tiles=tuple(tiles))
 
 
 def reconcile(
@@ -235,12 +313,22 @@ def reconcile(
         placed = replace(placed, current_anchor=installed[0])
 
     # ---- 第 2 步：调色效果（按目标类别） ---------------------------------
-    expected, _count = _apply_current_rule_upgrade(placed, rule)
+    affix = active_affix if active_affix is not None else previous.active_affix
+    # 覆盖类笔触（官方 2009~2012）会先把范围内颜料的**类型**改掉，再让调色按新类型
+    # 判定。类型是服务端摇的，模型推不出来，但**画面已经告诉我们了**——所以这里用
+    # 画面类型重建一个「刚被覆盖完」的中间态，只把等级基准交给模型。
+    # 不做这一步，「3 玩法 + 1 怪物」这种结果会被逐格报红，而红的其实是随机性。
+    if is_cover_affix(affix):
+        expected = _cover_intermediate(placed, current, previous, rule, affix)
+        cover_note = "本笔为覆盖类笔触，类型以画面为准、等级基准按文案推"
+    else:
+        expected = placed
+        cover_note = ""
+    expected, _count = _apply_current_rule_upgrade(expected, rule)
 
     # ---- 第 3 步：笔触效果（作用范围随机 N 个） ---------------------------
     # 「随机 N 个」在候选多于 N 时只能确定区间：下限 = 一个都没抽中，
     # 上限 = 抽中了这一格。画面落在区间内就不该报警，否则每笔都在红。
-    affix = active_affix if active_affix is not None else previous.active_affix
     # 范围里一个颜料都没有时**不会**兜底提升这一笔——初始颜料更不会（用户 2026-11-15）。
     # 落点若在范围里，它落笔后本来就成了范围内的候选，不需要额外照顾。
     sure, maybe, amount = scope_upgrade_targets(expected, affix)
@@ -260,6 +348,11 @@ def reconcile(
     uncertain: list[tuple[int, int]] = []
     #: 吃满上限（=可能被随机抽中）的格子：(row, col, low, high, observed, kind)
     saturated: list[tuple[int, int, int, int, int, str]] = []
+    #: 模型认为这一笔会**升等级**的格数（下限 / 上限）。
+    #: 游戏每升一格播一条 ``Anim_PutongShengji``，所以这两个数可以直接和
+    #: 日志里的动画条数对：对不上就说明模型漏了一条来源，或识别读错了格子。
+    upgrade_cells_min = 0
+    upgrade_cells_max = 0
 
     for row, col in sorted(existing | set(installed)):
         current_paint = current.tile(row, col).paint
@@ -276,6 +369,13 @@ def reconcile(
             if kind == "new"
             else _level(previous.tile(row, col).paint)
         )
+        before_final = (
+            base_before if kind == "new" else tile_final_level(previous.tile(row, col))
+        )
+        if low > before_final:
+            upgrade_cells_min += 1
+        if high > before_final:
+            upgrade_cells_max += 1
         _base, parts = tile_level_breakdown(
             expected, row, col, sources, base_level=base_before
         )
@@ -329,7 +429,12 @@ def reconcile(
             )
 
     if not levels:
-        return ReconcileReport(note="本帧没有可比对的颜料格", installed=installed, sources=sources)
+        return ReconcileReport(
+            note="本帧没有可比对的颜料格",
+            installed=installed,
+            sources=sources,
+            caveat=cover_note,
+        )
     return ReconcileReport(
         ran=True,
         installed=installed,
@@ -337,4 +442,6 @@ def reconcile(
         levels=tuple(sorted(levels)),
         uncertain=tuple(uncertain),
         sources=sources,
+        caveat=cover_note,
+        upgrade_cells=(upgrade_cells_min, upgrade_cells_max),
     )

@@ -17,8 +17,10 @@
 所以本表只记录 (方向, 类型, 提升级数) 三元组 + 两条官方原文。
 
 可靠性说明：Lua 常量池会去重，``TaskNum``（调色进度要求）等数值无法逐条
-归回记录，因此这里**不猜测 TaskNum**；进度要求仍由
-``game_model.empirical_defaults_for_level`` 按颜料等级给经验值。
+归回记录，因此这里**不猜测 TaskNum**。不过 TaskNum 本来就不用猜 ——
+它就是界面上的 ``0/3`` / ``0/4``（用户 2026-11-22 确认），由
+``read_current_paint`` 直接读进 ``CurrentPaintObservation.match_required``；
+``game_model.empirical_defaults_for_level`` 只是读不到时的兜底。
 """
 
 from __future__ import annotations

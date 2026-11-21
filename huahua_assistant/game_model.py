@@ -1068,17 +1068,21 @@ def place_current_rule_anchor(
         current_rule=replace(rule, match_current=min(match_count, rule.match_required)),
         backpack=sort_backpack_for_rule(placed_state.backpack, rule),
     )
-    upgraded_state, upgraded_count = _apply_current_rule_upgrade(placed_state, placed_state.current_rule)
-    affix_state, affix_message = _resolve_anchor_affix(upgraded_state, state.active_affix, rng)
-    # 这一格如果带着「同种颜料光环」，现在上面换了新颜料，光环就改挂到新颜料上。
-    affix_state = _recompute_auras(affix_state)
+    # 结算顺序由 settle_place_effects 统一：覆盖类笔触先改写范围内容，
+    # 调色再按改写后的类型给等级（用户 2026-11-22 实机口径）。
+    settled_state, upgraded_count, scope_count, settle_note = settle_place_effects(
+        placed_state, placed_state.current_rule, rng or random.Random()
+    )
+    affix_state = _recompute_auras(settled_state)
     message = (
         f"已放置新的初始颜料：{_paint_label(rule.paint)}，"
         f"安装即触发，范围内{upgraded_count}个目标颜料提升{rule.upgrade_amount}级，"
         "请选择背包颜料完成匹配"
     )
-    if affix_message:
-        message = f"{message}；{affix_message}"
+    if scope_count:
+        message = f"{message}；笔触影响范围内{scope_count}个目标"
+    if settle_note:
+        message = f"{message}；{settle_note}"
     return AnchorPlaceResult(
         state=affix_state,
         success=True,
@@ -1484,9 +1488,8 @@ def install_backpack_paint(
     # 词缀已经兑现到落下去的那枚颜料上了，下笔不再重复加。
     placed_state = replace(state, tiles=tuple(tiles), backpack=backpack, self_upgrade_pending=0)
     match_count = _current_match_count(placed_state, rule)
-    upgraded_state, upgraded_count = _apply_current_rule_upgrade(placed_state, rule)
-    upgraded_state, scope_affix_count = _apply_deferred_scope_affix(
-        upgraded_state, rng or random.Random(), placed=(row, col)
+    upgraded_state, upgraded_count, scope_affix_count, settle_note = settle_place_effects(
+        placed_state, rule, rng or random.Random(), placed=(row, col)
     )
     upgraded_state, persistent_affix_count = _apply_persistent_affix_after_install(upgraded_state)
     upgraded_state = _recompute_auras(upgraded_state)
@@ -1495,7 +1498,9 @@ def install_backpack_paint(
     progress = f"{min(match_count, rule.match_required)}/{rule.match_required}"
     message = f"已安装{_paint_label(paint)}，安装即触发，范围内{upgraded_count}个目标颜料提升{rule.upgrade_amount}级，当前进度{progress}"
     if scope_affix_count:
-        message = f"{message}；笔触额外提升{scope_affix_count}个颜料"
+        message = f"{message}；笔触影响范围内{scope_affix_count}个颜料"
+    if settle_note:
+        message = f"{message}；{settle_note}"
     if persistent_affix_count:
         message = f"{message}；持续词缀额外提升{persistent_affix_count}个颜料"
     if completed:
@@ -1535,9 +1540,8 @@ def _simulate_install_without_next_rule(
     backpack = sort_backpack_for_rule(_remove_one_paint(state.backpack, source_paint), rule)
     placed_state = replace(state, tiles=tuple(tiles), backpack=backpack, self_upgrade_pending=0)
     match_count = _current_match_count(placed_state, rule)
-    upgraded_state, _upgraded_count = _apply_current_rule_upgrade(placed_state, rule)
-    upgraded_state, _scope_affix_count = _apply_deferred_scope_affix(
-        upgraded_state, random.Random(0), placed=(row, col)
+    upgraded_state, _upgraded_count, _scope_affix_count, _note = settle_place_effects(
+        placed_state, rule, random.Random(0), placed=(row, col)
     )
     upgraded_state, _persistent_affix_count = _apply_persistent_affix_after_install(upgraded_state)
     upgraded_state = _recompute_auras(upgraded_state)
@@ -1945,6 +1949,89 @@ SCOPE_BUFF_EFFECTS = frozenset(
     }
 )
 
+#: 「覆盖」类作用范围效果 —— 改写范围内**颜料本身**（类型 / 等级），不是加等级。
+#:
+#: 官方文案（`S8_Selectable_Effect` 2009~2012）：
+#:
+#: * 2009 将作用范围内的颜料转变为**同等级**的随机颜料
+#: * 2010 / 2011 同上，但限定为随机怪物 / 随机玩法颜料
+#: * 2012 将作用范围内所有颜料的**等级和内容替换为自身**
+#:
+#: 这一类必须**先于调色效果结算**，理由见 :func:`settle_place_effects`。
+COVER_EFFECTS = frozenset(
+    {
+        AffixEffect.RANDOMIZE_SCOPE_ANY,
+        AffixEffect.RANDOMIZE_SCOPE_CATEGORY,
+        AffixEffect.COPY_SELF_TO_SCOPE,
+    }
+)
+
+#: 选完就消耗掉的一次性放置词条（3010~3013）：落一笔之后 ``active_affix`` 清空。
+CONSUMABLE_PLACE_EFFECTS = frozenset(
+    {
+        AffixEffect.ALLOW_PLACE_ON_BLOCKED,
+        AffixEffect.ALLOW_PLACE_ON_VOID_LOSE_SELF,
+        AffixEffect.ALLOW_PLACE_ON_PAINT_LOSE_SELF,
+        AffixEffect.ALLOW_PLACE_ON_FADED,
+    }
+)
+
+
+def is_cover_affix(affix: AffixRule | None) -> bool:
+    """这条笔触是不是「覆盖」类（改写范围内颜料类型/等级）。
+
+    界面与对账都靠它区分「这一笔会换掉场上颜料」和「这一笔只是加等级」——
+    前者会让对账里的「同类型才吃调色」失效，不能按老值直接推。
+    """
+    return affix is not None and affix.effect in COVER_EFFECTS
+
+
+def settle_place_effects(
+    state: PuzzleState,
+    rule: CurrentPaintRule,
+    rng: random.Random,
+    *,
+    placed: tuple[int, int] | None = None,
+) -> tuple[PuzzleState, int, int, str]:
+    """一次落笔的结算：**覆盖 → 调色 → 其余范围 buff**。
+
+    返回 ``(新状态, 调色提升的格数, 笔触额外影响的格数, 说明文字)``。
+
+    为什么覆盖必须排在调色前面（用户 2026-11-22 实机口径）：
+
+        3 级初始颜料；笔触 =「将作用范围内的颜料转变为同等级的随机颜料」；
+        调色效果 =「使玩法颜料提升 1 级」；范围内玩家自己装了 4 枚颜料。
+
+        实际结果：4 枚先被随机成 **3 个玩法 + 1 个怪物（仍是 3 级）**，
+        随后调色按**新类型**只给那 3 个玩法 +1
+        → **3 个 4 级玩法 + 1 个 3 级怪物**。
+
+    反过来（先调色再覆盖）会得到 4 个 4 级、且覆盖把这次升级冲掉，
+    与画面永远对不上。也就是说覆盖类笔触结算后，调色要**重新判定一次**——
+    覆盖清掉了 ``buff_applied_id``，所以这一刻天然满足「重新吃一次调色」。
+
+    非覆盖类（纯加等级 / 清地块）笔触不受顺序影响，仍按「调色 → 笔触」结算：
+    调色先把等级顶高，笔触再用当时的等级判断 7 级封顶，与实机一致。
+    """
+    affix = state.active_affix
+    covered = 0
+    if affix is not None and affix.effect in COVER_EFFECTS:
+        state, covered = _settle_scope_buff(state, rng, placed=placed)
+        affix = state.active_affix
+
+    state, upgraded = _apply_current_rule_upgrade(state, rule)
+
+    extra = 0
+    notes: list[str] = []
+    if covered:
+        notes.append(f"笔触改写范围内{covered}枚颜料")
+    if affix is not None and affix.effect in SCOPE_BUFF_EFFECTS and affix.effect not in COVER_EFFECTS:
+        state, extra = _settle_scope_buff(state, rng, placed=placed)
+    elif affix is not None and affix.effect in CONSUMABLE_PLACE_EFFECTS:
+        state = replace(state, active_affix=None)
+        notes.append("特殊放置词条已消耗")
+    return state, upgraded, covered + extra, "；".join(notes)
+
 
 def _settle_scope_buff(
     state: PuzzleState,
@@ -1988,10 +2075,14 @@ def _apply_deferred_scope_affix(
     *,
     placed: tuple[int, int] | None = None,
 ) -> tuple[PuzzleState, int]:
-    """落笔后结算作用范围 buff。
+    """落笔后结算作用范围 buff（**单步**，不含调色）。
 
     通用规则：**结算但不清空** ``active_affix``——这几条整局有效，
     每次落笔都要重算。旧实现会在这里清掉词缀，导致只生效一次。
+
+    注意：真正的主流程走 :func:`settle_place_effects`——它负责「覆盖先、调色后」
+    的顺序。本函数只保留给单步测试用，**不要再在落笔路径里直接调用**，
+    否则覆盖类笔触会排到调色后面，等级算出来比实机高 1 级。
     """
     return _settle_scope_buff(state, rng, placed=placed)
 
@@ -4758,6 +4849,11 @@ def _resolve_anchor_affix(
     affix: AffixRule | None,
     rng: random.Random | None = None,
 ) -> tuple[PuzzleState, str]:
+    """落笔时结算一条词缀（**单步**，不含调色）。
+
+    主流程已改走 :func:`settle_place_effects`（覆盖先、调色后），本函数只保留
+    给单步测试用。直接在落笔路径调用会让覆盖类笔触排到调色后面，等级偏高。
+    """
     if affix is None:
         return state, ""
     rng = rng or random.Random()
@@ -5181,8 +5277,10 @@ def _copy_self_to_scope(state: PuzzleState) -> tuple[PuzzleState, int]:
       地块上的 ``bonus_level`` / ``aura_amount`` 原样保留，
       由 :func:`tile_final_level` 相加得出 ``自身 + x``，
       所以"5 级宝箱 + 提升 1 级"落上去就是 6 级，再有别的升级 buff 就是 6+x；
-    * 整局有效：调用方（:func:`_resolve_anchor_affix` /
-      :func:`_apply_persistent_affix_after_install`）不清 ``active_affix``。
+    * 整局有效：调用方（:func:`settle_place_effects` /
+      :func:`_apply_persistent_affix_after_install`）不清 ``active_affix``；
+    * **先于调色结算**：覆盖后 ``buff_applied_id`` 被清空，这一格会重新吃一次
+      调色效果——这正是实机「3 个玩法变 4 级、1 个怪物还是 3 级」的来源。
     """
     rule = state.current_rule
     if rule is None:
@@ -5259,10 +5357,19 @@ def _is_same_paint_kind(paint: Paint, reference: Paint) -> bool:
 
 
 def _randomize_scope_paints(state: PuzzleState, affix: AffixRule, rng: random.Random) -> tuple[PuzzleState, int]:
-    """范围内颜料变成随机颜料。
+    """范围内颜料变成随机颜料（官方 2009~2011，用户口径里的「覆盖」）。
 
-    实机设定：**随机化会覆盖这一格之前累积的 buff**——地块加成清零，光环锚点也失效。
-    所以这里不能像清空/炸毁那样把 ``bonus_level`` 留下来。
+    实机设定：
+
+    * **类型随机、等级不变**——新颜料沿用被替换那枚的**基础等级**
+      （``paint.level``，不含地块加成）；
+    * **随机化会覆盖这一格之前累积的 buff**——地块加成清零，光环锚点也失效。
+      所以这里不能像清空/炸毁那样把 ``bonus_level`` 留下来；
+    * 必须**先于调色效果**结算（见 :func:`settle_place_effects`）：清零
+      ``buff_applied_id`` 之后，这一格会按**新类型**重新吃一次调色。
+
+    待验证：若被替换的格子原本带地块加成（例如 3 级 + 1 = 显示 4），换出来的是
+    3 级还是 4 级，尚无实机样本。当前按「基础等级」实现（=3 级）。
     """
     tiles = list(state.tiles)
     count = 0

@@ -76,6 +76,10 @@ LOG_BURST_WINDOW = 0.9
 #: 日志监听自己的节拍。它和自动跟随是两条线：自动跟随没开也要看得见「日志接上了、刚刚落了子」，
 #: 否则用户放完颜料只能看到一片安静，分不清是没接上还是本来就不动。
 GAME_LOG_TICK_MS = 250
+#: 落笔后等「升级动画」播完的窗口。实机一条 ``Anim_PutongShengji`` 一格，
+#: 一次落笔 1~4 条是**排队**播的（实测 0 / 1.8s / 2.9s），所以窗口要留够，
+#: 否则最后几条还没播就被当成「模型多算了」。
+LEVEL_ANIMATION_WINDOW = 6.0
 #: 采集线程多久不出帧就当它卡住了，重开一个。正常节拍最慢 1.5s 一帧，
 #: 但**拖窗口后的首次重新标定**要在缩略图上全搜索 + 36 格重分类，
 #: 1765x965 实测 7.6s；阈值留在 6s 会把它误判成卡死并重开 pump，
@@ -415,6 +419,10 @@ class HuahuaApp(tk.Tk):
         self.auto_follow_last_event_at = 0.0
         self.auto_follow_burst_until = 0.0
         self.last_game_log_events: list[GameLogEvent] = []
+        #: 落笔后播出的升级动画（``Anim_PutongShengji`` / ``CaiShengji``）条数，
+        #: 用来和「模型预计升几格」对账。窗口由 :data:`LEVEL_ANIMATION_WINDOW` 定。
+        self.level_animation_window: dict | None = None
+        self.level_animation_seq = 0
         self.auto_follow_pump: FramePump | None = None
         self.auto_follow_last_sequence = 0
         self.last_high_value_key: str | None = None
@@ -1601,6 +1609,7 @@ class HuahuaApp(tk.Tk):
                     },
                     source="game_log",
                 )
+            self._note_level_animation_events(events)
             # 「入画」= 一张新画纸开始了。实测两局各只有一次，且都紧跟在开局：
             #   15.37.17 Into → 15.37.18 TearUp → 15.37.19 Select → 15.37.20 Unfold
             # 用它开新局，比等「结算成功」可靠——重绘根本不经结算。
@@ -1959,6 +1968,7 @@ class HuahuaApp(tk.Tk):
             self.level_reconcile = ReconcileReport(note="对账异常，已跳过")
             return
         self.level_reconcile = report
+        self._open_level_animation_window(report)
         if report.ran and (report.mismatches or report.uncertain):
             record_observation(
                 "level_reconcile",
@@ -2001,10 +2011,81 @@ class HuahuaApp(tk.Tk):
                     "uncertain": [
                         {"r": row + 1, "c": col + 1} for row, col in report.uncertain
                     ],
+                    # 这一笔模型预计升几格（区间）。落盘是为了和随后的
+                    # ``level_animation_check`` 里「动画播了几条」直接对。
+                    "upgrade_cells": list(report.upgrade_cells),
+                    "caveat": report.caveat,
                     "summary": report.summary(),
                 },
                 source="real_capture",
             )
+
+    # ---- 「模型预计升几格」对「游戏播了几条升级动画」 ---------------------
+    #
+    # 实测：一条 ``Anim_PutongShengji`` = 一格升 1 级，``CaiShengji`` = 升到 7 级；
+    # 一次落笔 1~4 条是**排队**播的（0 / 1.8s / 2.9s），所以不能在落笔当帧就判，
+    # 要开一个窗口等它播完。窗口内的条数与 :attr:`ReconcileReport.upgrade_cells`
+    # 对不上，就说明模型漏了一条等级来源（或这一格被读错），比逐格看红框更快定位。
+
+    def _open_level_animation_window(self, report: ReconcileReport) -> None:
+        if not report.ran:
+            return
+        low, high = report.upgrade_cells
+        if high <= 0:
+            return
+        self.level_animation_seq += 1
+        seq = self.level_animation_seq
+        self.level_animation_window = {
+            "seq": seq,
+            "low": low,
+            "high": high,
+            "count": 0,
+            "installed": [list(cell) for cell in report.installed],
+        }
+        self.after(int(LEVEL_ANIMATION_WINDOW * 1000), lambda: self._flush_level_animation(seq))
+
+    def _note_level_animation_events(self, events: list[GameLogEvent]) -> None:
+        window = self.level_animation_window
+        if window is None:
+            return
+        added = sum(1 for event in events if event.kind in ("upgrade", "rainbow_upgrade"))
+        if not added:
+            return
+        window["count"] += added
+        current = self.level_reconcile
+        if current.ran:
+            self.level_reconcile = replace(current, animation_upgrades=window["count"])
+
+    def _flush_level_animation(self, seq: int) -> None:
+        window = self.level_animation_window
+        if window is None or window.get("seq") != seq:
+            return
+        self.level_animation_window = None
+        low, high, count = window["low"], window["high"], window["count"]
+        matched = low <= count <= high
+        current = self.level_reconcile
+        if current.ran:
+            self.level_reconcile = replace(current, animation_upgrades=count)
+        record_observation(
+            "level_animation_check",
+            {
+                "session": self.real_session_id,
+                "step": self.real_session_step_index,
+                "installed": window["installed"],
+                "expected_min": low,
+                "expected_max": high,
+                "animations": count,
+                "match": matched,
+            },
+            source="real_capture",
+        )
+        if matched:
+            return
+        self._set_notice(
+            f"升级动画播了 {count} 条，模型预计 {low}~{high} 格 —— 对不上。"
+            "要么漏了一条等级来源，要么有一格被读错；看右下「模型对账」的逐格差异。",
+            "warning",
+        )
 
     def _render_result(
         self,
@@ -5453,6 +5534,20 @@ class HuahuaApp(tk.Tk):
             self.region_text.insert(tk.END, "来源（分开算，各自带范围与目标）\n")
             for line in source_lines:
                 self.region_text.insert(tk.END, f"  {line}\n")
+        if report.caveat:
+            # 推演时做过妥协要写出来，否则「模型和画面一致」会被误当成完全确定。
+            self.region_text.insert(tk.END, f"推演口径：{report.caveat}\n")
+        low, high = report.upgrade_cells
+        if high > 0:
+            span = f"{low}" if low == high else f"{low}~{high}"
+            if report.animation_upgrades is None:
+                self.region_text.insert(tk.END, f"这一笔预计升{span}格（等升级动画播完再核）\n")
+            else:
+                verdict = "吻合" if report.animation_matches else "对不上"
+                self.region_text.insert(
+                    tk.END,
+                    f"这一笔预计升{span}格 / 动画播了{report.animation_upgrades}条（{verdict}）\n",
+                )
         if not report.mismatches:
             self.region_text.insert(
                 tk.END, f"已推演 {len(report.levels)} 格，模型与画面一致\n\n"

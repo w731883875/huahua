@@ -12,13 +12,20 @@
 
     <安装目录>\\UE_game\\TorchLight\\Saved\\Logs\\UE_game.log
 
-日志行形如：
+两种行都要认（音频与动画并存，互为兜底）：
 
     [2026.11.04-14.26.47:122][449]TLLua: Display: [Game] AudioMgr@PlayAudio  AudioEnum  == S8_HZXY_DrawPaper_Pigment_Puzzle
+    [2026.11.21-14.06.52:529][177]TLLua: Display: [Game] 1244_S8SnowField Anim_PutongShengji Start
 
 方括号里是 UTC 时间，末尾是事件名。同一次播放会再打一行 ``LogDataTable`` 的
 ``requested row 'Play_UI_S8_...'`` 警告，那是查表失败的回声，必须跳过，否则
 每个事件都会数成两次。
+
+**为什么不只认音频**：音效名会因资源缺失打出 ``DataTable FindRow Warning``，
+一旦音频表被改动就再也听不到事件，而 ``Anim_*`` 是 UI 控件自己的动画回调，
+只要动画播了就一定有。实测同一段时间里动画行（202 条）比音频行更密，而且
+``Anim_PutongShengji`` **一条对一个地块**——一次落笔升级 3 个格子就打出 3 条，
+这是音频给不了的信息（音效一次落笔只响一声）。两者都收，谁先到谁触发截图。
 """
 
 from __future__ import annotations
@@ -51,14 +58,38 @@ EVENT_KINDS = {
     "S8_HZXY_DrawPaper_Unfold": "unfold",
 }
 
+#: UI 控件动画 → 语义。这批名字是 2026-11-21 从本机 ``UE_game.log`` 实测统计出来的，
+#: 只出现在 ``S8SnowField``（棋盘本体）与 ``S8Paint``（颜料数字）上。
+#:
+#: * ``Huizhi``（绘制）：**整盘重绘**。实测 36 个地块对象在两毫秒内各播一条，
+#:   只出现在进入/重绘画纸时，不是单次落笔——别拿它当"落子"用。
+#: * ``Fangzhi``（放置）：把一枚颜料放上棋盘，之后紧跟该颜料的调色效果升级。
+#: * ``PutongShengji``（普通升级）：**一个地块一条**，同一次放置升级几张就几条，
+#:   而且是**排队播放**（实测同一批间隔 0 / 1.8s / 2.9s），所以别靠同时性判批。
+#: * ``CaiShengji``（彩升级）：Lv6→Lv7 那一下。
+#: * ``Shuzi``（数字）：结算数字滚动。
+ANIM_KINDS = {
+    "Huizhi": "draw",
+    "Fangzhi": "place",
+    "PutongShengji": "upgrade",
+    "CaiShengji": "rainbow_upgrade",
+    "Shuzi": "score",
+}
+
+#: 只认这几个控件上的动画。``Anim_Show`` 之类弹窗动画不认——任务成功
+#: （``S8TaskSucc``）、选能力（``S8ChooseAblityMini``）都会 Show，认了就全是噪声。
+ANIM_WIDGETS = frozenset({"S8SnowField", "S8Paint"})
+
 #: 值得为此截一帧的事件。``brush`` 只是打开笔锋面板，画面同样变了，所以也算；
 #: ``score`` 是结算数字滚动——一局结束时正是最该读一帧的时候。
-CAPTURE_KINDS = frozenset(EVENT_KINDS.values()) | {"score"}
+CAPTURE_KINDS = frozenset(EVENT_KINDS.values()) | frozenset(ANIM_KINDS.values())
 
 _LINE_RE = re.compile(r"^\[(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})\]")
 _AUDIO_RE = re.compile(r"AudioEnum\s*==\s*(\S+)")
+# 例：``[Game] 1244_S8SnowField Anim_PutongShengji Start`` / ``... Anim_PutongShengjiEnd``
+# 结尾的 ``End`` 是结束回调，不带 ``Start``；只认 ``Start``。
+_ANIM_RE = re.compile(r"\[Game\]\s+(\d+)_(\w+)\s+Anim_(\w+?)(End)?\s*(Start)?\s*$")
 _SCALE_RE = re.compile(r"PageViewSetUIScale.*?PageScale\s*=\s*([0-9.]+)")
-_SHIZI_RE = re.compile(r"(\d+_S8Paint)\s+Anim_Shuzi\s*Start")
 
 
 @dataclass(frozen=True)
@@ -71,6 +102,12 @@ class GameLogEvent:
     """本机 monotonic 时刻，用来算「距离上次事件多久」。"""
     game_time: datetime | None
     """日志里写的游戏时间（已转本地时区），仅用于展示/排查。"""
+    source: str = "audio"
+    """来源：``audio``（音效播放）还是 ``anim``（UI 控件动画）。"""
+    widget: str = ""
+    """动画所在控件，如 ``S8SnowField``。音频事件为空串。"""
+    object_id: int = 0
+    """控件对象序号。同一次落笔升级 N 个地块就是 N 条同 ``kind``、不同 ``object_id`` 的事件。"""
 
     @property
     def captures(self) -> bool:
@@ -157,35 +194,57 @@ def _read_cache() -> Path | None:
 
 
 def parse_line(line: str) -> GameLogEvent | None:
-    """把一行日志变成事件；不是画中雪原的事件就返回 None。"""
+    """把一行日志变成事件；不是画中雪原的事件就返回 None。
+
+    先按音效解析（老路径，行为不变），再按 UI 动画解析（新增，音效表坏了也能收到）。
+    两种行不会重叠——一条日志行只会命中其中一种。
+    """
 
     if "requested row" in line:
         # 音频查表失败的回声，和真正的播放事件成对出现，不能重复计数。
         return None
 
-    name = None
     match = _AUDIO_RE.search(line)
     if match is not None:
         name = match.group(1)
-    else:
-        match = _SHIZI_RE.search(line)
-        if match is not None:
-            return GameLogEvent(
-                name=match.group(1),
-                kind="score",
-                at=time.monotonic(),
-                game_time=_game_time(line),
-            )
-    if name is None:
+        if not name.startswith("S8_"):
+            return None
+        return GameLogEvent(
+            name=name,
+            kind=EVENT_KINDS.get(name, "other"),
+            at=time.monotonic(),
+            game_time=_game_time(line),
+        )
+
+    return _parse_anim(line)
+
+
+def _parse_anim(line: str) -> GameLogEvent | None:
+    """``[Game] 1244_S8SnowField Anim_PutongShengji Start`` 这类动画行。"""
+
+    match = _ANIM_RE.search(line)
+    if match is None:
         return None
-    if not name.startswith("S8_"):
+    if match.group(4):
+        # ``Anim_XXXEnd``：动画走完的回调。画面在这之前就已经变了，不重复触发。
+        return None
+
+    object_id, widget, anim = match.group(1), match.group(2), match.group(3)
+    if widget not in ANIM_WIDGETS:
+        # 弹窗类 Anim_Show 一律不认：任务成功、选能力都会 Show，认了就是噪声。
+        return None
+    kind = ANIM_KINDS.get(anim)
+    if kind is None:
         return None
 
     return GameLogEvent(
-        name=name,
-        kind=EVENT_KINDS.get(name, "other"),
+        name=f"{widget}.Anim_{anim}",
+        kind=kind,
         at=time.monotonic(),
         game_time=_game_time(line),
+        source="anim",
+        widget=widget,
+        object_id=int(object_id),
     )
 
 

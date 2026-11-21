@@ -47,6 +47,18 @@ SCALE = (
     "PageId = 2019_ConfirmV2Ctrl, PageScale = 0.80896353602409 0.809 0.80896353602409"
 )
 
+# --- 以下都是本机 UE_game.log 里原样摘的动画行（2026-11-21 那局）------------------
+HUIZHI = "[2026.11.21-14.07.05:494][898]TLLua: Display: [Game] 1296_S8SnowField Anim_Huizhi Start"
+HUIZHI_END = "[2026.11.21-14.07.06:340][948]TLLua: Display: [Game] 1296_S8SnowField Anim_HuizhiEnd"
+FANGZHI = "[2026.11.21-14.07.05:494][898]TLLua: Display: [Game] 1296_S8SnowField Anim_Fangzhi Start"
+SHENGJI = (
+    "[2026.11.21-14.06.52:529][177]TLLua: Display: [Game] 1244_S8SnowField Anim_PutongShengji Start"
+)
+CAI_SHENGJI = (
+    "[2026.11.21-14.50.30:730][ 73]TLLua: Display: [Game] 1302_S8SnowField Anim_CaiShengji Start"
+)
+TASK_SHOW = "[2026.11.21-14.06.56:129][389]TLLua: Display: [Game] 1345_S8TaskSucc Anim_Show Start"
+
 
 def _wait_for(predicate, timeout: float = 2.0) -> bool:  # noqa: ANN001
     deadline = time.monotonic() + timeout
@@ -108,6 +120,64 @@ class ParseLineTests(unittest.TestCase):
 
         assert event is not None
         self.assertEqual("score", event.kind)
+        self.assertEqual("anim", event.source)
+        self.assertEqual("S8Paint", event.widget)
+        self.assertEqual(1782, event.object_id)
+
+
+class AnimLineTests(unittest.TestCase):
+    """UI 控件动画行。音频表改动/资源缺失时音效那条会消失，动画回调不会。"""
+
+    def test_draw_is_recognised(self) -> None:
+        event = parse_line(HUIZHI)
+
+        assert event is not None
+        self.assertEqual("draw", event.kind)
+        self.assertTrue(event.captures)
+        self.assertEqual(("anim", "S8SnowField", 1296), (event.source, event.widget, event.object_id))
+
+    def test_animation_end_is_not_a_new_change(self) -> None:
+        """``Anim_XXXEnd`` 只是动画走完的回调，画面在此之前就变了。"""
+
+        self.assertIsNone(parse_line(HUIZHI_END))
+
+    def test_place_upgrade_and_rainbow_upgrade(self) -> None:
+        self.assertEqual("place", parse_line(FANGZHI).kind)
+        self.assertEqual("upgrade", parse_line(SHENGJI).kind)
+        self.assertEqual("rainbow_upgrade", parse_line(CAI_SHENGJI).kind)
+
+    def test_one_upgrade_per_tile(self) -> None:
+        """实测一次落笔升级 3 个格子会连打 3 条，对象序号各不相同——可用来数格子。"""
+
+        lines = [
+            "[2026.11.21-14.50.30:730][ 73]TLLua: Display: [Game] 1244_S8SnowField Anim_PutongShengji Start",
+            "[2026.11.21-14.50.32:164][ 73]TLLua: Display: [Game] 1258_S8SnowField Anim_PutongShengji Start",
+            "[2026.11.21-14.50.33:752][ 73]TLLua: Display: [Game] 1268_S8SnowField Anim_PutongShengji Start",
+        ]
+        events = [parse_line(line) for line in lines]
+
+        self.assertEqual(["upgrade"] * 3, [event.kind for event in events if event])
+        self.assertEqual({1244, 1258, 1268}, {event.object_id for event in events if event})
+
+    def test_popup_animations_are_ignored(self) -> None:
+        """``Anim_Show`` 任务成功/选能力都会播，认了就会每回合多截好几帧。"""
+
+        self.assertIsNone(parse_line(TASK_SHOW))
+        self.assertIsNone(
+            parse_line("[2026.11.21-14.06.24:763][588]TLLua: Display: [Game] 1127_S8DrawMap Anim_Show Start")
+        )
+
+    def test_unknown_animation_on_snowfield_is_ignored(self) -> None:
+        line = "[2026.11.21-14.06.24:763][588]TLLua: Display: [Game] 1127_S8SnowField Anim_SomethingNew Start"
+
+        self.assertIsNone(parse_line(line))
+
+    def test_audio_and_anim_coexist(self) -> None:
+        """同一次落笔音效、动画各一条，两条都要收（谁先到谁触发截图）。"""
+
+        kinds = [parse_line(PIGMENT).kind, parse_line(HUIZHI).kind]
+
+        self.assertEqual(["pigment", "draw"], kinds)
 
 
 class UiScaleTests(unittest.TestCase):

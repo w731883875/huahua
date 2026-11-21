@@ -362,12 +362,33 @@ _ASYNC_STATE: dict[str, object] = {
     "pending": False,
     "thread": None,
     "generation": 0,
+    #: 上一次成功读取时的 32x12 灰度缩略图，用来判断「面板换了没有」。
+    "reading_vector": None,
 }
 
 
 def panel_signature(crop: np.ndarray) -> str:
     small = cv2.resize(crop, (32, 12), interpolation=cv2.INTER_AREA)
     return hashlib.sha1(small.tobytes()).hexdigest()
+
+
+def panel_signature_vector(crop: np.ndarray) -> np.ndarray:
+    """32x12 灰度缩略图（float32，0~255）。
+
+    用来判断「面板到底换没换」：呼吸发光让摘要每帧都变，但**整体分布**几乎不动；
+    换面板（两张卡 → 一张卡、阶段一 → 阶段二）才会大幅变化。沿用上次结果前
+    先比一下这个，避免把上一笔的「堆砌」当成这一笔的选择写进录制。
+    """
+
+    small = cv2.resize(crop, (32, 12), interpolation=cv2.INTER_AREA)
+    if small.ndim == 3:
+        small = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    return small.astype(np.float32)
+
+
+#: 沿用上次结果的相似度上限（32x12 灰度平均绝对差，0~255）。
+#: 实测卡片呼吸 3~8；整块换掉（两张卡变一张、或内容换成别的卡）> 25。
+PANEL_REUSE_MAX_DISTANCE = 14.0
 
 
 def _cache_get(cache: OrderedDict, key: str):
@@ -396,6 +417,7 @@ def reset_cache() -> None:
                 "requested_at": 0.0,
                 "pending": False,
                 "generation": int(_ASYNC_STATE["generation"]) + 1,
+                "reading_vector": None,
             }
         )
 
@@ -476,10 +498,12 @@ def read_brush_panel_async(crop: np.ndarray) -> BrushPanelReading | None:
     if crop is None or crop.size == 0:
         return None
     key = panel_signature(crop)
+    vector = panel_signature_vector(crop)
     cached = _cache_get(_SIGNATURE_CACHE, key)
     if cached is not None:
         with _ASYNC_LOCK:
             _remember_async(key, cached)
+            _ASYNC_STATE["reading_vector"] = vector
         return cached
 
     now = time.monotonic()
@@ -489,9 +513,24 @@ def read_brush_panel_async(crop: np.ndarray) -> BrushPanelReading | None:
             and now - float(_ASYNC_STATE["reading_at"]) > PANEL_READ_STALE
         ):
             _ASYNC_STATE["reading"] = None
+            _ASYNC_STATE["reading_vector"] = None
         if _ASYNC_STATE["key"] == key and _ASYNC_STATE["reading"] is not None:
             return _ASYNC_STATE["reading"]
         stale = _ASYNC_STATE["reading"]
+        previous_vector = _ASYNC_STATE.get("reading_vector")
+        if stale is not None and previous_vector is not None:
+            # 沿用上一次结果之前先确认「还是同一块面板」。
+            # 2026-11-21 实机日志：22:08:12 点了第一张卡（转锋），下一帧却记成
+            # 「堆砌」——面板已经换成阶段二，缓存仍把上一笔的 reading 递了上来。
+            distance = float(np.mean(np.abs(np.asarray(previous_vector) - vector)))
+            if distance > PANEL_REUSE_MAX_DISTANCE:
+                # 只把局部变量置空是不够的：``_ASYNC_STATE["reading"]`` 还留着旧读数，
+                # 下一次 ``_ASYNC_STATE["key"] == key`` 那条分支又会把它递出来。
+                stale = None
+                _ASYNC_STATE["reading"] = None
+                _ASYNC_STATE["reading_vector"] = None
+            else:
+                _ASYNC_STATE["reading_vector"] = vector
         should_request = not _ASYNC_STATE["pending"] and (
             now - float(_ASYNC_STATE["requested_at"]) >= PANEL_READ_INTERVAL
         )
@@ -530,5 +569,6 @@ def _async_read_worker(key: str, crop: np.ndarray, generation: int) -> None:
                 _ASYNC_STATE["pending"] = False
                 if reading is not None:
                     _remember_async(key, reading)
+                    _ASYNC_STATE["reading_vector"] = panel_signature_vector(crop)
 
 

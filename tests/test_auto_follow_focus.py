@@ -40,7 +40,7 @@ class AutoFollowDoesNotStealFocusTests(unittest.TestCase):
     def test_capture_never_activates_the_game_window(self) -> None:
         """自动跟随截图必须 activate=False，否则每帧抢一次焦点。"""
         with (
-            patch.object(frame_pump, "find_window", return_value=_window()),
+            patch.object(frame_pump, "find_capture_window", return_value=_window()),
             patch.object(frame_pump, "_foreground_allows_capture", return_value=True),
             patch.object(frame_pump, "capture_window_content", return_value=(None, "test")),
             patch.object(frame_pump, "capture_target") as capture_target,
@@ -59,7 +59,7 @@ class AutoFollowDoesNotStealFocusTests(unittest.TestCase):
         """窗口内容抓得到时，前台是别的软件也照样读——遮挡/后台都不再是问题。"""
         frame = np.full((60, 80, 3), 128, dtype=np.uint8)
         with (
-            patch.object(frame_pump, "find_window", return_value=_window()),
+            patch.object(frame_pump, "find_capture_window", return_value=_window()),
             patch.object(frame_pump, "_foreground_allows_capture", return_value=False),
             patch.object(frame_pump, "capture_window_content", return_value=(frame, "wgc")),
             patch.object(frame_pump, "capture_target") as capture_target,
@@ -73,7 +73,7 @@ class AutoFollowDoesNotStealFocusTests(unittest.TestCase):
     def test_other_app_in_foreground_pauses_the_capture(self) -> None:
         """窗口内容抓不到、前台又是别的软件时返回 paused，不去截图、更不去激活。"""
         with (
-            patch.object(frame_pump, "find_window", return_value=_window()),
+            patch.object(frame_pump, "find_capture_window", return_value=_window()),
             patch.object(frame_pump, "_foreground_allows_capture", return_value=False),
             patch.object(frame_pump, "capture_window_content", return_value=(None, "wgc_unavailable")),
             patch.object(frame_pump, "capture_target") as capture_target,

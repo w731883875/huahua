@@ -32,6 +32,7 @@ import cv2
 import numpy as np
 
 from huahua_assistant import brush_panel
+from huahua_assistant.brush_panel import BrushPanelReading
 from huahua_assistant.game_model import BrushType
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -326,6 +327,58 @@ class PanelCacheTest(unittest.TestCase):
             )
             # 6 帧不能是 6 次 OCR：节流后每帧最多一次，且命中缓存后为 0 次
             self.assertLessEqual(reader.call_count, 6)
+
+    def test_panel_switch_drops_the_stale_reading(self) -> None:
+        """面板整块换掉之后，不能再把上一次的读数递上来。
+
+        2026-11-21 实机日志：22:08:12 点了第一张卡（转锋），紧接着那帧的
+        ``brush_stage1_selected`` 却记成「堆砌」——面板已经从阶段一换成阶段二，
+        而「沿用上次结果」还在返回上一笔的 reading。录制里于是写进了没选过的笔触。
+
+        呼吸发光（整体亮度小幅波动）必须继续沿用；换面板（两张卡变一张）必须立刻失效。
+        """
+
+        direction = BrushPanelReading(
+            stage="direction",
+            brush_types=(BrushType.TRANSFORM, BrushType.STACK),
+            confidence=0.9,
+        )
+        effect = BrushPanelReading(
+            stage="effect",
+            affixes=("自身提升1级",),
+            confidence=0.9,
+        )
+        calls: list[object] = [direction]
+
+        def fake_read(crop):
+            return calls.pop(0) if calls else None
+
+        with mock.patch.object(brush_panel, "read_brush_panel", side_effect=fake_read):
+            with mock.patch.object(brush_panel, "PANEL_READ_INTERVAL", 0.0):
+                brush_panel.reset_cache()
+                first = brush_panel.read_brush_panel_async(self.crop)
+                self.assertIsNone(first)  # 首帧发起请求
+                brush_panel.wait_for_async()
+                self.assertEqual("direction", brush_panel.read_brush_panel_async(self.crop).stage)
+
+                # 呼吸：整块面板亮度轻微浮动，必须继续沿用（否则又回到「永远读不到」）
+                breathing = self.crop.astype("int16")
+                breathing[::3] = np.clip(breathing[::3] + 4, 0, 255)
+                breathing = breathing.astype("uint8")
+                self.assertIsNotNone(brush_panel.read_brush_panel_async(breathing))
+
+                # 换面板：整块换成另一种底色/结构，必须立刻丢掉旧读数
+                switched = np.full_like(self.crop, 0)
+                switched[:, : self.crop.shape[1] // 2] = 255
+                stale_result = brush_panel.read_brush_panel_async(switched)
+                self.assertFalse(
+                    stale_result is not None and stale_result.stage == "direction",
+                    "面板已经换了，不能还返回旧读数",
+                )
+
+                brush_panel.wait_for_async()
+                settled = brush_panel.read_brush_panel_async(switched)
+                self.assertTrue(settled is None or settled.stage == "effect")
 
 
 class RealScreenshotTest(unittest.TestCase):

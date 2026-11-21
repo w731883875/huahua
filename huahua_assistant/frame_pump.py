@@ -44,6 +44,11 @@ class FramePumpResult:
     captured_at: float = 0.0
 
 
+#: 一帧跑超过这个秒数就记一条 ``slow_frame``。
+#: 自动跟随的节拍是 1.5s，正常帧 0.3~0.8s；超过 3s 才会被 tick 判成「很久没出帧」。
+SLOW_FRAME_SECONDS = 3.0
+
+
 class FramePump:
     """Background realtime loop that keeps only the newest analyzed frame."""
 
@@ -57,6 +62,7 @@ class FramePump:
         maybe_save_frame: Callable[[np.ndarray], float] | None = None,
         record_func: Callable[[FastVisionSnapshot | None, CaptureResult], object] | None = None,
         model_state_func: Callable[[], object] | None = None,
+        slow_frame_func: Callable[[dict], None] | None = None,
     ) -> None:
         self._capture_func = capture_func
         self._analyze_func = analyze_func
@@ -67,6 +73,8 @@ class FramePump:
         #: 规则推演出的模型状态（``game_model.PuzzleState``）。快照里的
         #: ``bonus_level`` / ``aura_level`` 只能从这里回填，视觉读不到。
         self._model_state_func = model_state_func
+        #: 慢帧回调：``elapsed`` 超过 :data:`SLOW_FRAME_SECONDS` 时收到分段耗时。
+        self._slow_frame_func = slow_frame_func
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         #: 提前唤醒正在等间隔的循环。日志说画面变了就置位，不必等满一个节拍。
@@ -128,10 +136,35 @@ class FramePump:
             with self._lock:
                 self._latest = result
             elapsed = time.perf_counter() - loop_started_at
+            if elapsed >= SLOW_FRAME_SECONDS:
+                self._report_slow_frame(result, elapsed)
             remaining = self._interval - elapsed
             if remaining > 0:
                 # 等间隔，或者被 wake() 提前叫醒（日志说画面变了）。
                 self._wake.wait(remaining)
+
+    def _report_slow_frame(self, result: FramePumpResult, elapsed: float) -> None:
+        """把慢帧的分段耗时交出去。
+
+        没有这条，「开局识别卡十秒」只能看到 tick 侧那句 ``auto_follow_restart``：
+        到底是抓图慢（WGC 在游戏切场景时不来帧）还是识别慢，日志里分不清。
+        """
+
+        if self._slow_frame_func is None:
+            return
+        try:
+            self._slow_frame_func(
+                {
+                    "kind": "slow_frame",
+                    "elapsed": round(elapsed, 2),
+                    "sequence": result.sequence,
+                    "frame_shape": None if result.frame_shape is None else list(result.frame_shape),
+                    "error": result.error,
+                    **result.perf,
+                }
+            )
+        except Exception:  # noqa: BLE001 - 诊断失败不能影响采集
+            pass
 
     def _capture_and_analyze(self) -> FramePumpResult:
         self._sequence += 1

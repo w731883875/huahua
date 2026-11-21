@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import time
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
+from huahua_assistant import frame_pump
 from huahua_assistant.capture import CaptureResult
 from huahua_assistant.frame_pump import FramePump
 
@@ -85,6 +87,59 @@ class WakeTests(unittest.TestCase):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline and counter.calls < target:
             time.sleep(0.01)
+
+
+class SlowFrameReportTests(unittest.TestCase):
+    """慢帧要把分段耗时交出去。
+
+    用户报「开局识别卡十秒」时，日志里只有 tick 侧那句 ``auto_follow_restart``
+    （泵 12 秒没出帧），分不清是抓图慢还是识别慢。这个回调就是补这条证据的。
+    """
+
+    def test_slow_frame_is_reported_with_breakdown(self) -> None:
+        reports: list[dict] = []
+
+        def slow_analyze(_frame):
+            time.sleep(0.05)
+            return None
+
+        pump = FramePump(
+            capture_func=_Counter(),
+            analyze_func=slow_analyze,
+            needs_full_refresh=lambda: False,
+            full_analyze_func=lambda _frame: None,
+            slow_frame_func=reports.append,
+        )
+        try:
+            # 阈值打桩到 10ms，否则要真跑 3 秒。
+            with patch.object(frame_pump, "SLOW_FRAME_SECONDS", 0.01):
+                pump.start(interval=0.1)
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and not reports:
+                    time.sleep(0.01)
+                pump.stop(wait=True)
+        finally:
+            pump.stop(wait=True)
+        self.assertTrue(reports, "帧耗时超过阈值时必须上报")
+        payload = reports[0]
+        self.assertLessEqual({"kind", "elapsed", "capture", "analysis"}, set(payload))
+        self.assertEqual("slow_frame", payload["kind"])
+
+    def test_fast_frames_are_not_reported(self) -> None:
+        reports: list[dict] = []
+        pump = FramePump(
+            capture_func=_Counter(),
+            analyze_func=lambda _frame: None,
+            needs_full_refresh=lambda: False,
+            full_analyze_func=lambda _frame: None,
+            slow_frame_func=reports.append,
+        )
+        try:
+            pump.start(interval=0.1)
+            time.sleep(0.3)
+        finally:
+            pump.stop(wait=True)
+        self.assertEqual([], reports, "正常帧不该刷诊断日志")
 
 
 if __name__ == "__main__":

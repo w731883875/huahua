@@ -222,6 +222,13 @@ class HuahuaApp(tk.Tk):
         # 固定比例会偏十几像素，实时路径整片报「没有棋盘」。自愈找到位置后落盘，
         # 下次不用再搜。测试进程不打开（几十帧不同尺寸的截图会把文件写乱）。
         vision.set_layout_autosave(True)
+        # 「开局识别卡十秒」这类问题，日志里原来只有 auto_follow_restart（泵停了 12 秒），
+        # 看不出是标定没命中、全搜索太慢还是 OCR 卡住。把识别侧慢路径接进同一条日志。
+        vision.set_diagnostic_hook(
+            lambda payload: record_observation(
+                "vision_diagnostic", dict(payload), source="vision"
+            )
+        )
         self.title("Huahua Puzzle Assistant v0.1")
         # 工具栏拆成两行后多了约 36px。棋盘边长是 min(可用宽, 可用高-留白) 算出来的，
         # 高度一少格子就整圈变小——屏幕够高就把窗口同步加高，让棋盘尺寸跟拆行前一致。
@@ -1437,6 +1444,9 @@ class HuahuaApp(tk.Tk):
                 maybe_save_frame=self._maybe_save_auto_frame,
                 record_func=self._record_auto_snapshot,
                 model_state_func=lambda: self.current_state,
+                slow_frame_func=lambda payload: record_observation(
+                    "slow_frame", dict(payload), source="auto_follow"
+                ),
             )
         interval_ms = max(100, int(self.auto_follow_interval_var.get() or 100))
         self.auto_follow_pump.start(interval=interval_ms / 1000.0)

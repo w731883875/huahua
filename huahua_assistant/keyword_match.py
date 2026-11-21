@@ -110,7 +110,7 @@ def _best_keyword_score(
 
 @lru_cache(maxsize=2048)
 def _keyword_template(keyword: str, font_size: int, binary: bool = False, scale: float = 2.0) -> np.ndarray:
-    font = ImageFont.truetype(_font_path(), font_size)
+    font = _font(font_size)
     bbox = font.getbbox(keyword)
     width = max(1, bbox[2] - bbox[0] + 8)
     height = max(1, bbox[3] - bbox[1] + 8)
@@ -125,8 +125,25 @@ def _keyword_template(keyword: str, font_size: int, binary: bool = False, scale:
     return arr
 
 
+@lru_cache(maxsize=1)
 def _font_path() -> str:
+    """字体路径。
+
+    **必须缓存**：``_keyword_template`` 每次生成模板都会问一次，而冷启动第一帧
+    要生成 500+ 个模板 —— 一次 ``Path(...).exists()`` 走四次磁盘 stat，
+    522 次调用实测吃掉 2.4 秒，全在首帧预算里。
+    """
     for candidate in FONT_CANDIDATES:
         if Path(candidate).exists():
             return candidate
     raise FileNotFoundError("No Chinese font found in C:/Windows/Fonts")
+
+
+@lru_cache(maxsize=32)
+def _font(size: int) -> ImageFont.FreeTypeFont:
+    """按字号复用 ``ImageFont`` 对象。
+
+    ``ImageFont.truetype`` 每次都要重新读一遍字体文件（实测 522 次共 1.18s，
+    其中 ``getfont`` 0.72s）。字号只有 ``range(14, 24)`` 这几个，缓存起来就没了。
+    """
+    return ImageFont.truetype(_font_path(), size)

@@ -13,6 +13,8 @@ import numpy as np
 
 
 _CACHE_LIMIT = 24
+#: 子进程冷启动（加载 WinRT + OCR 语言包）的上限。实测 1~4s，超过就是没起来。
+_READY_TIMEOUT = 6.0
 # 编码格式：BMP 不压缩，5MB 的图编码只要 ~10ms；PNG 同样一张要 ~90ms，
 # 而这段时间全卡在实时帧上（每帧最多两次 OCR）。Windows 的 BitmapDecoder
 # 原生认 BMP，解码也不慢，所以统一走 BMP。
@@ -82,8 +84,42 @@ def _warm_windows_ocr() -> None:
         _ensure_ocr_process_locked()
 
 
-def recognize_chinese_lines(image: np.ndarray, timeout: float = 5.0) -> tuple[str, ...]:
-    """Use the built-in Windows OCR only for uncached, unfamiliar brush cards."""
+def _readline_with_timeout(stream, timeout: float) -> str | None:
+    """读一行，但**不许无限等**。
+
+    这里原来是裸 ``stream.readline()``：``timeout`` 参数写进了签名却从没用上。
+    一旦 PowerShell 那侧的 WinRT ``Await`` 卡住（冷启动加载 OCR 语言包、
+    图太大、或者进程半死），这条 readline 就永远不返回，而它是在
+    ``_process_lock`` 里调的 —— 后面的 ``read_panel`` / 笔触面板请求全部排队。
+
+    实机表现就是「开局识别卡十秒」：一帧里唯一那次同步 OCR 挂住，
+    采集泵 12 秒没出帧被判 stall 重启，重启后缓存热了才恢复。
+
+    超时返回 ``None``，调用方据此杀掉子进程、这一帧当没读到。
+    """
+
+    box: dict[str, str] = {}
+
+    def reader() -> None:
+        try:
+            box["line"] = stream.readline()
+        except Exception:  # noqa: BLE001 - 进程被杀时 readline 会抛
+            box["line"] = ""
+
+    thread = threading.Thread(target=reader, name="huahua-ocr-read", daemon=True)
+    thread.start()
+    thread.join(max(0.05, float(timeout)))
+    if thread.is_alive():
+        return None
+    return box.get("line")
+
+
+def recognize_chinese_lines(image: np.ndarray, timeout: float = 2.5) -> tuple[str, ...]:
+    """Use the built-in Windows OCR only for uncached, unfamiliar brush cards.
+
+    ``timeout`` 是**单次往返**的上限（读不到就放弃这一帧），不是整帧预算：
+    超时会让子进程被重建，避免一个坏进程拖死后面每一帧。
+    """
 
     if os.name != "nt" or image.size == 0:
         return ()
@@ -99,6 +135,7 @@ def recognize_chinese_lines(image: np.ndarray, timeout: float = 5.0) -> tuple[st
             return cached
 
     path = ""
+    cacheable = True
     try:
         with tempfile.NamedTemporaryFile(
             prefix="huahua_ocr_", suffix=_IMAGE_EXT, delete=False
@@ -112,9 +149,16 @@ def recognize_chinese_lines(image: np.ndarray, timeout: float = 5.0) -> tuple[st
             else:
                 process.stdin.write(os.path.abspath(path) + "\n")
                 process.stdin.flush()
-                response = process.stdout.readline().strip()
-                payload_text = response.removeprefix("__RESULT__")
-                if not response.startswith("__RESULT__") or not payload_text:
+                response = _readline_with_timeout(process.stdout, timeout)
+                if response is None:
+                    # 超时：进程状态未知，杀掉重建。这一帧当作没读到，
+                    # 也**不能**把空结果写进缓存——否则同一张图永远读不出字。
+                    _abort_ocr_process_locked()
+                    lines = ()
+                    cacheable = False
+                    response = ""
+                payload_text = response.strip().removeprefix("__RESULT__")
+                if not response.strip().startswith("__RESULT__") or not payload_text:
                     # 一帧里没有任何文字时，PowerShell 的 ConvertTo-Json 会输出空串。
                     # 以前这里直接 json.loads("") 抛异常，把整帧识别带崩。
                     lines = ()
@@ -137,11 +181,12 @@ def recognize_chinese_lines(image: np.ndarray, timeout: float = 5.0) -> tuple[st
             except OSError:
                 pass
 
-    with _cache_lock:
-        _line_cache[cache_key] = lines
-        _line_cache.move_to_end(cache_key)
-        while len(_line_cache) > _CACHE_LIMIT:
-            _line_cache.popitem(last=False)
+    if cacheable:
+        with _cache_lock:
+            _line_cache[cache_key] = lines
+            _line_cache.move_to_end(cache_key)
+            while len(_line_cache) > _CACHE_LIMIT:
+                _line_cache.popitem(last=False)
     return lines
 
 
@@ -214,6 +259,28 @@ def _complete_async_ocr(cache_key: str, image: np.ndarray) -> None:
             _async_pending.discard(cache_key)
 
 
+def _abort_ocr_process_locked() -> None:
+    """把当前子进程判死并清空引用，下一次调用会重建。
+
+    超时之后不能只把结果丢掉：那条请求还在管道的另一头，进程可能停在半路，
+    继续用它会让后面每一次 OCR 都接在同一条坏管道上。
+    """
+
+    global _ocr_process
+    process = _ocr_process
+    _ocr_process = None
+    if process is None:
+        return
+    try:
+        process.kill()
+    except OSError:
+        pass
+    try:
+        process.wait(timeout=0.3)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 def _ensure_ocr_process_locked() -> subprocess.Popen[str] | None:
     global _ocr_process
     if _ocr_process is not None and _ocr_process.poll() is None:
@@ -237,8 +304,18 @@ def _ensure_ocr_process_locked() -> subprocess.Popen[str] | None:
             encoding="utf-8",
             errors="replace",
         )
-        if process.stdout is None or process.stdout.readline().strip() != "__READY__":
-            process.terminate()
+        # 冷启动要加载 WinRT + OCR 语言包，实测 1~4s；但**不能无限等**：
+        # 加载失败时 powershell 会一直不回 __READY__，而这里持着全局锁。
+        ready = (
+            _readline_with_timeout(process.stdout, _READY_TIMEOUT)
+            if process.stdout is not None
+            else None
+        )
+        if ready is None or ready.strip() != "__READY__":
+            try:
+                process.kill()
+            except OSError:
+                pass
             return None
         _ocr_process = process
     except OSError:

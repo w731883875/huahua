@@ -9,6 +9,7 @@ import queue
 import re
 import threading
 import time
+from typing import Callable
 
 import cv2
 import numpy as np
@@ -275,6 +276,32 @@ def _board_cells_look_flat(image: np.ndarray, rect: Rect) -> bool:
 
 
 def _locate_board_rect(image: np.ndarray) -> tuple[Rect, float] | None:
+    """定位棋盘，并在慢的时候把这次走的路径记进诊断日志。
+
+    只包一层：真正的实现在 :func:`_locate_board_rect_impl`（它会递归处理缩略图，
+    递归那层不重复埋点）。
+    """
+
+    started = time.perf_counter()
+    result = _locate_board_rect_impl(image)
+    elapsed = time.perf_counter() - started
+    if elapsed >= LOCATE_DIAGNOSTIC_SECONDS:
+        height, width = image.shape[:2]
+        _report_diagnostic(
+            {
+                "kind": "slow_locate",
+                "elapsed": round(elapsed, 2),
+                "width": int(width),
+                "height": int(height),
+                "found": result is not None,
+                "rect": None if result is None else [result[0].x, result[0].y, result[0].w, result[0].h],
+                "score": None if result is None else round(float(result[1]), 4),
+            }
+        )
+    return result
+
+
+def _locate_board_rect_impl(image: np.ndarray) -> tuple[Rect, float] | None:
     """只回答「棋盘在哪、有多像」，不碰面板 OCR / 笔触 / 背包 / 逐格分类。
 
     两个调用方都只需要矩形：``analyze_scene``（离线冷启动）和布局自愈
@@ -302,7 +329,7 @@ def _locate_board_rect(image: np.ndarray) -> tuple[Rect, float] | None:
         small = cv2.resize(
             image, (800, max(1, int(round(height * scale)))), interpolation=cv2.INTER_AREA
         )
-        small_located = _locate_board_rect(small)
+        small_located = _locate_board_rect_impl(small)
         if small_located is not None:
             small_rect, _ = small_located
             mapped = Rect(
@@ -583,6 +610,33 @@ def set_layout_autosave(enabled: bool) -> None:
     _LAYOUT_AUTOSAVE = bool(enabled)
 
 
+#: 定位路径的诊断回调。参数是一个 dict：``path``（calibrated/tracked/layout/
+#: search/none）、``elapsed``、``width``/``height``、``rect``/``score``。
+#: 界面进程接上它，把慢帧写进 ``observations.jsonl`` —— 「开局卡十秒」这类问题
+#: 原来只能靠猜是哪条分支，日志里没有路径信息。
+_DIAGNOSTIC_HOOK: Callable[[dict[str, object]], None] | None = None
+
+
+def set_diagnostic_hook(hook: Callable[[dict[str, object]], None] | None) -> None:
+    global _DIAGNOSTIC_HOOK
+    _DIAGNOSTIC_HOOK = hook
+
+
+#: 定位耗时超过这个秒数才写诊断记录。正常（标定命中）是 0.1~0.2s，
+#: 走全搜索是 2~4s，只有后者值得记 —— 否则自动跟随每 1.5 秒一条，把日志淹了。
+LOCATE_DIAGNOSTIC_SECONDS = 1.0
+
+
+def _report_diagnostic(payload: dict[str, object]) -> None:
+    hook = _DIAGNOSTIC_HOOK
+    if hook is None:
+        return
+    try:
+        hook(payload)
+    except Exception:  # noqa: BLE001 - 诊断绝不能影响识别
+        pass
+
+
 def _pick_board_rect(
     image: np.ndarray,
     screen: ScreenLayout,
@@ -697,10 +751,31 @@ def _remember_board_layout(width: int, height: int, rect: Rect) -> None:
     """
     if not _LAYOUT_AUTOSAVE:
         return
+    from .layout import calibration_is_plausible
+    from .layout import LayoutRect
+
+    plausible = calibration_is_plausible(
+        LayoutRect(
+            x_ratio=rect.x / max(1, width),
+            y_ratio=rect.y / max(1, height),
+            size_ratio=rect.w / max(1, min(width, height)),
+        )
+    )
     try:
         save_layout(width, height, rect)
     except OSError:
         return
+    # 落盘是否真的生效，决定「下一局还要不要重搜」——原来这件事只能靠读
+    # 磁盘上的 layout.json 反推，而用户那边的现象正是「每局都慢」。
+    _report_diagnostic(
+        {
+            "kind": "layout_saved",
+            "width": int(width),
+            "height": int(height),
+            "rect": [rect.x, rect.y, rect.w, rect.h],
+            "plausible": bool(plausible),
+        }
+    )
     reset_vision_caches()
 
 
@@ -5030,12 +5105,37 @@ def _estimated_board_layout_candidates(image: np.ndarray) -> list[Rect]:
     return candidates
 
 
+#: 版式候选最多精修几个。
+#:
+#: ``_refine_board_rect`` 要跑全图 Canny + 上百次评分，1607x822 实测 0.6s/次。
+#: 原来对**每个**候选都无差别精修（1607x822 上是 31 个），实测 18.5 秒，
+#: 而且这 31 个候选里一个都不在真棋盘上（预设比例最小 x=0.475，真实棋盘在
+#: x=0.075）—— 十几秒全花在一个注定失败的搜索上。用户看到的就是
+#: 「开局识别卡十秒」。
+#:
+#: 综合分（``_score_board_rect``）很便宜（31 个共 0.29s），先粗排再精修头部，
+#: 结果不变而耗时降到 1/8。留 4 个而不是 1 个：候选框偏 8px 时粗分会掉、
+#: 精修才救得回来，只取 top-1 会漏掉这种。
+BEST_LAYOUT_REFINE_LIMIT = 4
+
+
 def _best_estimated_board_layout(image: np.ndarray) -> tuple[Rect, float] | None:
     candidates = _estimated_board_layout_candidates(image)
     if not candidates:
         return None
+    if len(candidates) <= BEST_LAYOUT_REFINE_LIMIT:
+        ordered = [(None, rect) for rect in candidates]
+    else:
+        ordered = [
+            (score, rect)
+            for score, rect in sorted(
+                ((_score_board_rect(image, rect), rect) for rect in candidates),
+                key=lambda item: item[0],
+                reverse=True,
+            )[:BEST_LAYOUT_REFINE_LIMIT]
+        ]
     best: tuple[Rect, float] | None = None
-    for rect in candidates:
+    for _, rect in ordered:
         refined = _refine_board_rect(image, rect)
         score = _score_board_rect(image, refined)
         if best is None or score > best[1]:
@@ -5579,9 +5679,11 @@ def _board_position_score(shape: tuple[int, ...], rect: Rect) -> float:
 def _refine_board_rect(image: np.ndarray, rect: Rect) -> Rect:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(gray, 40, 110)
+    # 积分图只算一次，精修里上千个候选共用（见 ``_grid_line_strengths``）。
+    integral = cv2.integral(edges, sdepth=cv2.CV_64F)
     height, width = image.shape[:2]
 
-    best_score = _refine_candidate_score(image, edges, rect)
+    best_score = _refine_candidate_score(image, edges, rect, integral=integral)
     best_rect = rect
 
     side_min = max(BOARD_SIZE * 30, int(rect.w * 0.94))
@@ -5601,18 +5703,29 @@ def _refine_board_rect(image: np.ndarray, rect: Rect) -> Rect:
         for y in range(y_min, max_y_for_side + 1, step):
             for x in range(x_min, max_x_for_side + 1, step):
                 candidate = Rect(x, y, side, side)
-                score = _refine_candidate_score(image, edges, candidate)
+                score = _refine_candidate_score(image, edges, candidate, integral=integral)
                 if score > best_score:
                     best_score = score
                     best_rect = candidate
 
-    return _refine_board_rect_precise(image, edges, best_rect, width, height)
+    return _refine_board_rect_precise(image, edges, best_rect, width, height, integral=integral)
 
 
-def _refine_board_rect_precise(image: np.ndarray, edges: np.ndarray, rect: Rect, width: int, height: int) -> Rect:
-    best_score = _refine_candidate_score(image, edges, rect)
+def _refine_board_rect_precise(
+    image: np.ndarray,
+    edges: np.ndarray,
+    rect: Rect,
+    width: int,
+    height: int,
+    *,
+    integral: np.ndarray | None = None,
+) -> Rect:
+    best_score = _refine_candidate_score(image, edges, rect, integral=integral)
     best_rect = rect
-    precise_radius = 5
+    # 粗搜步长是 ``max(22, w//20)``，精修只需把 ±1 格内的取整误差收掉。
+    # 半径 5→4：搜索点从 216 降到 125（-42%），实测结果一格没变
+    # （1607x822 六张图 rect 完全相同），而这段是每次定位跑三遍的热点。
+    precise_radius = 4
     precise_step = 2
     for side in range(max(BOARD_SIZE * 30, rect.w - precise_radius), min(width, height, rect.w + precise_radius) + 1, precise_step):
         max_x = width - side
@@ -5620,24 +5733,47 @@ def _refine_board_rect_precise(image: np.ndarray, edges: np.ndarray, rect: Rect,
         for y in range(max(0, rect.y - precise_radius), min(max_y, rect.y + precise_radius) + 1, precise_step):
             for x in range(max(0, rect.x - precise_radius), min(max_x, rect.x + precise_radius) + 1, precise_step):
                 candidate = Rect(x, y, side, side)
-                score = _refine_candidate_score(image, edges, candidate)
+                score = _refine_candidate_score(image, edges, candidate, integral=integral)
                 if score > best_score:
                     best_score = score
                     best_rect = candidate
     return best_rect
 
 
-def _refine_candidate_score(image: np.ndarray, edges: np.ndarray, rect: Rect) -> float:
+def _refine_candidate_score(
+    image: np.ndarray,
+    edges: np.ndarray,
+    rect: Rect,
+    *,
+    integral: np.ndarray | None = None,
+) -> float:
     if not _is_rect_inside_image(image.shape, rect):
         return 0.0
-    grid = _score_edges_grid(edges, rect)
+    # 14 条网格线的强度算一次就够：``_score_edges_grid`` 和 ``_outer_edge_penalty``
+    # 各自调一次 ``_grid_line_strengths``，而后者每条线一个 ``ndarray.mean()``。
+    # 精修一次要评 1200+ 个候选，等于几万次 mean —— 实测 3 秒，全花在重复计算上。
+    strengths = _grid_line_strengths(edges, rect, integral=integral)
+    grid = _score_edges_grid(edges, rect, strengths=strengths)
     position = _board_position_score(image.shape, rect)
     size = _board_size_score(image.shape, rect)
-    return grid * (0.55 + position * 0.35 + size * 0.10) * _outer_edge_penalty(edges, rect)
+    return grid * (0.55 + position * 0.35 + size * 0.10) * _outer_edge_penalty(
+        edges, rect, strengths=strengths
+    )
 
 
-def _grid_line_strengths(edges: np.ndarray, rect: Rect) -> list[float]:
-    """返回棋盘 7 竖 7 横共 14 条网格线的边缘强度（0~1）。"""
+def _grid_line_strengths(
+    edges: np.ndarray,
+    rect: Rect,
+    *,
+    integral: np.ndarray | None = None,
+) -> list[float]:
+    """返回棋盘 7 竖 7 横共 14 条网格线的边缘强度（0~1）。
+
+    传了 ``integral``（``cv2.integral(edges, sdepth=cv2.CV_64F)``）就改用它做
+    矩形求和：每条线常数时间，不再切一张小图调 ``ndarray.mean()``。
+    精修一次要评 1200+ 个候选、每个 14 条线，实测 3 万次 ``mean()`` 占 2.3 秒 ——
+    这是「窗口没标定时开局识别卡好几秒」的主要开销。
+    """
     h, w = edges.shape[:2]
     line_band = max(2, rect.w // 120)
     strengths: list[float] = []
@@ -5645,23 +5781,56 @@ def _grid_line_strengths(edges: np.ndarray, rect: Rect) -> list[float]:
         x = round(rect.x + rect.w * i / BOARD_SIZE)
         x1 = max(0, x - line_band)
         x2 = min(w, x + line_band + 1)
-        strengths.append(float(edges[rect.y : rect.bottom, x1:x2].mean()) / 255.0)
+        strengths.append(
+            _band_mean(edges, integral, max(0, rect.y), min(h, rect.bottom), x1, x2)
+        )
 
         y = round(rect.y + rect.h * i / BOARD_SIZE)
         y1 = max(0, y - line_band)
         y2 = min(h, y + line_band + 1)
-        strengths.append(float(edges[y1:y2, rect.x : rect.right].mean()) / 255.0)
+        strengths.append(
+            _band_mean(edges, integral, y1, y2, max(0, rect.x), min(w, rect.right))
+        )
     return strengths
 
 
-def _score_edges_grid(edges: np.ndarray, rect: Rect) -> float:
+def _band_mean(
+    edges: np.ndarray,
+    integral: np.ndarray | None,
+    y1: int,
+    y2: int,
+    x1: int,
+    x2: int,
+) -> float:
+    """一条网格带内的平均边缘强度（0~1）。"""
+
+    if y2 <= y1 or x2 <= x1:
+        return 0.0
+    if integral is None:
+        return float(edges[y1:y2, x1:x2].mean()) / 255.0
+    total = integral[y2, x2] - integral[y1, x2] - integral[y2, x1] + integral[y1, x1]
+    return float(total) / ((y2 - y1) * (x2 - x1)) / 255.0
+
+
+def _score_edges_grid(
+    edges: np.ndarray,
+    rect: Rect,
+    *,
+    strengths: list[float] | None = None,
+) -> float:
     h, w = edges.shape[:2]
     if rect.x < 0 or rect.y < 0 or rect.right > w or rect.bottom > h:
         return 0.0
-    return float(np.clip(np.mean(_grid_line_strengths(edges, rect)) * 3.5, 0.0, 1.0))
+    values = _grid_line_strengths(edges, rect) if strengths is None else strengths
+    return float(np.clip(np.mean(values) * 3.5, 0.0, 1.0))
 
 
-def _outer_edge_penalty(edges: np.ndarray, rect: Rect) -> float:
+def _outer_edge_penalty(
+    edges: np.ndarray,
+    rect: Rect,
+    *,
+    strengths: list[float] | None = None,
+) -> float:
     """框的左/上再往外一格若还压着一条同样强的网格线，说明整体偏了一格。
 
     6x6 棋盘正好 7 条网格线，所以「棋盘内部任意 6x6 子区域」也能凑出 7 条线，
@@ -5673,8 +5842,8 @@ def _outer_edge_penalty(edges: np.ndarray, rect: Rect) -> float:
     颜料与背包面板，竖线本来就多，拿它当证据会把正确的框也判成偏移。
     """
     h, w = edges.shape[:2]
-    strengths = _grid_line_strengths(edges, rect)
-    inside = float(np.mean(strengths)) if strengths else 0.0
+    values = _grid_line_strengths(edges, rect) if strengths is None else strengths
+    inside = float(np.mean(values)) if values else 0.0
     if inside <= 1e-6:
         return 1.0
 

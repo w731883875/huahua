@@ -407,6 +407,8 @@ class AutomaticRunRecorder:
         self._frames = 0
         self._last_event_at: float | None = None
         self._finished_at: float | None = None
+        #: 上一局结束的原因，见 :meth:`_finish_run`。
+        self._last_finish_reason: str | None = None
         atexit.register(self.close)
 
     def process(
@@ -415,7 +417,22 @@ class AutomaticRunRecorder:
         *,
         observed_at: float | None = None,
         clicks: tuple[tuple[float, float, float], ...] = (),
+        run_boundary: str | None = None,
     ) -> RecorderFrameResult:
+        """处理一帧。
+
+        ``run_boundary`` 是**游戏日志给出的换局信号**，不是视觉猜的：
+
+        * ``"new_run"``：日志里出现 ``S8_HZXY_DrawPaper_Into``（入画/重绘后回到集雪），
+          说明一张新画纸真的开始了；
+        * ``"finished"``：日志里出现 ``S8_HZXY_DrawPaper_Draw_Finish``（点完成绘制）。
+
+        为什么非要这条通道（2026-11-22 21:56~21:57 实测）：两局之间只隔 4 秒，
+        交界那几帧整盘被替换，``_frame_looks_replaced`` 把「入画画面」和「真换局」
+        混在一起判，于是整帧否决、基准不推进——两局最后被合并成一条 214 秒的记录，
+        第 1 局的名义数据全长在第 2 局头上。日志是服务端驱动的，不会有这个歧义。
+        """
+
         started = time.perf_counter()
         now = time.time() if observed_at is None else float(observed_at)
         emitted: list[str] = []
@@ -432,6 +449,25 @@ class AutomaticRunRecorder:
             self._frames += 1
             start_visible = RegionKind.START_DRAWING.value in snapshot.regions
             finish_visible = RegionKind.FINISH_DRAWING.value in snapshot.regions
+
+            # 日志先说话：它比视觉硬，且不受「换盘那几帧被判成误读」的影响。
+            if run_boundary == "new_run":
+                if self.phase in {"playing", "opening"}:
+                    # 新画纸真的开始了：上一局到此为止。拿 ``self._last_snapshot`` 结算，
+                    # 因为当前这一帧已经是新画纸的画面（拿它当终局盘面等于记错局）。
+                    final_snapshot = (
+                        self._last_snapshot if self._last_snapshot is not None else snapshot
+                    )
+                    emitted.extend(
+                        self._finish_run(final_snapshot, now, reason="game_log_new_run")
+                    )
+                    self.phase = "waiting"
+                if self.phase in {"waiting", "finished"}:
+                    emitted.extend(self._start_run(snapshot, now, reason="game_log_new_run"))
+                    self.phase = "opening"
+            elif run_boundary == "finished" and self.phase == "playing":
+                emitted.extend(self._finish_run(snapshot, now, reason="game_log_finish"))
+                self.phase = "waiting"
 
             if start_visible:
                 if self.phase == "playing":
@@ -737,6 +773,10 @@ class AutomaticRunRecorder:
             "events": list(self._events),
         }
         emitted.append(self._emit("run_finished", summary, now, include_in_session=False))
+        #: 上一局为什么结束（``no_blank_tiles`` / ``finish_button`` / ``game_log_new_run`` …）。
+        #: 落盘的那条 ``run_finished`` 带了同样的 ``reason``；这里留一份给测试和界面读，
+        #: 免得为了一个字符串去解析 jsonl。
+        self._last_finish_reason = reason
         self._last_finished_signature = snapshot.board_signature
         self.phase = "finished"
         self._finished_at = now

@@ -418,6 +418,11 @@ class HuahuaApp(tk.Tk):
         #: 那个标志永远是 False，于是 ``previous_state`` 一直被继承，界面留着上一局
         #: 的调色目标/锚点/背包，看起来就是「换局了还显示旧棋盘」。
         self.pending_new_run = False
+        #: 日志给出的换局信号，``"new_run"`` / ``"finished"``；被
+        #: :meth:`_record_auto_snapshot` 取走后立刻清空（一次性）。
+        #: 视觉认换局在「两局只隔 4 秒」时会失效：交界那几帧整盘被替换，被当成
+        #: 入画画面误读丢掉，结果两局合并成一条记录（2026-11-22 21:56 实测）。
+        self._recorder_run_boundary: str | None = None
         self.auto_follow_after_id: str | None = None
         self.auto_follow_busy = False
         self.auto_follow_overlap_paused = False
@@ -1519,7 +1524,11 @@ class HuahuaApp(tk.Tk):
                 x = (click.x - window.left) / window.width * capture_width
                 y = (click.y - window.top) / window.height * capture_height
                 local_clicks.append((click.ts, x, y))
-        return self.run_recorder.process(snapshot, clicks=tuple(local_clicks))
+        # 换局信号「用掉就清」：日志事件是一次性的，不能每帧都拿它去切局。
+        boundary, self._recorder_run_boundary = self._recorder_run_boundary, None
+        return self.run_recorder.process(
+            snapshot, clicks=tuple(local_clicks), run_boundary=boundary
+        )
 
     # --- 游戏日志驱动 -------------------------------------------------------
 
@@ -1652,6 +1661,14 @@ class HuahuaApp(tk.Tk):
             if any(event.kind == "into" for event in events):
                 self.pending_new_run = True
                 record_observation("new_run_pending", {"trigger": "game_log_into"}, source="game_log")
+            # 同一个信号也要递给 run_recorder：它只看画面，而换局那几帧整盘被替换，
+            # 会被 `_frame_looks_replaced` 当成「入画画面误读」丢掉，于是两局合并成
+            # 一条（2026-11-22 21:56→21:57 实测：一条 214 秒的记录装了两局）。
+            # 日志是服务端驱动的，没有这个歧义。
+            if any(event.kind == "into" for event in events):
+                self._recorder_run_boundary = "new_run"
+            elif any(event.kind == "finish" for event in events):
+                self._recorder_run_boundary = "finished"
             self._sync_game_log_status(watcher)
 
         # 先定「静默与否」。它只看 watcher 的时间戳，跟这一批事件无关，

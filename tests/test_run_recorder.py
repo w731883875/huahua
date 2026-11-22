@@ -319,6 +319,42 @@ class AutomaticRunRecorderTests(unittest.TestCase):
         )
         self.assertIn("run_finished", result.events)
 
+    def test_game_log_new_run_splits_two_runs_that_visual_cannot_split(self) -> None:
+        """两局只隔几秒时，靠日志信号切开，不靠视觉猜。
+
+        2026-11-22 21:56→21:57 实测：第 1 局画满 → 点完成绘制 → 重绘回集雪 →
+        选难度 → 展开 → 新棋盘，全程 6 秒。交界那几帧整盘被替换，
+        ``_frame_looks_replaced`` 判成「入画画面误读」整帧否决、基准不推进，
+        于是两局合并成一条 214 秒的记录。
+        """
+
+        recorder = AutomaticRunRecorder(path=None, stable_frames=1)
+        tiles = [_blank_tile(index) for index in range(36)]
+        recorder.process(_snapshot(tiles, current=_current()), observed_at=1000.0, run_boundary="new_run")
+        self.assertEqual("playing", recorder.phase)
+        first_session = recorder.session_id
+
+        # 第 1 局打到一半（还有空白格，不会触发 no_blank 结算）
+        half = list(tiles)
+        for index in range(20):
+            half[index] = _paint_tile(index, "monster", 2)
+        recorder.process(_snapshot(half, current=_current()), observed_at=1060.0)
+        self.assertEqual("playing", recorder.phase)
+
+        # 日志说：入画了 → 上一局到此为止（哪怕盘面还有空白格）
+        result = recorder.process(
+            _snapshot(half, current=_current()), observed_at=1061.0, run_boundary="new_run"
+        )
+        self.assertIn("run_finished", result.events)
+        # 同一次 process 里结算上一局 + 立刻开新局，所以 phase 已经回到 playing。
+        self.assertEqual("game_log_new_run", recorder._last_finish_reason)
+        self.assertEqual("playing", recorder.phase)
+
+        # 新一局开始
+        second = [_blank_tile(index) for index in range(36)]
+        recorder.process(_snapshot(second, current=_current()), observed_at=1062.0, run_boundary="new_run")
+        self.assertNotEqual(first_session, recorder.session_id, "应当是独立的两局")
+
     def test_flapping_terrain_conflict_is_reported_once(self) -> None:
         """一格在两个值之间来回抖，``terrain_conflict_resolved`` 只报一次。
 

@@ -542,8 +542,21 @@ def state_from_observation(
         bonus, aura_amount = carried.get((tile.row, tile.col), (0, 0))
         paint = _paint_from_tile_observation(tile)
         if anchor == (tile.row, tile.col) and rule is not None:
-            # 面板给的是颜料**自己的**等级（「怪物颜料·邪影LV3」），不是棋盘上的最终等级。
+            # 锚点格要区分两件事：面板给的是颜料**自己的**等级，棋盘角标给的是
+            # **最终等级**（颜料等级 + 地块加成 + 光环）。
+            #
+            # 以前这里直接 ``paint = rule.paint``，等于用面板值顶掉实测值。
+            # 用户 2026-11-22 实机：r1c6 的初始颜料吃了「全图同内容额外提升3级」，
+            # 棋盘显示 6 级、点击地块加成 +3，面板仍是 3 级 —— 覆盖之后那 3 级就没了，
+            # 对账于是永远对不上。
+            #
+            # 现在改成：颜料等级取面板值，**超出面板的差额记到地块加成上**。
+            observed_level = paint.level if paint is not None else None
             paint = rule.paint
+            if observed_level is not None:
+                surplus = int(observed_level) - int(getattr(rule.paint, "level", 0) or 0)
+                if surplus > 0:
+                    bonus = max(bonus, min(MAX_LEVEL, surplus))
         tiles.append(
             Tile(
                 state=tile.state,

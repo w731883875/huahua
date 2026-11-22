@@ -163,13 +163,35 @@ def _paint_cells(tiles) -> set[tuple[int, int]]:
     }
 
 
+def _paint_state_cells(tiles) -> set[tuple[int, int]]:
+    """**状态是颜料**的格子，不管内容读没读出来。
+
+    和 :func:`_paint_cells` 的区别就在这里：这一帧 ``state == PAINT`` 但
+    ``paint is None``（被遮挡、动画中间态、首帧还没读到内容）时，那格**本来就
+    有颜料**，不能因为「没读出内容」就当成空。
+    """
+
+    return {
+        (index // BOARD_SIZE, index % BOARD_SIZE)
+        for index, tile in enumerate(tiles)
+        if tile.state == TileState.PAINT
+    }
+
+
 def installed_cells(
     previous: PuzzleState | None, current: PuzzleState | None
 ) -> tuple[tuple[int, int], ...]:
-    """本帧新落笔的格子（上一帧不是颜料、这一帧是）。"""
+    """本帧新落笔的格子（上一帧**不是颜料状态**、这一帧是）。
+
+    判据用 ``state`` 而不是「有没有读出内容」：用户 2026-11-22 实机，r1c6 那格
+    首帧 ``state=P`` 但内容没读出来，第二帧读到了 —— 旧实现（按内容判定）把它算成
+    「新落笔」，于是拿面板等级 3 去比画面 6，报出一条根本不该存在的 mismatch。
+    真正的新落笔是「上一帧这块地没有颜料」，不是「上一帧没看清」。
+    """
+
     if previous is None or current is None:
         return ()
-    return tuple(sorted(_paint_cells(current.tiles) - _paint_cells(previous.tiles)))
+    return tuple(sorted(_paint_state_cells(current.tiles) - _paint_state_cells(previous.tiles)))
 
 
 def _level(paint: Paint | None) -> int:

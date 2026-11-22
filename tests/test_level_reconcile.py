@@ -10,8 +10,13 @@ from __future__ import annotations
 import unittest
 from types import SimpleNamespace
 
+from dataclasses import replace
+
 from huahua_assistant.game_model import (
     BOARD_SIZE,
+    AffixEffect,
+    AffixRule,
+    BrushType,
     CurrentPaintRule,
     Paint,
     PaintCategory,
@@ -20,10 +25,15 @@ from huahua_assistant.game_model import (
     PuzzleState,
     Tile,
     TileState,
+    _apply_current_rule_upgrade,
+    place_current_rule_anchor,
+    tile_bonus_level,
+    tile_final_level,
 )
 from huahua_assistant.level_reconcile import (
     CellMismatch,
     ReconcileReport,
+    _cover_intermediate,
     installed_cells,
     reconcile,
 )
@@ -247,6 +257,109 @@ class SurfaceMismatchTests(unittest.TestCase):
         stub.surface(ReconcileReport(ran=True, mismatches=()))
 
         self.assertEqual("", stub.last_reconcile_notice_key)
+
+
+class InitialPaintBonusLivesOnTheTileTests(unittest.TestCase):
+    """初始颜料的加成落在**地块**上，不跟着颜料走。
+
+    用户 2026-11-22 实机口径（并更正了之前的说法「覆盖会清掉地块 buff」）：
+
+      c4r5 那格原本是 3 级怪物（M3），第三个初始颜料把作用范围内的颜料
+      「转变为同等级的随机颜料」，它变成 3 级机械之神；随后吃到第二个初始颜料
+      （横向玩法 +2）和第三个（相邻玩法 +1）的加成，最终 6 级。
+
+    关键点：加成加在地块上，所以**换了颜料这 N 级仍然在**。
+    此前模型把加成加到 ``paint.level``，颜料一被转换，加成连同旧颜料一起消失 ——
+    实测模型 3、画面 6、``breakdown`` 为空，对账天天报红。
+    """
+
+    def test_rule_upgrade_writes_tile_bonus_not_paint_level(self) -> None:
+        state = _state(
+            {(ROW, 1): Paint(PaintCategory.GAMEPLAY, 3, "赛季")},
+            upgrade=2,
+            match_current=3,
+            pending=True,  # 还没落锚点，才能放得下去
+        )
+        # 落笔那一刻就结算调色，所以直接看放置结果。
+        placed = place_current_rule_anchor(state, ROW, 0)
+        self.assertTrue(placed.success)
+
+        tile = placed.state.tile(ROW, 1)
+        self.assertEqual(3, tile.paint.level)         # 颜料自身等级没被改
+        self.assertEqual(2, tile_bonus_level(tile))   # 加成记在地块上
+        self.assertEqual(5, tile_final_level(tile))   # 最终等级照样是 5
+
+    def test_tile_bonus_survives_a_paint_being_replaced(self) -> None:
+        """加成在地块上：那格换成别的颜料，这 N 级不能丢。"""
+
+        with_bonus = _state(
+            {(ROW, 1): Paint(PaintCategory.GAMEPLAY, 3, "赛季")}, match_current=3, pending=True
+        )
+        after = place_current_rule_anchor(with_bonus, ROW, 0).state
+        self.assertEqual(2, tile_bonus_level(after.tile(ROW, 1)))
+
+        # 模拟「这格被覆盖成另一枚 3 级颜料」：只换 paint，地块加成原地不动。
+        tile = after.tile(ROW, 1)
+        replaced = replace(tile, paint=Paint(PaintCategory.GAMEPLAY, 3, "机械之神"))
+
+        self.assertEqual(2, tile_bonus_level(replaced))
+        self.assertEqual(5, tile_final_level(replaced))
+
+    def test_cover_affix_keeps_the_tile_bonus(self) -> None:
+        """覆盖类笔触改的是颜料类型，不该顺带把地块加成清零。"""
+
+        previous = _state({(ROW, 1): Paint(PaintCategory.MONSTER, 3, "伊吉")}, match_current=3)
+        tiles = list(previous.tiles)
+        index = ROW * BOARD_SIZE + 1
+        tiles[index] = replace(tiles[index], bonus_level=3)
+        previous = replace(previous, tiles=tuple(tiles))
+
+        # 画面上它已经被转成同等级的机械之神。
+        current_tiles = list(previous.tiles)
+        current_tiles[index] = replace(
+            current_tiles[index],
+            paint=Paint(PaintCategory.GAMEPLAY, 3, "机械之神"),
+            bonus_level=3,
+        )
+        current = replace(previous, tiles=tuple(current_tiles))
+
+        affix = AffixRule(
+            BrushType.TRANSFORM,
+            "将作用范围内的颜料转变为同等级的随机颜料",
+            AffixEffect.UPGRADE_IN_SCOPE,
+            amount=0,
+        )
+        intermediate = _cover_intermediate(previous, current, previous, previous.current_rule, affix)
+
+        self.assertEqual(3, tile_bonus_level(intermediate.tile(ROW, 1)))
+        self.assertEqual(6, tile_final_level(intermediate.tile(ROW, 1)))
+
+
+class ReadInIsNotANewPlacementTests(unittest.TestCase):
+    """「上一帧有颜料但没读出内容」不算新落笔。
+
+    2026-11-22 实测 r1c6：首帧 ``state=P`` 但 ``paint=None``（遮挡/动画中间态），
+    第二帧读到 ``G6-梦魇``。旧实现按「有没有读出内容」判定新落笔，于是拿面板等级 3
+    去比画面 6，报出一条根本不该存在的 mismatch。
+    """
+
+    def test_cell_with_unread_paint_is_not_installed(self) -> None:
+        previous = _state({(ROW, 1): Paint(PaintCategory.GAMEPLAY, 3, "赛季")})
+        # 同一格：上一帧状态是 PAINT 但内容没读出来
+        tiles = list(previous.tiles)
+        index = ROW * BOARD_SIZE + 1
+        tiles[index] = Tile(state=TileState.PAINT, paint=None)
+        previous = replace(previous, tiles=tuple(tiles))
+
+        current = _state({(ROW, 1): Paint(PaintCategory.GAMEPLAY, 6, "梦魇")})
+
+        self.assertEqual((), installed_cells(previous, current))
+
+    def test_truly_blank_cell_is_still_installed(self) -> None:
+        previous = _state({})
+        current = _state({(ROW, 1): Paint(PaintCategory.GAMEPLAY, 3, "赛季")})
+
+        self.assertEqual(((ROW, 1),), installed_cells(previous, current))
 
 
 if __name__ == "__main__":

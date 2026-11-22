@@ -159,6 +159,7 @@ from .learning import (
     trajectory_count,
 )
 from .level_reconcile import ReconcileReport, reconcile as reconcile_levels
+from .level_smoothing import LevelStabilizer
 from .models import BoardObservation, BrushOptionsObservation, PaintCategory, PaintDirection, PaintObject, Rect, RegionKind, SceneObservation, TileObservation, TileState
 from .mouse_monitor import MouseClickMonitor
 from .outcome_learning import decision_records_from_steps
@@ -379,6 +380,9 @@ class HuahuaApp(tk.Tk):
         self.level_reconcile: ReconcileReport = ReconcileReport()
         #: 已经提醒过的对账差异集合。同一笔每帧都会重算，靠它做到「变了才提醒」。
         self.last_reconcile_notice_key = ""
+        #: 棋盘等级/种类的时序稳定器。挡「点击地块后浮窗遮挡」造成的 1↔7 抖动，
+        #: 并在本局结算后冻结（等级与种类不再变化）。
+        self.level_stabilizer = LevelStabilizer()
         self.last_quick_step_key: str | None = None
         self.pending_tentative_step: dict | None = None
         self.pending_tentative_signature: str | None = None
@@ -2102,6 +2106,21 @@ class HuahuaApp(tk.Tk):
                 return max(0, int(getattr(affix, "amount", 0) or 0))
         return 0
 
+    def _stabilize_scene(self, scene: SceneObservation) -> SceneObservation:
+        """棋盘等级/种类过一遍时序稳定（见 :mod:`level_smoothing`）。
+
+        用户 2026-11-22：点击地块看加成时浮窗会挡住格子，等级读数在 1↔7、3↔6
+        之间抖。抖动帧一旦进模型，会同时污染观测、对账和地块加成反推。
+        """
+
+        try:
+            board = self.level_stabilizer.observe(scene.board)
+        except Exception:  # 稳定器出问题不能连累采集，宁可这帧不平滑
+            return scene
+        if board is scene.board:
+            return scene
+        return replace(scene, board=board)
+
     def _surface_level_mismatch(self, report: ReconcileReport) -> None:
         """模型和画面不一致时，把结论顶到状态栏和提示条。
 
@@ -2310,6 +2329,7 @@ class HuahuaApp(tk.Tk):
         self.backpack_frame_visible = bool(scene.backpack and scene.backpack.paints)
         self.manual_correction_applied = False
         previous_state = self.current_state
+        scene = self._stabilize_scene(scene)
         self.current_state = state_from_observation(
             scene.board, scene.current_paint, backpack, previous=previous_state
         )
@@ -2450,6 +2470,9 @@ class HuahuaApp(tk.Tk):
         self._maybe_start_new_run_from_board(scene, trigger="board_changed_after_finish")
 
         previous_scene = self.current_scene
+        # 稳定化要在写入 current_scene **之前**做：后面所有判断（落子识别、对账、
+        # 观测落盘）都读 current_scene，晚一步就会用抖动值算一遍再丢。
+        scene = self._stabilize_scene(scene)
         self.current_scene = scene
         previous_state = self.current_state
         previous_backpack_visible = bool(previous_scene and previous_scene.backpack and previous_scene.backpack.paints)
@@ -2736,6 +2759,9 @@ class HuahuaApp(tk.Tk):
                 return False
         if finished_before and _looks_like_new_run(scene, self.last_real_capture_step):
             self.start_new_real_session(record_event=True)
+            # 新一局：等级稳定器清空历史并解除冻结，否则上一局的「已确认等级」
+            # 会被当成这一局的基准，新画纸上的读数全被按旧值顶回去。
+            self.level_stabilizer.reset()
             record_observation(
                 "new_run_detected",
                 {"trigger": trigger, "board": board},
@@ -3097,6 +3123,10 @@ class HuahuaApp(tk.Tk):
         # 统计和轨迹都变了：让后台算完后把界面上的数字和推荐排序换掉。
         self._schedule_learning_stats_refresh()
         self.real_session_finished = True
+        # 本局已经结算：颜料等级和种类从此不该再变（只有加成可能还在变）。
+        # 用户 2026-11-22 要求「本局完成后颜料等级和种类不再变化」——结算后还让
+        # 抖动读数改写终局盘面，会把已经入库的成绩和轨迹一起改坏。
+        self.level_stabilizer.freeze()
         return saved, score
 
     def _intern_board(self, step: dict) -> str:

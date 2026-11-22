@@ -14,3 +14,11 @@ _*.py
 # 工具链本地配置
 opencode.json
 .workbuddy-ai/
+
+# 逆向解包临时目录：几万个 .uasset/.uexp/.oodle，一次 add 就能把仓库塞爆。
+# 2026-11-22 实测：`git add -A` 把 28186 个文件塞进一个提交。
+.workbuddy/
+_repak/
+
+# 一次性截帧/探针产物
+huahua_ocr_*.bmp

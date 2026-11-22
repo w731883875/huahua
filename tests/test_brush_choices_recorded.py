@@ -110,6 +110,49 @@ class BrushChoiceRecordingTests(unittest.TestCase):
     def _events(self, name: str) -> list[dict]:
         return [event for event in self.recorder._events if event["event"] == name]
 
+    def test_click_while_awaiting_affix_is_not_a_stage1_click(self) -> None:
+        """等词缀定案时，面板上的点击归阶段二，不能算成阶段一选卡。
+
+        实机 2026-11-22 20:36：+131.7s 阶段二弹出（扩散两条词缀），+136.6s
+        面板刚关闭那一帧又落了一次点击。那帧 ``stage2_options`` 已空、
+        ``stage1_options`` 还是 ``['spread']``，点击被阶段一支路抢走，
+        真正那条词缀点击丢失，最后只能落一条 ``affix_choice_unresolved``。
+        """
+
+        tiles = [_blank_tile(index) for index in range(36)]
+        stage2 = ("横向随机阻挡地块变为空白地块", "当前颜料可放置在虚空地块但失去自身内容")
+        # 阶段二可见
+        _feed(
+            self.recorder,
+            _snapshot(
+                tiles,
+                brush=_brush(stage1_options=("spread",), chosen_stage1="spread", stage2_options=stage2),
+            ),
+            800.0,
+        )
+        # 面板关闭（stage2 从有变无）→ 产生 pending
+        _feed(
+            self.recorder,
+            _snapshot(tiles, brush=_brush(stage1_options=("spread",), chosen_stage1="spread")),
+            802.0,
+        )
+        self.assertIsNotNone(self.recorder._pending_affix, "面板关闭后应当进入 waiter 状态")
+
+        # 再落一次点击（面板刚关那一帧）
+        self.recorder.process(
+            _snapshot(tiles, brush=_brush(stage1_options=("spread",), chosen_stage1="spread")),
+            observed_at=803.0,
+            clicks=((802.95, 160.0, 70.0),),
+        )
+
+        stage1_clicks = self._events("brush_stage1_card_clicked")
+        self.assertEqual([], stage1_clicks, "这一下不能被记成阶段一选卡")
+        self.assertTrue(
+            any(abs(at - 802.95) < 0.01 for _x, _y, at in self.recorder._buffered_panel_clicks)
+            or self.recorder._clicked_affix is not None,
+            "这一下应当被留作阶段二定案用",
+        )
+
     def test_narrowing_to_one_card_settles_the_choice(self) -> None:
         """用户 2026-11-22 19:40 那局的四次选择，按「窄化」全中。
 

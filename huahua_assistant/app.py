@@ -2347,12 +2347,17 @@ class HuahuaApp(tk.Tk):
         self._clear_brush_choice()
         self._apply_detected_brush_options(scene.brush_options)
         recommendation_started_at = time.perf_counter()
-        self.recommendations = recommend_placements(
-            self.current_state,
-            include_lookahead=False,
-            learning_stats=self._learning_stats_cache,
-        )
-        self.install_plan = recommend_install_plan(self.current_state)
+        if recording_mode_enabled():
+            # 记录模式：推荐一律不算（见 recording_mode_enabled 的注释）。
+            self.recommendations = []
+            self.install_plan = None
+        else:
+            self.recommendations = recommend_placements(
+                self.current_state,
+                include_lookahead=False,
+                learning_stats=self._learning_stats_cache,
+            )
+            self.install_plan = recommend_install_plan(self.current_state)
         recommendation_elapsed = time.perf_counter() - recommendation_started_at
         self._update_fast_snapshot(snapshot_from_scene(scene, self.current_state))
         self._update_perf_panel(
@@ -2505,12 +2510,18 @@ class HuahuaApp(tk.Tk):
         self.last_rule_anomalies = []
         self._merge_quick_brush_stage2(scene.brush_options)
         recommendation_started_at = time.perf_counter()
-        self.recommendations = recommend_placements(
-            self.current_state,
-            include_lookahead=False,
-            learning_stats=self._learning_stats_cache,
-        )
-        self.install_plan = recommend_install_plan(self.current_state)
+        if recording_mode_enabled():
+            # 记录模式：推荐一律不算。这一对每帧要花几十到几百毫秒（含 lookahead
+            # 之外的打分与安装计划求解），录数据时没有任何用处。
+            self.recommendations = []
+            self.install_plan = None
+        else:
+            self.recommendations = recommend_placements(
+                self.current_state,
+                include_lookahead=False,
+                learning_stats=self._learning_stats_cache,
+            )
+            self.install_plan = recommend_install_plan(self.current_state)
         recommendation_elapsed = time.perf_counter() - recommendation_started_at
         quick_quality = _quick_capture_quality(scene, elapsed, capture_perf, capture_source=capture_source)
         self.last_capture_quality = quick_quality
@@ -2518,7 +2529,9 @@ class HuahuaApp(tk.Tk):
             snapshot_from_scene(scene, self.current_state),
             evaluate_pet=False,
         )
-        self.last_pet_state = evaluate_pet_state(self)
+        # 桌宠决策在记录模式下也跳过：evaluate_pet_state 会调 recommend_brush_types /
+        # recommend_affixes，同样是白烧（用户 2026-11-22：记录模式不要任何推荐）。
+        self.last_pet_state = None if recording_mode_enabled() else evaluate_pet_state(self)
         self._update_perf_panel(
             mode="自动跟随" if auto else "快速获取",
             elapsed=elapsed,
@@ -2706,13 +2719,17 @@ class HuahuaApp(tk.Tk):
 
         state = self.current_state
         if (
-            state is not None
+            not recording_mode_enabled()
+            and state is not None
             and current_rule_is_pending(state)
             and scenario is not None
             and self.selected_brush_type is not None
             and scenario.stage2_options
             and self.selected_affix is None
         ):
+            # 注意：这是**猜**——拿「推荐排序第一」当玩家选了哪条词缀。记录模式里
+            # 一律不猜（用户 2026-11-22：记录模式不要任何推荐）。坐实的选择靠
+            # run_recorder 的 affix_card_clicked / 窄化判定。
             recommendations = recommend_affixes(state, scenario.stage2_options)
             if recommendations:
                 inferred_affix = recommendations[0].affix
@@ -9020,6 +9037,20 @@ def _merge_fast_rule_state(
         ),
         observed_scope_cells=state.observed_scope_cells or previous_state.observed_scope_cells,
     )
+
+
+def recording_mode_enabled() -> bool:
+    """记录模式：只录数据，不算任何推荐。
+
+    用户 2026-11-22 明确要求：「现在是记录模式，不是推荐模式，任何推荐的都需要
+    关掉！不要浪费不必要的时间」。
+
+    管的是**主采集路径的计算**（``recommend_placements`` / ``recommend_install_plan``
+    / ``recommend_affixes``）——每帧几十到几百毫秒，纯属白烧。
+    和 ``pet.recommendations`` 不是一回事：那个只管桌宠浮层画不画标记。
+    """
+
+    return bool(config_value("recording_mode", False))
 
 
 def _state_for_visible_brush_panel(

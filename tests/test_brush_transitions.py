@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from huahua_assistant.app import HuahuaApp, _state_for_visible_brush_panel
 from huahua_assistant.game_model import (
@@ -188,11 +189,51 @@ class BrushTransitionTests(unittest.TestCase):
 
         app._merge_quick_brush_stage2(None)
         self.assertIsNotNone(app.brush_scenario)
-        app._merge_quick_brush_stage2(None)
+        # 记录模式（默认开）下不猜词缀，见 recording_mode_enabled 的注释；
+        # 这里模拟「非记录模式」，验证旧的猜测路径还在。
+        with patch("huahua_assistant.app.recording_mode_enabled", return_value=False):
+            app._merge_quick_brush_stage2(None)
 
         self.assertIsNone(app.brush_scenario)
         self.assertIsNotNone(app.selected_affix)
         self.assertTrue(recommend_placements(app.current_state))
+
+    def test_recording_mode_does_not_guess_the_affix(self) -> None:
+        """记录模式绝不能靠「推荐排序第一」去猜玩家选了哪条词缀。
+
+        用户 2026-11-22 明确要求：「现在是记录模式，不是推荐模式，任何推荐的都需要
+        关掉」。猜错比留空更糟——留空时下游知道「这条没坐实」，猜错就成了假数据。
+        """
+
+        app = _BrushHarness()
+        app.current_state = _pending_state()
+        app.brush_scenario = None
+        app.selected_brush_type = None
+        app.selected_affix = None
+        app.selected_backpack_index = None
+        app.brush_stage1_rects = {}
+        app.brush_affix_rects = {}
+        app._brush_panel_absent_frames = 0
+        app._last_brush_observation = None
+        app._brush_stage1_vote_observations = []
+        app.status_var = SimpleNamespace(set=lambda _value: None)
+
+        stack_affixes = tuple(
+            affix.name
+            for affix in build_affix_catalog()
+            if affix.brush_type == BrushType.STACK
+        )[:2]
+        app._merge_quick_brush_stage2(
+            _observation(
+                stage1=(BrushType.STACK.value,),
+                chosen=BrushType.STACK.value,
+                stage2=stack_affixes,
+            )
+        )
+        app._merge_quick_brush_stage2(None)
+        app._merge_quick_brush_stage2(None)
+
+        self.assertIsNone(app.selected_affix, "记录模式不得凭空猜一条词缀")
 
 
 if __name__ == "__main__":

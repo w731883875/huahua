@@ -98,6 +98,15 @@ DEFAULT_STRATEGY_CONFIG: dict[str, Any] = {
         # 只是叠在游戏画面上的浮层，默认开等于默认挡视线。
         "recommendations": False,
     },
+    # 记录模式：一局一局打、只把数据录下来，不需要任何建议。
+    #
+    # 2026-11-22 用户明确要求：「现在是记录模式，不是推荐模式，任何推荐的都需要
+    # 关掉！不要浪费不必要的时间」。开成 True 后主采集路径**不再计算**
+    # recommend_placements / recommend_install_plan / recommend_affixes，
+    # 这些每帧要花几十到几百毫秒，纯粹白烧。
+    # 注意和 ``pet.recommendations`` 的区别：那个只管桌宠浮层画不画标记，
+    # 管不到主路径的计算；这个才是总闸门。
+    "recording_mode": True,
     "debug": {
         "save_fast_captures": False,
     },

@@ -44,7 +44,12 @@ PENDING_CLICK_BUFFER_MAX = 4
 PENDING_CLICK_BUFFER_SECONDS = 8.0
 
 #: 「点卡片 + 点确认」两下算一次选择：同一条卡在这个秒数内连点两下，只记第一下。
-CONFIRM_DEDUPE_SECONDS = 3.0
+#:
+#: 3 秒太短：2026-11-22 20:35 那局实测两次同序号点击间隔 4.7 秒
+#: （+63.2s 与 +67.9s 都是 ``范围内随机1个颜料提升1级``），于是同一次选择被
+#: 记成了两条 ``affix_card_clicked``，污染整局数据。玩家看完文字再点确认，
+#: 4~6 秒很正常，所以放到 6。
+CONFIRM_DEDUPE_SECONDS = 6.0
 
 #: 开局时棋盘上自带的颜料块数。
 #:
@@ -1390,6 +1395,20 @@ class AutomaticRunRecorder:
                             clicked_at,
                         )
                     )
+                    continue
+            # 正在等词缀生效定案时，面板上的点击归**阶段二**，不能算成阶段一选卡。
+            #
+            # 2026-11-22 20:36 那局实测：+131.7s 阶段二弹出（扩散两条词缀），
+            # +136.6s 面板刚关闭那一帧又落了一次点击，而那时 ``stage2_options``
+            # 已经空、``stage1_options`` 还是 ``['spread']``，于是被下面的阶段一
+            # 支路抢走记成了「选了扩散」——真正的那条词缀点击就此丢失，
+            # 最后只能落一条 ``affix_choice_unresolved``（confidence 0.35）。
+            # 有 pending 就说明「这一屏是词缀屏」，先存坐标，等面板关闭时回填定案。
+            if self._pending_affix is not None:
+                panel_rect = brush.panel_rect if brush is not None else self._last_panel_rect
+                if panel_rect is not None and _point_in_rect(x, y, panel_rect):
+                    self._buffered_panel_clicks.append((x, y, clicked_at))
+                    del self._buffered_panel_clicks[:-PENDING_CLICK_BUFFER_MAX]
                     continue
             if brush is not None and brush.stage1_options and _point_in_rect(x, y, brush.panel_rect):
                 # 阶段一同样是**上下排列**（用户 2026-11-22 明确纠正：不是横排三张）。

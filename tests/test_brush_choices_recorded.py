@@ -110,6 +110,79 @@ class BrushChoiceRecordingTests(unittest.TestCase):
     def _events(self, name: str) -> list[dict]:
         return [event for event in self.recorder._events if event["event"] == name]
 
+    def test_narrowing_to_one_card_settles_the_choice(self) -> None:
+        """用户 2026-11-22 19:40 那局的四次选择，按「窄化」全中。
+
+        用户按「阶段一位次」报的答案：
+            第2次 #2、第3次 #1、第4次 #2
+        对应的面板变化：
+            [转锋,扩散] → [扩散]   → 扩散（第 2 张）
+            [转锋,堆砌] → [转锋]   → 转锋（第 1 张）
+            [转锋,堆砌] → [堆砌]   → 堆砌（第 2 张）
+
+        同一局第 3 次里，按点击坐标会算成 idx=1（堆砌）——那一下其实是「确认」。
+        窄化比坐标硬。
+        """
+
+        cases = [
+            (("transform", "spread"), "spread", 1),
+            (("transform", "stack"), "transform", 0),
+            (("transform", "stack"), "stack", 1),
+        ]
+        tiles = [_blank_tile(index) for index in range(36)]
+        for offset, (options, expected, index) in enumerate(cases):
+            with self.subTest(options=options, expected=expected):
+                base = 500.0 + offset * 100
+                _feed(self.recorder, _snapshot(tiles, brush=_brush(stage1_options=options)), base)
+                self.recorder.process(
+                    _snapshot(tiles, brush=_brush(stage1_options=(expected,), chosen_stage1=expected)),
+                    observed_at=base + 2.0,
+                )
+
+                selected = [
+                    event
+                    for event in self._events("brush_stage1_selected")
+                    if event["payload"]["selected"] == expected
+                ]
+                self.assertTrue(selected, f"应当记到选中 {expected}")
+                payload = selected[-1]["payload"]
+                self.assertEqual(index, payload["card_index"])
+                self.assertEqual("narrowed", payload["source"])
+
+    def test_narrowing_overrides_a_wrong_confirm_click(self) -> None:
+        """确认按钮被算成「点了下面那张卡」时，窄化必须把它纠正回来。
+
+        实机 19:40:24 点了转锋（idx=0），19:40:26 点确认被算成 idx=1（堆砌），
+        随后列表窄化成 [转锋]。正确答案是转锋。
+        """
+
+        tiles = [_blank_tile(index) for index in range(36)]
+        panel = _brush(stage1_options=("transform", "stack"))
+        _feed(self.recorder, _snapshot(tiles, brush=panel), 700.0)
+
+        # 先点上面那张（转锋）
+        self.recorder.process(
+            _snapshot(tiles, brush=panel),
+            observed_at=700.3,
+            clicks=((700.25, 160.0, 70.0),),
+        )
+        # 再点「确认」，被几何算成下面那张（堆砌）
+        self.recorder.process(
+            _snapshot(tiles, brush=panel),
+            observed_at=702.0,
+            clicks=((701.95, 160.0, 220.0),),
+        )
+        # 面板窄化成只剩转锋
+        self.recorder.process(
+            _snapshot(tiles, brush=_brush(stage1_options=("transform",), chosen_stage1="transform")),
+            observed_at=702.4,
+        )
+
+        settled = self._events("brush_stage1_selected")
+        self.assertTrue(settled)
+        self.assertEqual("transform", settled[-1]["payload"]["selected"])
+        self.assertEqual("narrowed", settled[-1]["payload"]["source"])
+
     def test_stage1_options_are_recorded_once_per_panel(self) -> None:
         tiles = [_blank_tile(index) for index in range(36)]
         _feed(self.recorder, _snapshot(tiles, brush=_brush(stage1_options=("transform", "stack", "spread"))), 200.0)

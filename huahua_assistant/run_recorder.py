@@ -1150,23 +1150,41 @@ class AutomaticRunRecorder:
             )
         chosen_before = before.chosen_stage1 if before is not None else None
         chosen_after = after.chosen_stage1 if after is not None else None
+        # 「列表从多张窄化成一张」= 那张就是确认后的选择。
+        #
+        # 用户 2026-11-22 19:40 那局按「阶段一位次」报的答案，与三条独立记录对照：
+        #   [转锋,扩散] → [扩散]  : 用户第 2 次报 #2 = 扩散 ✓
+        #   [转锋,堆砌] → [转锋]  : 用户第 3 次报 #1 = 转锋 ✓
+        #   [转锋,堆砌] → [堆砌]  : 用户第 4 次报 #2 = 堆砌 ✓
+        # 三次全中。而同一局第 3 次按点击坐标会算成 idx=1（堆砌）——那一下其实是
+        # 「确认」按钮落在下面那张卡的位置上。所以窄化比坐标硬，用它定案。
+        narrowed = (
+            len(before_stage1) > 1
+            and len(after_stage1) == 1
+            and after_stage1[0] in before_stage1
+        )
+        if narrowed:
+            self._clicked_stage1 = (after_stage1[0], now, before_stage1.index(after_stage1[0]))
+        settled = after_stage1[0] if narrowed else chosen_after
         if (
-            chosen_after
-            and chosen_after != chosen_before
+            settled
+            and settled != chosen_before
             and self._stage1_reported != after_stage1
         ):
             clicked = self._clicked_stage1
-            from_click = clicked is not None and clicked[0] == chosen_after
+            from_click = clicked is not None and clicked[0] == settled
             self._stage1_reported = after_stage1
             emitted.append(
                 self._emit(
                     "brush_stage1_selected",
                     {
-                        "selected": chosen_after,
-                        "selected_name": _brush_name(chosen_after),
-                        "code": brush_code(chosen_after),
+                        "selected": settled,
+                        "selected_name": _brush_name(settled),
+                        "code": brush_code(settled),
                         "options": list(after_stage1 or before_stage1),
-                        "source": "captured_click" if from_click else "card_highlight",
+                        "source": (
+                            "narrowed" if narrowed else ("captured_click" if from_click else "card_highlight")
+                        ),
                         "card_index": clicked[2] if from_click else None,
                         "stage2_options": list(after_stage2),
                     },

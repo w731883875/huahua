@@ -351,6 +351,14 @@ class AutomaticRunRecorder:
         self._terrain_conflict: dict[tuple[int, int], tuple[str, str, int]] = {}
         #: 已经报过 `terrain_conflict_held` 的 (格子, 观察值)，同一对只报一次。
         self._terrain_conflict_reported: set[tuple] = set()
+        #: 已经**定案**过的 ``(格子, 新值)``。定案后再反向抖回来不再重复报
+        #: ``terrain_conflict_resolved``：那一格就是读不稳，反复报只是在刷日志。
+        #:
+        #: 2026-11-22 21:55 那局实测：``r4c0 void→blocked`` 报了 **57 次**，
+        #: 占掉整局 151 条事件的三分之一，真正的内容全被淹了。原因是
+        #: resolved 之后基准已变成 blocked，下一帧又读回 void 就成了反向冲突，
+        #: 再等 2 帧又 resolved —— 一个来回就是一条，循环不止。
+        self._terrain_conflict_settled: set[tuple] = set()
         #: 每格等级状态 ``{(row, col): (kind, level, pending_level, pending_count)}``。
         #: 见 :data:`LEVEL_CHANGE_CONFIRM_FRAMES`——**升和降一视同仁**，都要连续
         #: 若干帧读到同一新值才生效。绝不写死「只升不降」：随机颜料 / 同内容颜料
@@ -570,6 +578,7 @@ class AutomaticRunRecorder:
         #: 上一局的旧读数压住（棋盘已经重排，同一坐标根本不是同一块地）。
         self._terrain_conflict = {}
         self._terrain_conflict_reported = set()
+        self._terrain_conflict_settled = set()
         self._scene_swap_frames = 0
         self._frame_unreliable = False
         self._subtype_votes = {}
@@ -771,6 +780,8 @@ class AutomaticRunRecorder:
                 conflicted.append((tile, old))
         if not conflicted:
             # 这一帧没有任何地形对调：冲突计数全部作废（格子已被颜料覆盖/换成别的东西）。
+            # ``_terrain_conflict_settled`` 不清：它记的是「这一格这一局已经定案成什么」，
+            # 清了就又会重新开始刷 resolved。
             self._terrain_conflict.clear()
             self._terrain_conflict_reported.clear()
             return snapshot, []
@@ -799,6 +810,12 @@ class AutomaticRunRecorder:
                 # 连续同向：认了。这一帧原样放行，`_record_transition` 会把它记成地形变化。
                 self._terrain_conflict.pop(key, None)
                 tiles.append(tile)
+                settled = (key, observed)
+                if settled in self._terrain_conflict_settled:
+                    # 这一格之前就定案成同一个值了：说明它在两个值之间来回抖，
+                    # 再报一遍只是刷日志（2026-11-22 实测刷了 57 条）。放行但不报。
+                    continue
+                self._terrain_conflict_settled.add(settled)
                 events.append(
                     self._emit(
                         "terrain_conflict_resolved",

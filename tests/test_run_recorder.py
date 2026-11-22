@@ -319,6 +319,30 @@ class AutomaticRunRecorderTests(unittest.TestCase):
         )
         self.assertIn("run_finished", result.events)
 
+    def test_flapping_terrain_conflict_is_reported_once(self) -> None:
+        """一格在两个值之间来回抖，``terrain_conflict_resolved`` 只报一次。
+
+        2026-11-22 21:55 那局实测：``r4c0 void→blocked`` 报了 **57 次**，占掉
+        整局 151 条事件的三分之一。原因是 resolved 之后基准已变成 blocked，
+        下一帧又读回 void 就成了反向冲突，再等 2 帧又 resolved，循环不止。
+        """
+
+        recorder = AutomaticRunRecorder(path=None, stable_frames=1)
+        tiles = [_blank_tile(index) for index in range(36)]
+        recorder.process(_snapshot(tiles, current=_current()), observed_at=1000.0)
+
+        # 让 r4c0 在 void / blocked 之间来回抖 12 次
+        for step in range(12):
+            board = list(tiles)
+            state = TileState.BLOCKED.value if step % 2 == 0 else TileState.VOID.value
+            board[24] = _blank_tile(24, state)
+            recorder.process(_snapshot(board, current=_current()), observed_at=1000.5 + step * 0.2)
+
+        resolved = [
+            event for event in recorder._events if event["event"] == "terrain_conflict_resolved"
+        ]
+        self.assertLessEqual(len(resolved), 2, f"同一格抖动不该反复上报，实际 {len(resolved)} 条")
+
     def test_initial_single_paint_is_not_mid_run_attach(self) -> None:
         """开局自带 1 块初始颜料，看到 1 块就接入不算「中途接入」。"""
         recorder = AutomaticRunRecorder(path=None, stable_frames=1)

@@ -137,6 +137,7 @@ from .game_model import (
 )
 from .learning import (
     LAST_PERSIST_TIMING,
+    cached_learning_stats,
     export_learning_bundle,
     load_learning_stats,
     lowest_trajectory_score,
@@ -2919,6 +2920,8 @@ class HuahuaApp(tk.Tk):
             self.last_finished_board_states = str(
                 _compact_board_summary(self.current_scene).get("states") or ""
             )
+        # 统计和轨迹都变了：让后台算完后把界面上的数字和推荐排序换掉。
+        self._schedule_learning_stats_refresh()
         self.real_session_finished = True
         return saved, score
 
@@ -3626,6 +3629,8 @@ class HuahuaApp(tk.Tk):
         saved = record_high_score_trajectory(payload, source="real_capture")
         if saved:
             self.last_auto_trajectory_key = payload_key
+            # 统计在后台算，算完把界面上的数字换掉（以前只在启动时算过一次）。
+            self._schedule_learning_stats_refresh()
         return saved
 
     def _ensure_initial_snapshot(self, step: dict) -> None:
@@ -4361,6 +4366,8 @@ class HuahuaApp(tk.Tk):
             suffix = "，已应用到当前局面" if applied else "，仅记录未应用"
             self.status_var.set(f"已保存真实识别纠错：{len(changed)} 个字段变化{suffix}")
             self._refresh_after_correction()
+            # 纠错也会进统计（后台算），算完把界面数字换掉。
+            self._schedule_learning_stats_refresh()
             window.destroy()
 
         button_row = len(fields) + 4
@@ -4431,6 +4438,58 @@ class HuahuaApp(tk.Tk):
         )
         self.selected_brush_type = chosen if stage2 else None
         self.selected_affix = None
+
+    def _sync_learning_stats(self) -> bool:
+        """把后台刚算好的统计换进来，返回「换到了新的一份」。
+
+        绝不在这里现算：算一次要 1.8 秒（几乎全在 ``build_outcome_risk_report``），
+        主线程等不起。后台线程算完会回填 ``learning`` 的内存缓存，这里只是取指针。
+        """
+        fresh = cached_learning_stats()
+        if fresh is None or fresh is self._learning_stats_cache:
+            return False
+        self._learning_stats_cache = fresh
+        return True
+
+    def _schedule_learning_stats_refresh(self, attempts: int = 6, delay_ms: int = 700) -> None:
+        """收尾后隔一会儿再看统计算好没有。
+
+        为什么要等：``_write_stats`` 现在是后台线程，一局收尾后它还要跑 1.8 秒左右。
+        立刻去看必然是旧的，所以按小步重试几次；拿到就停，拿不到就算了——
+        刷新界面上的数字不值得为它卡住任何东西。
+        """
+        try:
+            self.after(delay_ms, lambda: self._learning_stats_refresh_tick(attempts, delay_ms))
+        except Exception:  # noqa: BLE001 - 窗口正在销毁时 after 会抛
+            pass
+
+    def _learning_stats_refresh_tick(self, attempts: int, delay_ms: int) -> None:
+        if self._sync_learning_stats():
+            self._apply_learning_stats_to_ui()
+            return
+        if attempts > 1:
+            try:
+                self.after(delay_ms, lambda: self._learning_stats_refresh_tick(attempts - 1, delay_ms))
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _apply_learning_stats_to_ui(self) -> None:
+        """统计换了之后把界面上依赖它的东西重画一遍。
+
+        以前这里没人做，于是 ``_learning_stats_cache`` 只在启动时算过一次：
+        打完一局不重启，界面上的统计数字、风险提示、推荐排序全都停在开机那一刻。
+        """
+        try:
+            self._write_learning_stats()
+            self._write_current_terrain_bucket_hint()
+        except Exception:  # noqa: BLE001 - 刷数字不能影响主流程
+            pass
+        # 推荐排序本身就吃 learning_stats，有局面就按新统计重排一次。
+        if self.current_state is not None:
+            try:
+                self._refresh_after_correction()
+            except Exception:  # noqa: BLE001
+                pass
 
     def _refresh_after_correction(self) -> None:
         if self.current_state is None:

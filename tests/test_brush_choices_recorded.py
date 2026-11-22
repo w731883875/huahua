@@ -331,6 +331,55 @@ class BrushChoiceRecordingTests(unittest.TestCase):
         self.assertEqual(1, len(clicked))
         self.assertEqual(1, clicked[0]["payload"]["card_index"])
 
+    def test_click_below_the_cards_is_a_confirm_not_a_card(self) -> None:
+        """确认按钮的点击不能算成「选了最后一张卡」。
+
+        实机 2026-11-22 22:37 实测：``CARD_SLOTS`` 里两张卡占
+        ``0.108~0.488`` / ``0.520~0.900``，确认按钮在其下（0.92~0.98）。
+        旧映射 ``int(relative_y * count)`` 把 0.94 算成 ``int(1.88) = 1``，
+        于是同一次确认先落一条 ``brush_stage1_card_clicked idx=1``（stack），
+        而窄化出来的真值是卡 1（transform），两处对不上。
+        """
+
+        tiles = [_blank_tile(index) for index in range(36)]
+        # panel_rect = (100, 40, 300, 200)：卡 2 底边 0.900 → y=220；确认在 y>222。
+        panel = _brush(stage1_options=("transform", "stack"))
+        _feed(self.recorder, _snapshot(tiles, brush=panel), 400.0)
+
+        self.recorder.process(
+            _snapshot(tiles, brush=panel),
+            observed_at=400.5,
+            clicks=((400.45, 160.0, 228.0),),  # relative_y = 0.94
+        )
+
+        self.assertEqual([], self._events("brush_stage1_card_clicked"), "确认按钮不是选卡")
+
+    def test_both_stage1_cards_are_reachable(self) -> None:
+        """两张卡的点击都要记到正确的序号（分带边界按实测版式）。"""
+
+        tiles = [_blank_tile(index) for index in range(36)]
+        panel = _brush(stage1_options=("transform", "stack"))
+        _feed(self.recorder, _snapshot(tiles, brush=panel), 420.0)
+
+        # 卡 1 中心 relative_y≈0.30 → y=100；卡 2 中心 relative_y≈0.71 → y=182
+        self.recorder.process(
+            _snapshot(tiles, brush=panel),
+            observed_at=420.5,
+            clicks=((420.45, 160.0, 100.0),),
+        )
+        self.recorder.process(
+            _snapshot(tiles, brush=panel),
+            observed_at=428.5,
+            clicks=((428.45, 160.0, 182.0),),
+        )
+
+        clicked = self._events("brush_stage1_card_clicked")
+        self.assertEqual(2, len(clicked))
+        self.assertEqual(0, clicked[0]["payload"]["card_index"])
+        self.assertEqual("transform", clicked[0]["payload"]["selected"])
+        self.assertEqual(1, clicked[1]["payload"]["card_index"])
+        self.assertEqual("stack", clicked[1]["payload"]["selected"])
+
     def test_stage1_choice_read_from_highlight_is_marked_as_such(self) -> None:
         tiles = [_blank_tile(index) for index in range(36)]
         _feed(self.recorder, _snapshot(tiles, brush=_brush(stage1_options=("transform", "stack"))), 400.0)

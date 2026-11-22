@@ -49,6 +49,29 @@ PENDING_CLICK_BUFFER_SECONDS = 8.0
 #: （+63.2s 与 +67.9s 都是 ``范围内随机1个颜料提升1级``），于是同一次选择被
 #: 记成了两条 ``affix_card_clicked``，污染整局数据。玩家看完文字再点确认，
 #: 4~6 秒很正常，所以放到 6。
+#: 确认按钮所在的纵带下界（相对面板高度的比例）。**超过它的点击不是选卡**。
+#:
+#: 依据是实测版式 :data:`huahua_assistant.brush_panel.CARD_SLOTS`：
+#: 卡 1 占 ``0.108~0.488``、卡 2 占 ``0.520~0.900``，两张卡都止于 0.900。
+#: 确认按钮在那之下。
+#:
+#: 为什么必须有这一条（2026-11-22 22:37 那局实测）：阶段一按
+#: ``int(relative_y * count)`` 分带，确认按钮落在 0.92~0.98，
+#: ``int(0.94*2)=1`` → 被算成「选了卡 2」。同一次确认于是先记一条
+#: ``brush_stage1_card_clicked idx=1``，而窄化出来的真值是卡 1，两处对不上。
+#:
+#: 之前用「排除确认按钮矩形 ``y+0.80h~0.91h``」修过，但那个矩形是几何估算的，
+#: 下沿 0.91h 压住了卡 2 的 0.900，把「点下面那张卡」一起吃掉了
+#: （2026-11-22 17:21 整局 0 条 affix_card_clicked）。所以阈值要卡在卡 2 下沿
+#: **之上**：0.91 只到 0.91，碰不到 0.900。
+CARD_CONFIRM_ZONE_TOP = 0.91
+
+#: 「点卡片 + 点确认」两下算一次选择：同一条卡在这个秒数内连点两下，只记第一下。
+#:
+#: 3 秒太短：2026-11-22 20:35 那局实测两次同序号点击间隔 4.7 秒
+#: （+63.2s 与 +67.9s 都是 ``范围内随机1个颜料提升1级``），于是同一次选择被
+#: 记成了两条 ``affix_card_clicked``，污染整局数据。玩家看完文字再点确认，
+#: 4~6 秒很正常，所以放到 6。
 CONFIRM_DEDUPE_SECONDS = 6.0
 
 #: 「棋盘上没有空白格」不能用来结束一局的最短局龄（秒）。
@@ -1444,6 +1467,9 @@ class AutomaticRunRecorder:
         for clicked_at, x, y in clicks:
             if brush is not None and brush.stage2_options and _point_in_rect(x, y, brush.panel_rect):
                 relative_y = (y - brush.panel_rect.y) / max(1, brush.panel_rect.h)
+                if relative_y > CARD_CONFIRM_ZONE_TOP:
+                    # 落在两张卡（底边 0.900）之下的确认按钮上：这不是选卡。
+                    continue
                 index = 0 if relative_y < 0.52 else 1
                 if 0 <= index < len(brush.stage2_options):
                     name = brush.stage2_options[index]
@@ -1472,6 +1498,9 @@ class AutomaticRunRecorder:
                                 "brush": brush.chosen_stage1,
                                 "brush_name": _brush_name(brush.chosen_stage1),
                                 "confidence": 0.99,
+                                "click_y": round(y, 1),
+                                "relative_y": round(relative_y, 4),
+                                "panel_height": round(brush.panel_rect.h, 1),
                             },
                             clicked_at,
                         )
@@ -1498,6 +1527,9 @@ class AutomaticRunRecorder:
                 #   * 点上面那张卡时用 X 反推索引，与真实位置无关，等于随机。
                 # 现在改成按 Y 分带，和阶段二同一套几何。
                 relative_y = (y - brush.panel_rect.y) / max(1, brush.panel_rect.h)
+                if relative_y > CARD_CONFIRM_ZONE_TOP:
+                    # 落在两张卡（底边 0.900）之下的确认按钮上：这不是选卡。
+                    continue
                 count = len(brush.stage1_options)
                 index = min(count - 1, max(0, int(relative_y * count)))
                 name = brush.stage1_options[index]
@@ -1521,6 +1553,11 @@ class AutomaticRunRecorder:
                             "options": list(brush.stage1_options),
                             "names": [_brush_name(option) for option in brush.stage1_options],
                             "confidence": 0.99,
+                            # 原始坐标留档：阶段一「窄化成一张」是服务端真值，
+                            # 配上这里的 relative_y 就能离线校准分带阈值。
+                            "click_y": round(y, 1),
+                            "relative_y": round(relative_y, 4),
+                            "panel_height": round(brush.panel_rect.h, 1),
                         },
                         clicked_at,
                     )

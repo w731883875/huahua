@@ -4495,7 +4495,19 @@ def _estimate_regions(image: np.ndarray, board: BoardObservation) -> list[Region
     right = _clamp_int(max(x0 + 1, width - b.w * 0.06), 1, width)
     panel_w = max(1, right - x0)
     content_panel_w = max(1, right - content_x0)
-    stage_mode = _detect_brush_options_mode(image, x0, b, panel_w)
+    # 笔触面板**单独**算宽度，不能跟 ``right`` 共用。
+    #
+    # 2026-11-22 用户在 1917x1077 窗口下逐像素量过：词缀卡区真值是
+    # ``x ∈ [b.right+0.13·b.w, b.right+1.04·b.w]``、``y ∈ [b.y+0.30·b.h, b.y+0.65·b.h]``。
+    # 而 ``right = width - 0.06·b.w`` 这一屏右侧空出约 298px（≈0.47·b.w）雪地，
+    # 于是 ROI 右边界往外多出约 260px（31%）——整块 ROI 混进大片空白，
+    # ``card_bands_ok`` 的上下两张卡分带判据直接崩掉，**面板根本检测不出来**，
+    # 实测 17:30 之后 ``brush_options`` 一条都没有（此前累计 390 条）。
+    #
+    # 这里只给笔触面板收窄，``right`` 仍留给背包含义不变（背包要用到窗口右缘）。
+    brush_right = _clamp_int(min(right, b.right + b.w * 1.04 + 1), 1, width)
+    brush_panel_w = max(1, brush_right - x0)
+    stage_mode = _detect_brush_options_mode(image, x0, b, brush_panel_w)
 
     regions: list[RegionObservation] = [
         RegionObservation(
@@ -4531,7 +4543,7 @@ def _estimate_regions(image: np.ndarray, board: BoardObservation) -> list[Region
                     rect=_bounded_rect(
                         x0,
                         b.y + b.h * 0.23,
-                        panel_w,
+                        brush_panel_w,
                         b.h * 0.48,
                         width,
                         height,
@@ -4541,7 +4553,7 @@ def _estimate_regions(image: np.ndarray, board: BoardObservation) -> list[Region
                 ),
                 RegionObservation(
                     kind=RegionKind.CONFIRM_BUTTON,
-                    rect=_estimate_confirm_button_rect(image, b, x0, panel_w, stage_mode=True),
+                    rect=_estimate_confirm_button_rect(image, b, x0, brush_panel_w, stage_mode=True),
                     confidence=board.score * 0.70,
                     label="confirm button",
                 ),
@@ -4634,13 +4646,13 @@ def _estimate_regions_fast(image: np.ndarray, board: BoardObservation) -> list[R
             [
                 RegionObservation(
                     kind=RegionKind.BRUSH_OPTIONS,
-                    rect=_bounded_rect(x0, b.y + b.h * 0.23, panel_w, b.h * 0.48, width, height),
+                    rect=_bounded_rect(x0, b.y + b.h * 0.23, brush_panel_w, b.h * 0.48, width, height),
                     confidence=board.score * 0.88,
                     label="brush options fast",
                 ),
                 RegionObservation(
                     kind=RegionKind.CONFIRM_BUTTON,
-                    rect=_bounded_rect(x0 + panel_w * 0.35, b.y + b.h * 0.88, panel_w * 0.38, b.h * 0.10, width, height),
+                    rect=_bounded_rect(x0 + brush_panel_w * 0.35, b.y + b.h * 0.88, brush_panel_w * 0.38, b.h * 0.10, width, height),
                     confidence=board.score * 0.62,
                     label="confirm button fast",
                 ),

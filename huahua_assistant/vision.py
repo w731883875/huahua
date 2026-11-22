@@ -298,7 +298,35 @@ def _locate_board_rect(image: np.ndarray) -> tuple[Rect, float] | None:
                 "score": None if result is None else round(float(result[1]), 4),
             }
         )
+    if result is None:
+        _dump_locate_failure(image)
     return result
+
+
+#: 定位失败时最多多久落一张原图。玩家报「识别不到棋盘」时，日志里只有
+#: "found=False" 这几个字，看不出当时窗口是黑屏、弹窗盖住、还是缩放变了——
+#: 留一张原图才有可能事后还原现场。但一秒一帧全存会塞满磁盘，所以限流。
+LOCATE_FAIL_DUMP_INTERVAL = 60.0
+_LAST_LOCATE_FAIL_DUMP = 0.0
+
+
+def _dump_locate_failure(image: np.ndarray) -> None:
+    """定位失败时把当前帧落一张 PNG（限流 :data:`LOCATE_FAIL_DUMP_INTERVAL`）。
+
+    只写 ``runtime/_locate_fail.png`` 一张，覆盖写——需要的是「最近一次失败长什么样」，
+    不是所有失败的历史。任何异常都吞掉：存诊断图绝不能让识别路径崩。
+    """
+    global _LAST_LOCATE_FAIL_DUMP
+    now = time.monotonic()
+    if now - _LAST_LOCATE_FAIL_DUMP < LOCATE_FAIL_DUMP_INTERVAL:
+        return
+    _LAST_LOCATE_FAIL_DUMP = now
+    try:
+        target = Path("runtime") / "_locate_fail.png"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        write_image(target, image)
+    except Exception:  # noqa: BLE001 - 存诊断图失败不算识别失败
+        pass
 
 
 def _locate_board_rect_impl(image: np.ndarray) -> tuple[Rect, float] | None:

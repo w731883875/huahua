@@ -136,6 +136,7 @@ from .game_model import (
     state_from_observation,
 )
 from .learning import (
+    LAST_PERSIST_TIMING,
     export_learning_bundle,
     load_learning_stats,
     lowest_trajectory_score,
@@ -380,6 +381,13 @@ class HuahuaApp(tk.Tk):
         #: 满铺是**不可逆**的：同一张画纸满铺之后格子不会自己空出来，
         #: 所以「满铺过」配上「空位又回来」就是换画纸，不需要等结算。
         self.board_reached_full = False
+        #: 上一局**收尾时**那一帧的棋盘状态串。只为了拦一件事：刚收完尾，
+        #: 画面还停在旧棋盘上，这时再去问 :func:`_looks_like_new_run` 有可能
+        #: 因为没有参照帧（``last_real_capture_step`` 已随新局清空）而直接判成新局，
+        #: 于是凭空开出一局 0 步的假局、还要白跑一遍十几秒的收尾写盘。
+        #: 实测 2026-11-22 10:04:21 就这么假开了一局（1000.68 分、0 步）。
+        #: 这里故意**不随新局重置**：它描述的是「上一局留下的画面」。
+        self.last_finished_board_states = ""
         #: 本局是否已经在满铺那一刻尝试过自动存档。只尝试**一次**：
         #: 存档失败（没到高分门槛）时不能每帧重试，否则一次失败会在记录里刷出几十条。
         self.board_full_autosave_attempted = False
@@ -2544,6 +2552,13 @@ class HuahuaApp(tk.Tk):
         finished_before = self.real_session_finished or (
             self.board_reached_full and self.last_real_capture_step is not None
         )
+        # 先拦一道「画面还是上一局那块」：收完尾之后 ``last_real_capture_step``
+        # 可能已经被清空，``_looks_like_new_run(..., None)`` 会无条件返回 True，
+        # 于是同一块满铺棋盘被当成新画纸，凭空开出一局 0 步的假局。
+        # 用上一局收尾时记下的状态串比一下，同款就直接不认。
+        if finished_before and self.last_finished_board_states:
+            if str(board.get("states") or "") == self.last_finished_board_states:
+                return False
         if finished_before and _looks_like_new_run(scene, self.last_real_capture_step):
             self.start_new_real_session(record_event=True)
             record_observation(
@@ -2558,6 +2573,8 @@ class HuahuaApp(tk.Tk):
             # ``self.current_state`` 换成这一帧之后才跑，否则评分用的是满铺前
             # 少一格、少一枚颜料的旧局面。
             self.board_reached_full = True
+            # 记下这块满铺棋盘：下一帧如果还是它，就不能当新画纸。
+            self.last_finished_board_states = str(board.get("states") or "")
         return False
 
     def _maybe_autosave_full_board(self, scene: SceneObservation) -> None:
@@ -2890,9 +2907,18 @@ class HuahuaApp(tk.Tk):
                 "initial_snapshot": initial_snapshot,
                 "raw_finish_seen": raw_finish_seen,
                 "finish_seen": finish_seen,
+                # 收尾各步耗时的快照：下次再「卡十几秒」时，一眼就能看出
+                # 是读盘、规范化、写轨迹还是回写统计吃掉了时间。
+                "persist_timing": dict(LAST_PERSIST_TIMING),
             }),
             source="real_capture",
         )
+        # 记下收尾时的棋盘：下一帧如果还是这块，就不能当新画纸
+        # （见 :meth:`_maybe_start_new_run_from_board` 里的同款拦截）。
+        if self.current_scene is not None:
+            self.last_finished_board_states = str(
+                _compact_board_summary(self.current_scene).get("states") or ""
+            )
         self.real_session_finished = True
         return saved, score
 

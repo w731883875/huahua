@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
 
 from huahua_assistant.game_model import (
     BOARD_SIZE,
@@ -20,7 +21,12 @@ from huahua_assistant.game_model import (
     Tile,
     TileState,
 )
-from huahua_assistant.level_reconcile import installed_cells, reconcile
+from huahua_assistant.level_reconcile import (
+    CellMismatch,
+    ReconcileReport,
+    installed_cells,
+    reconcile,
+)
 
 ROW = 4
 PANEL = Paint(PaintCategory.MONSTER, 5, "伊吉")
@@ -160,6 +166,87 @@ class ReconcileTests(unittest.TestCase):
         report = reconcile(None, _state({}))
         self.assertFalse(report.ran)
         self.assertTrue(report.note)
+
+
+class SurfaceMismatchTests(unittest.TestCase):
+    """对账差异必须能在界面上看见。
+
+    2026-11-22 用户原话：「日志标了对不上，不在 ui 上给我看？」——之前差异只写进
+    右侧「识别区域」的小节和 observations.jsonl，用户根本注意不到。
+    """
+
+    @staticmethod
+    def _app():
+        from huahua_assistant.app import HuahuaApp
+
+        class Stub:
+            last_reconcile_notice_key = ""
+            status = ""
+            notice = ""
+
+            def __init__(self):
+                self.status_var = SimpleNamespace(set=lambda v: setattr(self, "status", v))
+
+            def _set_notice(self, message, level="info"):
+                self.notice = message
+                self.level = level
+
+        stub = Stub()
+        stub.surface = lambda report: HuahuaApp._surface_level_mismatch(stub, report)
+        return stub
+
+    def test_mismatch_is_pushed_to_status_and_notice(self) -> None:
+        stub = self._app()
+        report = ReconcileReport(
+            ran=True,
+            levels=((4, 3, 3, 3),),
+            mismatches=(CellMismatch(row=4, col=3, predicted=3, observed=6),),
+        )
+
+        stub.surface(report)
+
+        self.assertIn("对账不一致", stub.status)
+        self.assertIn("r5c4", stub.notice)  # 对外用 1 基坐标
+        self.assertIn("模型3≠画面6", stub.notice)
+        self.assertEqual("warning", stub.level)
+
+    def test_same_mismatch_is_not_repeated(self) -> None:
+        """同一笔每帧都会重算，逐帧弹提示会刷屏。"""
+
+        stub = self._app()
+        report = ReconcileReport(
+            ran=True,
+            mismatches=(CellMismatch(row=0, col=0, predicted=1, observed=2),),
+        )
+
+        stub.surface(report)
+        first = stub.notice
+        stub.notice = ""
+        stub.surface(report)
+
+        self.assertNotEqual("", first)
+        self.assertEqual("", stub.notice)
+
+    def test_changed_mismatch_is_reported_again(self) -> None:
+        stub = self._app()
+        stub.surface(
+            ReconcileReport(ran=True, mismatches=(CellMismatch(row=0, col=0, predicted=1, observed=2),))
+        )
+        stub.notice = ""
+        stub.surface(
+            ReconcileReport(ran=True, mismatches=(CellMismatch(row=0, col=0, predicted=1, observed=3),))
+        )
+
+        self.assertIn("模型1≠画面3", stub.notice)
+
+    def test_clean_reconcile_clears_the_key(self) -> None:
+        stub = self._app()
+        stub.surface(
+            ReconcileReport(ran=True, mismatches=(CellMismatch(row=0, col=0, predicted=1, observed=2),))
+        )
+        stub.surface(ReconcileReport(ran=True, mismatches=()))
+
+        self.assertEqual("", stub.last_reconcile_notice_key)
 
 
 if __name__ == "__main__":

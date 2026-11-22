@@ -25,9 +25,11 @@ class _FakePump:
     def __init__(self, interval: float = 0.1) -> None:
         self.interval = interval
         self.wakes = 0
+        self.intervals: list[float] = []
 
     def set_interval(self, interval: float) -> None:
         self.interval = interval
+        self.intervals.append(interval)
 
     def wake(self) -> None:
         self.wakes += 1
@@ -38,6 +40,13 @@ class _FakeWatcher:
         self._events = list(events)
         self.running = running
         self.revision = 1 if events else 0
+        # 静默判定要用：日志最近一次写入距今多久、可识别事件距今多久。
+        # 默认都当成「刚刚」——也就是不静默，和加这两个判定之前的行为一致。
+        self.line_age = 0.0
+        self.idle_seconds = 0.0 if events else float("inf")
+        # 「日志在写却没有可识别事件」已经持续多久。0 表示不静默。
+        self.silent_seconds = 0.0
+        self.lines_seen = 0
 
     def drain(self) -> list[GameLogEvent]:
         events, self._events = self._events, []
@@ -101,16 +110,29 @@ def _app(
         status_var=_FakeStringVar(),
         game_log_var=_FakeStringVar(),
         notice="",
+        # ``_consume_game_log_events`` 会先过一遍等级动画窗口；真实 ``__init__``
+        # 默认就是 None，这里补齐以免属性缺失。
+        level_animation_window=None,
+        level_reconcile=SimpleNamespace(ran=False),
+        # 日志「在写但认不出」的静默状态（见 _note_log_silence）。默认为未静默。
+        auto_follow_log_silent=False,
+        auto_follow_silence_notice_key=False,
         after=lambda delay, callback: scheduled.append((delay, callback)),
     )
     # 被调用的那几个方法本身也挂在 self 上，这里手动绑一下。
     stub._wake_auto_follow_pump = lambda: HuahuaApp._wake_auto_follow_pump(stub)
     stub._auto_follow_base_interval = lambda: HuahuaApp._auto_follow_base_interval(stub)
     stub._auto_follow_idle_interval = lambda: HuahuaApp._auto_follow_idle_interval(stub)
+    stub._auto_follow_fallback_interval = lambda: HuahuaApp._auto_follow_fallback_interval(stub)
+    stub._log_is_silent = lambda watcher: HuahuaApp._log_is_silent(stub, watcher)
+    stub._note_log_silence = lambda watcher, now: HuahuaApp._note_log_silence(stub, watcher, now)
+    stub._report_log_silence = lambda watcher: HuahuaApp._report_log_silence(stub, watcher)
+    stub._report_log_resumed = lambda watcher: HuahuaApp._report_log_resumed(stub, watcher)
     stub._sync_game_log_status = lambda watcher=None: HuahuaApp._sync_game_log_status(stub, watcher)
     stub._nudge_auto_follow_after_event = lambda event, now: HuahuaApp._nudge_auto_follow_after_event(
         stub, event, now
     )
+    stub._note_level_animation_events = lambda events: HuahuaApp._note_level_animation_events(stub, events)
     stub._set_notice = lambda message, level="info": setattr(stub, "notice", message)
     stub.scheduled = scheduled
     return stub
@@ -255,6 +277,104 @@ class ConsumeEventTests(unittest.TestCase):
 
         self.assertNotEqual("", first_notice)
         self.assertEqual("", stub.notice)
+
+
+class LogSilenceTests(unittest.TestCase):
+    """日志在写、却解析不出事件时的兜底。
+
+    这是 2026-11-22 实测出来的真实缺陷：第二局用户大量安装颜料，但那些颜料落在
+    初始颜料生效范围外、任务没完成，游戏只播通用按钮音 ``ECommonBtnType``，
+    一条 ``S8_*`` 都没有。于是日志驱动整段沉默，64 秒里零帧。
+    现存证据：那段窗口日志写了 147 行，``parse_line`` 命中 0 条。
+    """
+
+    def test_silent_when_log_is_written_but_nothing_parses(self) -> None:
+        watcher = _FakeWatcher([], running=True)
+        watcher.line_age = 0.5           # 日志刚写过
+        watcher.idle_seconds = 60.0      # 但 60 秒没有可识别事件
+        watcher.silent_seconds = 60.0
+        stub = _app(watcher=watcher, pump=_FakePump())
+
+        self.assertTrue(HuahuaApp._log_is_silent(stub, watcher))
+
+    def test_not_silent_when_the_game_stopped_writing(self) -> None:
+        """游戏关掉/停写时不能算静默，否则会在没人玩的时候白截。"""
+
+        watcher = _FakeWatcher([], running=True)
+        watcher.line_age = 300.0
+        watcher.idle_seconds = 300.0
+        watcher.silent_seconds = 0.0
+        stub = _app(watcher=watcher, pump=_FakePump())
+
+        self.assertFalse(HuahuaApp._log_is_silent(stub, watcher))
+
+    def test_not_silent_right_after_an_event(self) -> None:
+        watcher = _FakeWatcher([], running=True)
+        watcher.line_age = 0.5
+        watcher.idle_seconds = 1.0
+        watcher.silent_seconds = 0.0
+        stub = _app(watcher=watcher, pump=_FakePump())
+
+        self.assertFalse(HuahuaApp._log_is_silent(stub, watcher))
+
+    def test_pump_falls_back_to_slower_cadence_when_silent(self) -> None:
+        watcher = _FakeWatcher([], running=True)
+        watcher.line_age = 0.5
+        watcher.idle_seconds = 60.0
+        watcher.silent_seconds = 60.0
+        pump = _FakePump()
+        stub = _app(watcher=watcher, pump=pump)
+
+        HuahuaApp._consume_game_log_events(stub)
+
+        # 静默时用兜底节拍；不静默时是 idle 节拍（1.5s 默认）。
+        self.assertEqual(app_module.LOG_FALLBACK_INTERVAL, pump.intervals[-1])
+        self.assertTrue(stub.auto_follow_log_silent)
+
+    def test_silence_is_surfaced_to_the_user_not_only_logged(self) -> None:
+        """静默必须能在界面上看见——以前这种情况界面上一切正常。"""
+
+        watcher = _FakeWatcher([], running=True)
+        watcher.line_age = 0.5
+        watcher.idle_seconds = 60.0
+        watcher.silent_seconds = 60.0
+        stub = _app(watcher=watcher, pump=_FakePump())
+
+        HuahuaApp._consume_game_log_events(stub)
+
+        self.assertIn("兜底节拍", stub.notice)
+        self.assertIn("兜底节拍", stub.status_var.value)
+
+    def test_silence_notice_is_not_repeated_every_tick(self) -> None:
+        watcher = _FakeWatcher([], running=True)
+        watcher.line_age = 0.5
+        watcher.idle_seconds = 60.0
+        watcher.silent_seconds = 60.0
+        stub = _app(watcher=watcher, pump=_FakePump())
+
+        HuahuaApp._consume_game_log_events(stub)
+        first = stub.notice
+        stub.notice = ""
+        HuahuaApp._consume_game_log_events(stub)
+
+        self.assertNotEqual("", first)
+        self.assertEqual("", stub.notice)
+
+    def test_silence_flag_clears_when_events_resume(self) -> None:
+        watcher = _FakeWatcher([], running=True)
+        watcher.line_age = 0.5
+        watcher.idle_seconds = 60.0
+        watcher.silent_seconds = 60.0
+        stub = _app(watcher=watcher, pump=_FakePump())
+        HuahuaApp._consume_game_log_events(stub)
+        self.assertTrue(stub.auto_follow_log_silent)
+
+        # 事件恢复：换一个有事件的 watcher。
+        resumed = _FakeWatcher([_event("pigment")], running=True)
+        stub.game_log_watcher = resumed
+        HuahuaApp._consume_game_log_events(stub)
+
+        self.assertFalse(stub.auto_follow_log_silent)
 
 
 class WakeTests(unittest.TestCase):

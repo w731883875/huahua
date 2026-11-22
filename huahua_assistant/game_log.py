@@ -46,6 +46,9 @@ CACHE_PATH = Path("runtime/game_log.json")
 #: 轮询周期。150ms 是 TartarusSolver 用的值：比一次截图+识别短，又不会空转太多。
 POLL_INTERVAL = 0.15
 
+#: 日志多久没新行就算「游戏没在写」。游戏常驻心跳约 1 秒一条，5 秒足够宽松。
+LOG_ALIVE_SECONDS = 5.0
+
 #: 事件名 → 语义。没列出来的 ``S8_HZXY_`` 事件一律记成 ``other``，仍然算「画面变了」。
 EVENT_KINDS = {
     "S8_HZXY_DrawPaper_Pigment_Puzzle": "pigment",
@@ -292,6 +295,11 @@ class GameLogWatcher:
         self._identity: tuple[int, int] | None = None
         self.last_error: str | None = None
         self.last_event_at: float = 0.0
+        #: 最近一次**读到新行**的时间（monotonic）。注意它跟 :attr:`last_event_at` 不是一回事：
+        #: 游戏一直在写心跳和网络日志，行一直在涨，但可能**一行都认不出来**。
+        #: 2026-11-22 实测：第二局 64 秒里日志写了 174 行，解析出的画中雪原事件是 0 条，
+        #: 全靠这个字段才能把「日志没在写」和「在写但认不出」分开。
+        self.last_line_at: float = 0.0
         self.lines_seen = 0
 
     # --- 生命周期 ---------------------------------------------------------
@@ -340,6 +348,30 @@ class GameLogWatcher:
         if not self.last_event_at:
             return float("inf")
         return time.monotonic() - self.last_event_at
+
+    @property
+    def line_age(self) -> float:
+        """距最近一次读到新行过了多久。日志停了会变大，日志在写就一直很小。"""
+
+        if not self.last_line_at:
+            return float("inf")
+        return time.monotonic() - self.last_line_at
+
+    @property
+    def silent_seconds(self) -> float:
+        """日志在写、但一条可识别事件都没有，已经持续多久。
+
+        返回 ``0.0`` 表示「没有静默」（要么最近有事件，要么日志根本没在写）。
+        这就是「用户明明在落子，工具却一动不动」的量化指标。
+        """
+
+        if self.line_age > LOG_ALIVE_SECONDS:
+            return 0.0
+        idle = self.idle_seconds
+        if idle == float("inf"):
+            # 接上之后一条事件都没来过：从接上那刻算起，避免一上来就报静默。
+            return 0.0
+        return idle
 
     # --- 内部 -------------------------------------------------------------
 
@@ -396,6 +428,8 @@ class GameLogWatcher:
         self._buffer = lines.pop() if lines else b""
         if not lines:
             return
+        # 不管认不认得出事件，先把「日志在动」记下来：区分「游戏没写」和「写了但认不出」。
+        self.last_line_at = time.monotonic()
 
         events: list[GameLogEvent] = []
         scale: float | None = None

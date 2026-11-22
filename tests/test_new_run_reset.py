@@ -120,8 +120,18 @@ def _event(kind: str, name: str = "S8_HZXY_DrawPaper_Into"):
 def _log_consumer_app(events):
     """只补齐 ``_consume_game_log_events`` 真正会碰到的属性。"""
 
-    return SimpleNamespace(
-        game_log_watcher=SimpleNamespace(running=True, drain=lambda: list(events), revision=1),
+    stub = SimpleNamespace(
+        game_log_watcher=SimpleNamespace(
+            running=True,
+            drain=lambda: list(events),
+            revision=1,
+            # 静默判定要用的三个量：日志写入距今、可识别事件距今、
+            # 「在写但认不出」持续多久。都给「刚写过、不静默」，和加判定前行为一致。
+            line_age=0.0,
+            idle_seconds=0.0 if events else float("inf"),
+            silent_seconds=0.0,
+            lines_seen=0,
+        ),
         auto_follow_pump=Mock(),
         last_game_log_events=(),
         auto_follow_last_event_at=0.0,
@@ -133,14 +143,33 @@ def _log_consumer_app(events):
         game_log_nudge_at=0.0,
         status_var=SimpleNamespace(set=lambda *_: None),
         pending_new_run=False,
+        # 「等级动画窗口」：``_consume_game_log_events`` 里会先过一遍
+        # ``_note_level_animation_events``，真实 ``__init__`` 的默认值就是 None
+        # （没有待核对的对账就不开窗口），这里必须补齐，否则属性缺失。
+        level_animation_window=None,
+        level_reconcile=SimpleNamespace(ran=False),
         _sync_game_log_status=lambda *a, **k: None,
         _wake_auto_follow_pump=lambda: None,
         _nudge_auto_follow_after_event=lambda *a, **k: None,
         _auto_follow_idle_interval=lambda: 1.5,
         _auto_follow_base_interval=lambda: 1.5,
+        auto_follow_log_silent=False,
+        auto_follow_silence_notice_key=False,
         _set_notice=lambda *a, **k: None,
         after=lambda *a, **k: None,
     )
+    # 走**真实**方法（窗口为 None 时立刻返回），别用空实现盖住它——
+    # 那样以后这条链路再漏属性也发现不了。
+    stub._note_level_animation_events = lambda events: app.HuahuaApp._note_level_animation_events(
+        stub, events
+    )
+    # 同理：静默相关也走真实实现，别让空实现掩盖漏属性。
+    stub._auto_follow_fallback_interval = lambda: app.HuahuaApp._auto_follow_fallback_interval(stub)
+    stub._log_is_silent = lambda watcher: app.HuahuaApp._log_is_silent(stub, watcher)
+    stub._note_log_silence = lambda watcher, now: app.HuahuaApp._note_log_silence(stub, watcher, now)
+    stub._report_log_silence = lambda watcher: app.HuahuaApp._report_log_silence(stub, watcher)
+    stub._report_log_resumed = lambda watcher: app.HuahuaApp._report_log_resumed(stub, watcher)
+    return stub
 
 
 class IntoEventDispatchTests(unittest.TestCase):

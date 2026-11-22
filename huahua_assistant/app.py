@@ -56,7 +56,7 @@ from .codes import (
 from .fast_events import FastVisionEvent, detect_fast_events
 from .fast_vision import FastVisionSnapshot, backpack_page_of, snapshot_from_scene
 from .frame_pump import FramePump, default_auto_capture
-from .game_log import GameLogEvent, GameLogWatcher, find_game_log
+from .game_log import LOG_ALIVE_SECONDS, GameLogEvent, GameLogWatcher, find_game_log
 
 #: 日志说画面变了之后的「连拍」节拍：不额外等待，跑完一帧接着跑下一帧。
 LOG_BURST_INTERVAL = 0.1
@@ -69,6 +69,17 @@ CODEBOOK_PATH = Path("runtime/codebook.json")
 BACKPACK_SNAPSHOT_PATH = Path("runtime/backpack_snapshot.json")
 #: 没有事件时的节拍。棋盘在两笔之间不会动，按 100ms 盲截是纯浪费。
 LOG_IDLE_INTERVAL = 1.5
+#: 日志在写、但一条可识别事件都没有时的兜底节拍。
+#:
+#: 捕获的唤醒绑死在日志词汇上：认不出事件就永远等不到唤醒。2026-11-22 实测第二局，
+#: 用户大量安装颜料（落在初始颜料生效范围外，任务未完成），游戏只播通用按钮音
+#: ``ECommonBtnType``，``S8_*`` 一条都没有，于是 64 秒里零帧。兜底节拍只在
+#: 「日志确实在增长」时才启用，所以不会在游戏关掉时白截。
+LOG_FALLBACK_INTERVAL = 1.8
+#: 日志在写、却连续这么久没有可识别事件，就判定为「静默」并启用兜底节拍 + 界面提示。
+LOG_SILENT_SECONDS = 6.0
+#: 采集线程还在跑、但这么久没往轨迹里写任何步骤，就落一条 ``capture_gap`` 证据。
+CAPTURE_GAP_SECONDS = 20.0
 #: 事件发生后多久再截：落子/开面板都有动画，抢在动画中间截会读到中间态。
 LOG_SETTLE_MS = 220
 #: 最后一次事件之后还保持连拍多久。
@@ -366,6 +377,8 @@ class HuahuaApp(tk.Tk):
         self.last_rule_anomalies: list[dict] = []
         #: 最近一次「模型推算 vs 画面识别」的逐格对账结果（见 :mod:`level_reconcile`）。
         self.level_reconcile: ReconcileReport = ReconcileReport()
+        #: 已经提醒过的对账差异集合。同一笔每帧都会重算，靠它做到「变了才提醒」。
+        self.last_reconcile_notice_key = ""
         self.last_quick_step_key: str | None = None
         self.pending_tentative_step: dict | None = None
         self.pending_tentative_signature: str | None = None
@@ -427,6 +440,16 @@ class HuahuaApp(tk.Tk):
         self.auto_follow_log_revision = 0
         self.auto_follow_last_event_at = 0.0
         self.auto_follow_burst_until = 0.0
+        #: 当前是否处于「日志在写、却解析不出画中雪原事件」的状态。
+        #: 进入就切兜底节拍，并且**只在翻转时**记一条观测，不每 tick 刷屏。
+        self.auto_follow_log_silent = False
+        #: 静默提示是否已经顶到界面上过。置位表示「这轮静默已经提醒过」。
+        self.auto_follow_silence_notice_key = False
+        #: 最近一次真正写进轨迹的时间（monotonic）。用来发现「一直在截，却一帧都没记」
+        #: 这种空档——2026-11-22 就是靠人工数日志才发现，不该再靠人工。
+        self.last_step_recorded_at = 0.0
+        self.capture_gap_frames = 0
+        self.capture_gap_reported = False
         self.last_game_log_events: list[GameLogEvent] = []
         #: 落笔后播出的升级动画（``Anim_PutongShengji`` / ``CaiShengji``）条数，
         #: 用来和「模型预计升几格」对账。窗口由 :data:`LEVEL_ANIMATION_WINDOW` 定。
@@ -1627,17 +1650,95 @@ class HuahuaApp(tk.Tk):
                 record_observation("new_run_pending", {"trigger": "game_log_into"}, source="game_log")
             self._sync_game_log_status(watcher)
 
+        # 先定「静默与否」。它只看 watcher 的时间戳，跟这一批事件无关，
+        # 所以放在前面：事件一恢复就能立刻把静默状态清掉（否则会一直挂着兜底节拍）。
+        silent = self._note_log_silence(watcher, now)
         capturing = [event for event in events if event.captures]
+        if silent:
+            self._report_log_silence(watcher)
+        elif self.auto_follow_silence_notice_key:
+            self._report_log_resumed(watcher)
+
         if capturing and pump is not None:
             # 落子/开面板的动画还没走完就截会读到中间态，等一小会儿再叫醒采集线程。
             pump.set_interval(LOG_BURST_INTERVAL)
             self.auto_follow_burst_until = now + LOG_BURST_WINDOW
             self.after(LOG_SETTLE_MS, self._wake_auto_follow_pump)
         elif pump is not None and now > self.auto_follow_burst_until:
-            pump.set_interval(self._auto_follow_idle_interval())
+            # 静默时用更慢的兜底节拍：词汇对不上至少还能出帧，而不是整段沉默。
+            pump.set_interval(
+                self._auto_follow_fallback_interval() if silent else self._auto_follow_idle_interval()
+            )
 
         if capturing and not self.auto_follow_var.get():
             self._nudge_auto_follow_after_event(capturing[-1], now)
+
+    def _auto_follow_fallback_interval(self) -> float:
+        """日志在写但认不出事件时用的兜底节拍。
+
+        为什么需要它：捕获的唤醒**完全绑死在日志词汇**上。2026-11-22 实测第二局，
+        用户大量安装颜料（放在初始颜料生效范围外，任务没完成），游戏只播通用按钮音
+        ``ECommonBtnType``，一条 ``S8_*`` 都没有 → 日志驱动整段沉默，很久才出一帧。
+        兜底节拍让「词汇对不上」最多慢一点，而不是整段丢。
+        """
+
+        try:
+            value = float(config_value("game_log.fallback_interval", LOG_FALLBACK_INTERVAL))
+        except (TypeError, ValueError):
+            value = LOG_FALLBACK_INTERVAL
+        return max(0.2, value)
+
+    def _log_is_silent(self, watcher: GameLogWatcher) -> bool:
+        """日志在持续写入，但已经很久没有可识别事件了。"""
+
+        if not watcher.running or watcher.line_age > LOG_ALIVE_SECONDS:
+            return False
+        return watcher.silent_seconds >= LOG_SILENT_SECONDS
+
+    def _note_log_silence(self, watcher: GameLogWatcher, now: float) -> bool:
+        """静默状态翻转时记一笔，并说明「日志在写但认不出」这件事本身。"""
+
+        silent = self._log_is_silent(watcher)
+        if silent == self.auto_follow_log_silent:
+            return silent
+        self.auto_follow_log_silent = silent
+        record_observation(
+            "game_log_silent" if silent else "game_log_silent_cleared",
+            {
+                "silent_seconds": round(watcher.silent_seconds, 1),
+                "line_age": round(watcher.line_age, 1),
+                "lines_seen": watcher.lines_seen,
+                "fallback_interval": self._auto_follow_fallback_interval() if silent else None,
+                "note": (
+                    "日志在写但解析不出画中雪原事件，已按兜底节拍采集"
+                    if silent
+                    else "日志事件恢复，回到日志驱动"
+                ),
+            },
+            source="game_log",
+        )
+        return silent
+
+    def _report_log_silence(self, watcher: GameLogWatcher) -> None:
+        """把「日志在动、工具却认不出」顶到界面上，别让它静默降级。"""
+
+        if not self._log_is_silent(watcher):
+            return
+        if self.auto_follow_silence_notice_key:
+            return
+        self.auto_follow_silence_notice_key = True
+        seconds = int(max(0, watcher.silent_seconds))
+        message = (
+            f"日志在写入但已 {seconds} 秒没有可识别的画中雪原事件，"
+            f"已切到 {self._auto_follow_fallback_interval():.1f}s 兜底节拍。"
+            "若是把颜料放在初始颜料生效范围外，游戏只播通用按钮音，属于已知情况。"
+        )
+        self.status_var.set(message)
+        self._set_notice(message, "warning")
+
+    def _report_log_resumed(self, watcher: GameLogWatcher) -> None:
+        self.auto_follow_silence_notice_key = False
+        self.status_var.set("日志事件已恢复，回到日志驱动采集。")
 
     def _nudge_auto_follow_after_event(self, event: GameLogEvent, now: float) -> None:
         """自动跟随没开时，至少让用户知道「刚才那下我看见了」。"""
@@ -1690,6 +1791,46 @@ class HuahuaApp(tk.Tk):
         if self.auto_follow_pump is None:
             self._start_auto_follow_pump()
         self._poll_auto_follow_pump(self.auto_follow_generation)
+        self._report_capture_gap()
+
+    def _report_capture_gap(self) -> None:
+        """「采集线程在跑，却很久没往轨迹里写东西」时留一条证据。
+
+        为什么需要：这种情况界面上一切正常——灯是绿的、日志是接上的、进程也不报错，
+        但棋盘上的变化一帧都没进库。2026-11-22 那 64 秒就是这么过去的，最后只能
+        人工去数日志时间戳才发现。把当时的节拍、日志状态、丢帧原因一起落盘，
+        下次直接看这一条就能定位。
+        """
+
+        if self.auto_follow_pump is None:
+            self.capture_gap_reported = False
+            return
+        now = time.monotonic()
+        last = self.last_step_recorded_at or self.real_session_started_at or now
+        gap = now - last
+        if gap < CAPTURE_GAP_SECONDS:
+            self.capture_gap_reported = False
+            return
+        if self.capture_gap_reported:
+            return
+        self.capture_gap_reported = True
+        watcher = self.game_log_watcher
+        record_observation(
+            "capture_gap",
+            {
+                "session": self.real_session_id or None,
+                "gap_seconds": round(gap, 1),
+                "frames_since_step": self.capture_gap_frames,
+                "pump_interval": round(self.auto_follow_pump.interval, 2),
+                "log_running": bool(watcher.running) if watcher is not None else False,
+                "log_line_age": round(watcher.line_age, 1) if watcher is not None else None,
+                "log_idle_seconds": round(watcher.idle_seconds, 1) if watcher is not None else None,
+                "log_silent": self.auto_follow_log_silent,
+                "last_quick_step_key_matched": True,
+                "note": "采集线程在跑但没有新步骤入库：多半是帧内容没变被去重，或日志驱动没唤醒",
+            },
+            source="auto_follow",
+        )
 
     def _auto_follow_pump_stalled(self) -> bool:
         """采集线程还挂着，却一直不出帧。
@@ -1764,6 +1905,8 @@ class HuahuaApp(tk.Tk):
             return
         self.auto_follow_last_sequence = result.sequence
         self.auto_follow_last_frame_at = time.monotonic()
+        # 到过一帧就记一次：配合 last_step_recorded_at 能看出「截了但没入库」。
+        self.capture_gap_frames += 1
         # 换了游戏窗口（重开游戏、窗口重建）：把「WGC 不可用」的判定清掉重试一次。
         # 那条判定只是为了别每帧白抛异常，不该变成永久结论。
         captured_window = result.capture.window
@@ -1959,6 +2102,36 @@ class HuahuaApp(tk.Tk):
                 return max(0, int(getattr(affix, "amount", 0) or 0))
         return 0
 
+    def _surface_level_mismatch(self, report: ReconcileReport) -> None:
+        """模型和画面不一致时，把结论顶到状态栏和提示条。
+
+        以前只写进右侧「识别区域」里的「模型对账」小节，用户看不见——
+        2026-11-22 原话：「日志标了对不上，不在 ui 上给我看？」。
+        对账是判断「识别错还是规则错」的唯一线索，必须显眼。
+
+        只在**差异集合变化**时提醒一次：同一笔每一帧都重算，逐帧弹会刷屏。
+        """
+
+        if not report.ran or not report.mismatches:
+            self.last_reconcile_notice_key = ""
+            return
+        key = "|".join(
+            f"{item.row},{item.col},{item.predicted},{item.observed}" for item in report.mismatches
+        )
+        if key == self.last_reconcile_notice_key:
+            return
+        self.last_reconcile_notice_key = key
+        detail = "；".join(
+            f"r{item.row + 1}c{item.col + 1} 模型{item.predicted}≠画面{item.observed}"
+            for item in report.mismatches[:3]
+        )
+        more = f" 等{len(report.mismatches)}处" if len(report.mismatches) > 3 else ""
+        self.status_var.set(f"对账不一致：{detail}{more}")
+        self._set_notice(
+            f"模型推算与画面不一致：{detail}{more}（逐格来源见右侧「模型对账」）",
+            "warning",
+        )
+
     def _update_level_reconcile(self, previous_state: PuzzleState | None) -> None:
         """落笔后用模型跑一遍「这一笔该变成几级」，和画面逐格比。
 
@@ -1978,6 +2151,7 @@ class HuahuaApp(tk.Tk):
             return
         self.level_reconcile = report
         self._open_level_animation_window(report)
+        self._surface_level_mismatch(report)
         if report.ran and (report.mismatches or report.uncertain):
             record_observation(
                 "level_reconcile",
@@ -3096,6 +3270,9 @@ class HuahuaApp(tk.Tk):
         self.real_trajectory_steps.append(step)
         self.real_trajectory_steps = self.real_trajectory_steps[-80:]
         self.quick_capture_record_count += 1
+        # 「一直截却没有新步骤」的计时从这一刻重新开始（见 _report_capture_gap）。
+        self.last_step_recorded_at = time.monotonic()
+        self.capture_gap_frames = 0
         record_observation(
             "quick_capture_step",
             step,

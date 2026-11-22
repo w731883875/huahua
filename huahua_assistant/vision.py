@@ -2518,6 +2518,7 @@ def _analyze_brush_options(
     crop = image[panel.y : panel.bottom, panel.x : panel.right]
     if crop.size == 0:
         return None
+    crop = _trim_blank_right(crop)
 
     # 面板文字是最终真值，先走它。以前靠「≥2 张卡片就算方向阶段」区分阶段，
     # 结果「选笔触效果」阶段被当成「选笔触方向」，报出一堆假的笔锋类型。
@@ -2595,6 +2596,39 @@ def _analyze_brush_options(
     )
 
 
+def _trim_blank_right(crop: np.ndarray) -> np.ndarray:
+    """裁掉右侧整列无内容的空白，再交给分带判据。
+
+    为什么需要：笔触面板 ROI 的右边界是靠 ``b.right + 1.04·b.w`` 估的，估宽了就会
+    把右侧大片空白雪地圈进来。而 :func:`brush_panel._split_brush_cards` 用**整幅宽度**
+    求行活动度均值（``active.mean(axis=1)``），多出来的空白列会把它稀释到阈值以下，
+    于是「上下两张卡」判不出来、面板直接检测失败——2026-11-22 17:30 之后
+    ``brush_options`` 归零就是这个现象。
+
+    这里不依赖任何面板常数：从右侧往里找第一列有内容的，再留一点边距。
+    """
+
+    if crop.size == 0:
+        return crop
+    height, width = crop.shape[:2]
+    if width < 40:
+        return crop
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    # 「有内容」= 足够饱和（卡片底色/图标）或明显暗（文字与阴影）。
+    interesting = (hsv[:, :, 1] > 24) | (hsv[:, :, 2] < 110)
+    column_ratio = interesting.mean(axis=0)
+    active = np.where(column_ratio > 0.05)[0]
+    if len(active) == 0:
+        return crop
+    right = min(width, int(active[-1]) + max(4, int(width * 0.02)) + 1)
+    if right >= width:
+        return crop
+    # 裁得太狠会切掉卡片正文，至少要保留 55% 宽度。
+    if right < width * 0.55:
+        return crop
+    return crop[:, :right]
+
+
 def _analyze_brush_options_realtime(
     image: np.ndarray,
     regions: tuple[RegionObservation, ...],
@@ -2614,6 +2648,7 @@ def _analyze_brush_options_realtime(
     crop = image[panel.y : panel.bottom, panel.x : panel.right]
     if crop.size == 0:
         return None
+    crop = _trim_blank_right(crop)
 
     # 实时帧：面板文字缓存命中就立即用，没命中丢后台线程，这一帧走原来的兜底。
     panel_reading = brush_panel.read_brush_panel_async(crop)
@@ -4487,6 +4522,16 @@ def _save_backpack_slot_crops(image: np.ndarray, scene: SceneObservation | None)
         write_image(output_dir / filename, image[rect.y : rect.bottom, rect.x : rect.right])
 
 
+#: 笔触面板右边界相对棋盘宽度的倍数。**不要轻易收窄它。**
+#:
+#: 2026-11-22 有人按某一个窗口尺寸量出「卡区右缘 = b.right+1.04·b.w」，据此把右边界
+#: 收到 1.04。用 jietu/ 下 4 张真实截图回归：ratio=1.04 时 stage2_options 全空
+#: （0/4），ratio 退回「不限」时 4/4 全对——收窄会把卡片正文切掉，OCR 读不到。
+#:
+#: 右侧多出来的空白交给 :func:_trim_blank_right 自动裁，不靠常数。
+BRUSH_ROI_RIGHT_RATIO = 99.0
+
+
 def _estimate_regions(image: np.ndarray, board: BoardObservation) -> list[RegionObservation]:
     height, width = image.shape[:2]
     b = board.rect
@@ -4505,7 +4550,7 @@ def _estimate_regions(image: np.ndarray, board: BoardObservation) -> list[Region
     # 实测 17:30 之后 ``brush_options`` 一条都没有（此前累计 390 条）。
     #
     # 这里只给笔触面板收窄，``right`` 仍留给背包含义不变（背包要用到窗口右缘）。
-    brush_right = _clamp_int(min(right, b.right + b.w * 1.04 + 1), 1, width)
+    brush_right = _clamp_int(min(right, b.right + b.w * BRUSH_ROI_RIGHT_RATIO + 1), 1, width)
     brush_panel_w = max(1, brush_right - x0)
     stage_mode = _detect_brush_options_mode(image, x0, b, brush_panel_w)
 
@@ -4620,7 +4665,10 @@ def _estimate_regions_fast(image: np.ndarray, board: BoardObservation) -> list[R
     right = _clamp_int(max(x0 + 1, width - b.w * 0.06), 1, width)
     panel_w = max(1, right - x0)
     content_panel_w = max(1, right - content_x0)
-    stage_mode = _detect_brush_options_mode(image, x0, b, panel_w)
+    # 与 ``_estimate_regions`` 同款：笔触面板右边界单独算，不占用背包的 ``right``。
+    brush_right = _clamp_int(min(right, b.right + b.w * BRUSH_ROI_RIGHT_RATIO + 1), 1, width)
+    brush_panel_w = max(1, brush_right - x0)
+    stage_mode = _detect_brush_options_mode(image, x0, b, brush_panel_w)
     regions = [
         RegionObservation(
             kind=RegionKind.CURRENT_PAINT,

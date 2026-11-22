@@ -24,6 +24,7 @@ from huahua_assistant.game_model import (
     apply_affix_to_state,
     install_backpack_paint,
     place_current_rule_anchor,
+    tile_final_level,
 )
 
 ANCHOR_ROW = 4
@@ -72,12 +73,14 @@ class SelfUpgradeAffixTests(unittest.TestCase):
     def test_install_applies_pending_to_the_placed_paint(self) -> None:
         plain = install_backpack_paint(_state(), 0, ANCHOR_ROW, 3)
         self.assertTrue(plain.success)
-        base_level = plain.state.tile(ANCHOR_ROW, 3).paint.level
+        # 断言**显示等级**（地块加成 + 颜料等级）。调色那 2 级 2026-11-22 起记在地块上，
+        # 读 paint.level 会把层级当结果，玩家看到的其实是 tile_final_level。
+        base_level = tile_final_level(plain.state.tile(ANCHOR_ROW, 3))
 
         with_affix = apply_affix_to_state(_state(), SELF_AFFIX)
         upgraded = install_backpack_paint(with_affix.state, 0, ANCHOR_ROW, 3)
         self.assertTrue(upgraded.success)
-        level = upgraded.state.tile(ANCHOR_ROW, 3).paint.level
+        level = tile_final_level(upgraded.state.tile(ANCHOR_ROW, 3))
 
         # 1(本体) + 2(自身词缀) + 2(调色) = 5；不选词缀只有 1 + 2 = 3
         self.assertEqual(base_level, 3)

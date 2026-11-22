@@ -211,8 +211,13 @@ def _cover_intermediate(
 
     覆盖类笔触把范围内颜料的**类型**交给服务端摇，模型无法预测；但**等级基准**能推：
 
-    * 2009~2011「转变为同等级的随机颜料」→ 等级 = 上一帧这一格的等级，地块加成清零；
-    * 2012「等级和内容替换为自身」→ 等级 = 自身等级，地块加成与光环保持不动。
+    * 2009~2011「转变为同等级的随机颜料」→ 等级 = 上一帧这一格的等级；
+    * 2012「等级和内容替换为自身」→ 等级 = 自身等级。
+
+    **地块加成两种情况都保留**（用户 2026-11-22 实机更正）：初始颜料的加成是加在
+    地块上的，换一枚颜料这 N 级仍然在。之前这里把 ``bonus`` 清零，结果是颜料被
+    覆盖后模型算出的等级比画面低一截——实测 c4r5 那格：模型 3、画面 6、
+    ``breakdown`` 还是空的，对账因此天天报红。
 
     类型一律取**这一帧画面上**的实测值——它已经是覆盖后的结果。这样对账只会因为
     「等级基准算错」报红，而不是因为随不到同一个类型就每笔都红，随机性不再是
@@ -229,15 +234,15 @@ def _cover_intermediate(
         observed = current.tile(row, col).paint
         if observed is None:
             continue
+        keep = tiles[index]
+        # 地块加成跟着地块走，不跟着颜料走：覆盖不改变它。
+        bonus = tile_bonus_level(keep)
         if copy_self:
             base = self_level
-            keep = tiles[index]
-            bonus = tile_bonus_level(keep)
             aura_amount = max(0, int(keep.aura_amount))
         else:
             base = _level(previous.tile(row, col).paint)
-            bonus = 0
-            aura_amount = 0
+            aura_amount = max(0, int(keep.aura_amount))
         if base <= 0:
             continue
         tiles[index] = Tile(
@@ -245,7 +250,7 @@ def _cover_intermediate(
             paint=replace(observed, level=min(MAX_LEVEL, base)),
             bonus_level=bonus,
             aura_amount=aura_amount,
-            aura_level=tile_aura_level(tiles[index]) if copy_self else 0,
+            aura_level=tile_aura_level(tiles[index]),
         )
     return replace(placed, tiles=tuple(tiles))
 

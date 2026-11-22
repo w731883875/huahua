@@ -1079,8 +1079,9 @@ def place_current_rule_anchor(
         f"安装即触发，范围内{upgraded_count}个目标颜料提升{rule.upgrade_amount}级，"
         "请选择背包颜料完成匹配"
     )
-    if scope_count:
-        message = f"{message}；笔触影响范围内{scope_count}个目标"
+    scope_phrase = _scope_affix_phrase(scope_count, placed_state.active_affix, unit="目标")
+    if scope_phrase:
+        message = f"{message}；{scope_phrase}"
     if settle_note:
         message = f"{message}；{settle_note}"
     return AnchorPlaceResult(
@@ -1497,8 +1498,9 @@ def install_backpack_paint(
     next_rule = replace(rule, match_current=min(match_count, rule.match_required))
     progress = f"{min(match_count, rule.match_required)}/{rule.match_required}"
     message = f"已安装{_paint_label(paint)}，安装即触发，范围内{upgraded_count}个目标颜料提升{rule.upgrade_amount}级，当前进度{progress}"
-    if scope_affix_count:
-        message = f"{message}；笔触影响范围内{scope_affix_count}个颜料"
+    scope_phrase = _scope_affix_phrase(scope_affix_count, state.active_affix)
+    if scope_phrase:
+        message = f"{message}；{scope_phrase}"
     if settle_note:
         message = f"{message}；{settle_note}"
     if persistent_affix_count:
@@ -1984,6 +1986,29 @@ def is_cover_affix(affix: AffixRule | None) -> bool:
     前者会让对账里的「同类型才吃调色」失效，不能按老值直接推。
     """
     return affix is not None and affix.effect in COVER_EFFECTS
+
+
+def _scope_affix_phrase(count: int, affix: AffixRule | None, *, unit: str = "颜料") -> str:
+    """这一笔笔触的影响措辞；没有影响就返回空串。
+
+    为什么要按效果分流（9931fc5 把三种效果统一成一句「笔触影响范围内 N 个」，
+    结果「额外提升」的**级数**被吞掉了，界面上看不出这一笔到底加了几级）：
+
+    * **额外提升类**（``DEFERRED_SCOPE_UPGRADE_EFFECTS``）—— 官方文案是
+      「额外提升 N 级」，所以必须把级数说出来，并点明它记在**地块加成**上；
+    * **覆盖类**（``COVER_EFFECTS``）—— ``settle_note`` 里已经有
+      「笔触改写范围内 N 枚颜料」，这里不重复；
+    * **其余范围类**（清除地块等）—— 不是"提升"，只报影响范围。
+    """
+    if count <= 0 or affix is None:
+        return ""
+    if affix.effect in COVER_EFFECTS:
+        return ""
+    if _is_deferred_scope_upgrade(affix):
+        amount = max(0, int(getattr(affix, "amount", 0) or 0))
+        tail = f"（+{amount}级，记在地块加成）" if amount else ""
+        return f"笔触额外提升{count}个{unit}{tail}"
+    return f"笔触影响范围内{count}个{unit}"
 
 
 def settle_place_effects(
@@ -3384,6 +3409,18 @@ def _current_match_count(state: PuzzleState, rule: CurrentPaintRule) -> int:
 
 
 def _apply_current_rule_upgrade(state: PuzzleState, rule: CurrentPaintRule) -> tuple[PuzzleState, int]:
+    """结算初始颜料的「调色效果：范围内目标提升 N 级」。
+
+    **加成落在地块上，不落在颜料身上**（用户 2026-11-22 实机口径）。
+
+    证据链：用户这局 c4r5 原本是 3 级怪物，被第三个初始颜料转成 3 级机械之神，
+    随后吃到第二个初始颜料（横向玩法 +2）与第三个（相邻玩法 +1），最终显示 6 级；
+    且**点击该地块，游戏提示的正是 +3** —— 2+1=3，说明这两笔加成是记在地块上的。
+
+    之前实现写 ``paint.level``，那格颜料一被覆盖/转换，先前积累的加成跟着旧颜料一起
+    消失，模型只能算出 3 级，而画面是 6 级、``breakdown`` 还是空的，对账天天报红。
+    """
+
     tiles = list(state.tiles)
     upgraded_count = 0
     for row, col in _placement_scope_cells(state, rule):
@@ -3393,14 +3430,10 @@ def _apply_current_rule_upgrade(state: PuzzleState, rule: CurrentPaintRule) -> t
             continue
         if not _tile_can_receive_current_buff(tile, state):
             continue
-        # 调色效果「提升 N 级」加到颜料等级上；地块加成已经顶满 7 级时不再产生收益。
-        tiles[index] = replace(tile, paint=replace(
-            tile.paint,
-            level=max(
-                tile.paint.level,
-                min(MAX_LEVEL - tile_bonus_level(tile) - tile_aura_level(tile), tile.paint.level + rule.upgrade_amount),
-            ),
-        ), buff_applied_id=state.current_buff_id)
+        tiles[index] = replace(
+            _tile_with_upgrade(tile, max(0, int(rule.upgrade_amount)), as_bonus=True),
+            buff_applied_id=state.current_buff_id,
+        )
         upgraded_count += 1
     return replace(state, tiles=tuple(tiles)), upgraded_count
 
@@ -5071,7 +5104,9 @@ def level_sources(
                 target=rule.target_object,
                 amount=max(0, int(rule.upgrade_amount)),
                 random_count=None,
-                as_bonus=False,
+                # 初始颜料的调色加成落在**地块**上（用户 2026-11-22 实机口径：
+                # c4r5 被转换后仍吃到 +2/+1 到 6 级，且点击地块提示 +3 = 2+1）。
+                as_bonus=True,
             )
         )
     chosen_affix = affix if affix is not None else state.active_affix
@@ -5363,13 +5398,16 @@ def _randomize_scope_paints(state: PuzzleState, affix: AffixRule, rng: random.Ra
 
     * **类型随机、等级不变**——新颜料沿用被替换那枚的**基础等级**
       （``paint.level``，不含地块加成）；
-    * **随机化会覆盖这一格之前累积的 buff**——地块加成清零，光环锚点也失效。
-      所以这里不能像清空/炸毁那样把 ``bonus_level`` 留下来；
+    * **地块加成保留**——覆盖只换颜料，不清地块 buff。这是 2026-11-22 补上的
+      实机样本：用户那局 c4r5 原本 3 级，被转成 3 级机械之神后仍吃到此前积累的
+      +2/+1，显示 6 级，且点击该地块游戏提示 +3。旧实现按「随机化会覆盖之前累积的
+      buff」把 ``bonus_level`` 清零（注释里本来就标着「待验证」），已被该样本否掉；
     * 必须**先于调色效果**结算（见 :func:`settle_place_effects`）：清零
       ``buff_applied_id`` 之后，这一格会按**新类型**重新吃一次调色。
 
-    待验证：若被替换的格子原本带地块加成（例如 3 级 + 1 = 显示 4），换出来的是
-    3 级还是 4 级，尚无实机样本。当前按「基础等级」实现（=3 级）。
+    2026-11-22 前的遗留问题（已被上面的样本回答）：若被替换的格子原本带地块加成
+    （例如 3 级 + 1 = 显示 4），换出来的是 3 级还是 4 级。现在口径是 4 级：
+    基础等级沿用 3，地块加成 +1 保留。
     """
     tiles = list(state.tiles)
     count = 0
@@ -5386,9 +5424,10 @@ def _randomize_scope_paints(state: PuzzleState, affix: AffixRule, rng: random.Ra
             paint=next_paint,
             buff_applied_id=None,
             affix_applied_id=None,
-            bonus_level=0,
-            aura_amount=0,
-            aura_level=0,
+            # 地块加成保留：用户 2026-11-22 的 c4r5 就是反例样本——被转成机械之神后
+            # 仍吃到此前积累的 +2/+1 到 6 级，点击地块提示 +3。光环是派生量，
+            # 交给 _recompute_auras 按当前锚点重算。
+            bonus_level=tile_bonus_level(tile),
         )
         count += 1
     return _recompute_auras(replace(state, tiles=tuple(tiles))), count

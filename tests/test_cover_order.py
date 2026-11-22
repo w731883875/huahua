@@ -16,7 +16,11 @@
 
 本文件用一条与随机结果无关的不变式锁住这件事：
 
-    被覆盖的格子，等级 = 3 + (1 if 覆盖后是玩法 else 0)
+    被覆盖的格子，**显示等级** = 3 + (1 if 覆盖后是玩法 else 0)
+
+比的是 ``tile_final_level``（棋盘上显示的值），因为用户看到的是显示值；至于那 +1
+记在颜料等级还是地块加成上，是实现细节。2026-11-22 的口径是后者（地块加成），
+依据是 c4r5 被转换后仍带着此前的加成到 6 级、且点击地块提示 +3。
 
 无论服务端把它们随机成什么类型，这条都必须成立；顺序错了就会大量出现
 「怪物 4 级」或「玩法 3 级」。下面另有一条负例，用旧顺序跑同一判据，
@@ -70,16 +74,21 @@ def _state(*, target: gm.PaintObject = gm.PaintObject.GAMEPLAY, upgrade: int = 1
 
 
 def _violations(state: gm.PuzzleState) -> list[tuple[int, int, str, int]]:
-    """不变式检查：覆盖后是玩法就该 4 级，是怪物就该 3 级。"""
+    """不变式检查：覆盖后是玩法就该显示 4 级，是怪物就该显示 3 级。
+
+    比的是 **``tile_final_level``（棋盘上显示的等级）**，不是 ``paint.level``：
+    用户看到的是显示值，而 2026-11-22 的口径下加在颜料等级还是地块加成上是实现细节。
+    """
     bad: list[tuple[int, int, str, int]] = []
     for row, col in FILLED:
-        paint = state.tile(row, col).paint
+        tile = state.tile(row, col)
+        paint = tile.paint
         if paint is None:
             bad.append((row, col, "空白", 0))
             continue
         expected = 4 if paint.category is gm.PaintCategory.GAMEPLAY else 3
-        if paint.level != expected:
-            bad.append((row, col, paint.category.value, paint.level))
+        if gm.tile_final_level(tile) != expected:
+            bad.append((row, col, paint.category.value, gm.tile_final_level(tile)))
     return bad
 
 
@@ -95,8 +104,12 @@ class CoverBeforeTintTest(unittest.TestCase):
         self.assertTrue(covered, "范围内有 4 枚颜料，覆盖应当真的动手")
         self.assertEqual(_violations(settled), [])
         for row, col in FILLED:
-            # 2009「同等级」替换会清掉这一格之前累积的地块加成
-            self.assertEqual(settled.tile(row, col).bonus_level, 0)
+            # 覆盖只换颜料，**不清**这一格已积累的地块加成（用户 2026-11-22 口径，
+            # c4r5 被转成机械之神后仍带着此前的 +2/+1）。
+            # 进来的加成是 0，覆盖后再吃调色 +1 → 玩法格 +1、怪物格 0。
+            tile = settled.tile(row, col)
+            expected_bonus = 1 if tile.paint.category is gm.PaintCategory.GAMEPLAY else 0
+            self.assertEqual(gm.tile_bonus_level(tile), expected_bonus)
 
     def test_anchor_is_never_covered(self) -> None:
         state = gm.replace(_state(), active_affix=_affix(gm.AffixEffect.RANDOMIZE_SCOPE_ANY))
@@ -122,8 +135,8 @@ class CoverBeforeTintTest(unittest.TestCase):
             self.assertIsNotNone(paint)
             self.assertIs(paint.category, rule_paint.category)
             self.assertEqual(paint.subtype, rule_paint.subtype)
-            # 等级 = 自身 3 级 + 调色 1 级
-            self.assertEqual(paint.level, 4)
+            # 显示等级 = 自身 3 级 + 调色 1 级
+            self.assertEqual(gm.tile_final_level(settled.tile(row, col)), 4)
 
     def test_random_category_affix_respects_its_target(self) -> None:
         """2011「随机玩法颜料」：覆盖后全变成玩法，于是全吃调色 → 全 4 级。"""
@@ -137,7 +150,7 @@ class CoverBeforeTintTest(unittest.TestCase):
             paint = settled.tile(row, col).paint
             self.assertIsNotNone(paint)
             self.assertIs(paint.category, gm.PaintCategory.GAMEPLAY)
-            self.assertEqual(paint.level, 4)
+            self.assertEqual(gm.tile_final_level(settled.tile(row, col)), 4)
 
 
 class LegacyOrderWouldFailTest(unittest.TestCase):

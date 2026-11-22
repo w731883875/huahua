@@ -7,7 +7,13 @@
 2. 最终等级 = min(MaxPlotLevel, 颜料等级 + 地块加成)，上限 7。
 3. 游戏内没有「拆下颜料」，只有强制调色；强制调色炸毁的是颜料，不是加成。
 
-「额外提升 N 级」类笔触加的是**加成**，普通「提升 N 级」加的是**颜料等级**。
+各级加成的落点（2026-11-22 口径）：
+
+* 「额外提升 N 级」类**笔触** → 地块加成；
+* 普通「提升 N 级」**笔触** → 颜料等级；
+* **初始颜料的调色效果** → 地块加成。依据：用户那局 c4r5 被转成机械之神后仍吃到
+  +2/+1 到 6 级，点击该地块游戏提示 +3（= 2+1）。写进颜料等级的话，颜料一被覆盖
+  这 N 级就没了，与画面永远对不上。
 """
 
 from __future__ import annotations
@@ -111,7 +117,8 @@ class BonusSurvivesOnTileTest(unittest.TestCase):
         self.assertEqual(gm.tile_bonus_level(tile), 4)
 
     def test_bonus_survives_force_complete_destruction(self) -> None:
-        state = _with_tile(_state(rule=_rule()), 2, 3, gm.Tile(gm.TileState.PAINT, gm.Paint(GAMEPLAY, 3), bonus_level=4))
+        # 规则本身不额外提升，单看「炸毁后加成还在」这件事
+        state = _with_tile(_state(rule=_rule(amount=0)), 2, 3, gm.Tile(gm.TileState.PAINT, gm.Paint(GAMEPLAY, 3), bonus_level=4))
         # 只留这一格有颜料，强制完成必定炸它
         result = gm.force_complete_current_rule(state, force_used=0, rng=random.Random(0))
 
@@ -161,15 +168,23 @@ class UpgradeLandsOnTheRightLayerTest(unittest.TestCase):
         self.assertEqual(tile.paint.level, 4)
         self.assertEqual(gm.tile_bonus_level(tile), 0)
 
-    def test_rule_effect_raises_paint_level_only(self) -> None:
+    def test_rule_effect_writes_tile_bonus(self) -> None:
+        """初始颜料的调色加成也落在地块上（用户 2026-11-22 口径）。
+
+        证据：c4r5 被转成机械之神后仍吃到 +2/+1 到 6 级，且点击该地块游戏提示 +3。
+        所以断言最终等级，并锁住「加成没写进颜料等级」——写进颜料等级的话，
+        那格颜料一被覆盖，这 N 级就跟着旧颜料一起没了。
+        """
+
         state = _with_tile(_state(rule=_rule(amount=2)), 2, 3, gm.Tile(gm.TileState.PAINT, gm.Paint(GAMEPLAY, 2)))
 
         upgraded, count = gm._apply_current_rule_upgrade(state, state.current_rule)
 
         self.assertEqual(count, 1)
         tile = upgraded.tile(2, 3)
-        self.assertEqual(tile.paint.level, 4)
-        self.assertEqual(gm.tile_bonus_level(tile), 0)
+        self.assertEqual(tile.paint.level, 2, "调色加成不该改颜料等级")
+        self.assertEqual(gm.tile_bonus_level(tile), 2)
+        self.assertEqual(gm.tile_final_level(tile), 4)
 
     def test_rule_effect_is_wasted_once_bonus_fills_the_cap(self) -> None:
         # 加成 +6 时 Lv1 已经是 7 级，再提升颜料等级不产生收益

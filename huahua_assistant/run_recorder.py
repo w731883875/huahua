@@ -32,10 +32,16 @@ def _brush_name(brush: str | None) -> str | None:
 
 AUTO_RUN_LOG = Path("runtime") / "auto_run_records.jsonl"
 
-#: 阶段一卡片在笔触面板里占的高度比例（面板顶部这一条）。与 ``vision`` 里
-#: ``_brush_stage1_crop`` 取的前 34% 保持一致：把点击落到卡片上要用同一个边界，
-#: 否则「点在上边缘」会被判成阶段二。
-STAGE1_CLICK_HEIGHT_RATIO = 0.34
+# 这里原来有个 ``STAGE1_CLICK_HEIGHT_RATIO = 0.34``，用于「阶段一卡片只在面板
+# 顶部 34% 内」的点击判定。2026-11-22 用户纠正：**两个阶段的卡片都是上下排列**，
+# 阶段一不是横排三张。那个常量把下半张卡的点击全挡掉了，已随判定改成 Y 分带一并删除。
+
+#: 缓存的「面板还没读出卡片时点下的那些点击」最多留几条。
+#: 正常一次操作只有「点卡片 + 点确认」两下，留 4 条足够，再多多半是误点。
+PENDING_CLICK_BUFFER_MAX = 4
+
+#: 缓存的点击最多等这么久（秒）。超过就丢——面板早就换了一屏，坐标不再对应。
+PENDING_CLICK_BUFFER_SECONDS = 8.0
 
 #: 开局时棋盘上自带的颜料块数。
 #:
@@ -348,6 +354,14 @@ class AutomaticRunRecorder:
         #: 阶段一（转锋/堆砌/扩散）抓到的那次点击：``(名称, 时间, 卡片序号)``。
         #: 只靠「选中高亮」读不出用户到底点了哪个，点击是唯一确凿来源。
         self._clicked_stage1: tuple[str, float, int] | None = None
+        #: 落在笔触面板里、但**当时还没读到「有哪几张卡」**的点击：``(x, y, 时间)``。
+        #:
+        #: 用户 2026-11-22 确认：两个阶段都是「先点卡片、再点确认」两步。而点击
+        #: 往往比词缀文字 OCR 更早到达——stage2 还没读出来时点下的那一下，以前
+        #: 直接被丢掉，于是那一局 0 条 ``affix_card_clicked``，只能退化成
+        #: ``effect_inference`` 猜（16:42/16:43 两局实测就是这样）。
+        #: 现在先按坐标存住，等卡片读出来再按 Y 分带回填。
+        self._buffered_panel_clicks: list[tuple[float, float, float]] = []
         #: 已经上报过选择的阶段一候选组。同一组候选只报一次 `brush_stage1_selected`，
         #: 免得每帧都补一条；候选变了（换面板/刷新）就重新允许上报。
         self._stage1_reported: tuple[str, ...] | None = None
@@ -527,6 +541,7 @@ class AutomaticRunRecorder:
         self._visible_stage2 = ()
         self._clicked_affix = None
         self._clicked_stage1 = None
+        self._buffered_panel_clicks = []
         self._stage1_reported = None
         self._pending_force_clicked_at = None
         self._events = []
@@ -1155,6 +1170,9 @@ class AutomaticRunRecorder:
                 self._clicked_stage1 = None
 
         if after_stage2 and after_stage2 != before_stage2:
+            # 卡片刚读出来：看看之前有没有「面板还没读出来时就点下去」的一下。
+            # 有就按 Y 分带回填成具体的词缀选择——这比事后靠等级变化反推可靠得多。
+            self._resolve_buffered_panel_click(after, after_stage2, emitted, now)
             if before_stage2:
                 emitted.append(
                     self._emit(
@@ -1239,6 +1257,64 @@ class AutomaticRunRecorder:
             self._stage1_reported = None
         return emitted
 
+    def _resolve_buffered_panel_click(
+        self,
+        brush: FastBrush,
+        stage2_options: tuple[str, ...],
+        emitted: list[str],
+        now: float,
+    ) -> None:
+        """把「卡片还没读出来时点下的那一下」回填成具体的词缀选择。
+
+        用户 2026-11-22 确认：第二阶段是**点词缀卡 + 点确认**两步，而且点完不
+        立即生效，要装到地块才生效。问题在于点击通常比词缀文字 OCR 更早到达，
+        ``stage2_options`` 还是空的时候点下的那一下以前直接丢掉，整局就 0 条
+        ``affix_card_clicked``，只能退化成 ``effect_inference`` 猜。
+
+        回填后写进 ``self._clicked_affix``，交给面板关闭时那段现成的逻辑收尾——
+        那边会标 ``source="captured_click"``、置信度 0.99，比反推硬气得多。
+        """
+
+        if self._clicked_affix is not None:
+            return
+        if brush is None or not stage2_options:
+            return
+        fresh = [(x, y, at) for x, y, at in self._buffered_panel_clicks if now - at <= PENDING_CLICK_BUFFER_SECONDS]
+        self._buffered_panel_clicks = fresh
+        if not fresh:
+            return
+        # 取**最后**一次落在面板里的点击：卡片点击之后紧跟着的是「确认」，
+        # 而确认按钮已经在记录时被排除了，所以剩下的最后一下就是点卡片那下。
+        chosen: tuple[float, float, float] | None = None
+        for entry in fresh:
+            if _point_in_rect(entry[0], entry[1], brush.panel_rect):
+                chosen = entry
+        if chosen is None:
+            return
+        x, y, clicked_at = chosen
+        relative_y = (y - brush.panel_rect.y) / max(1, brush.panel_rect.h)
+        index = min(len(stage2_options) - 1, max(0, int(relative_y * len(stage2_options))))
+        name = stage2_options[index]
+        self._clicked_affix = (name, clicked_at)
+        self._buffered_panel_clicks = []
+        emitted.append(
+            self._emit(
+                "affix_card_clicked",
+                {
+                    "selected": name,
+                    "card_index": index,
+                    "options": list(stage2_options),
+                    "brush": brush.chosen_stage1,
+                    "brush_name": _brush_name(brush.chosen_stage1),
+                    "confidence": 0.90,
+                    "source": "buffered_click",
+                    "clicked_at": round(clicked_at, 3),
+                    "note": "点击早于词缀文字 OCR，按点击纵坐标回填卡片序号",
+                },
+                clicked_at,
+            )
+        )
+
     def _record_control_clicks(
         self,
         snapshot: FastVisionSnapshot,
@@ -1249,6 +1325,15 @@ class AutomaticRunRecorder:
         emitted: list[str] = []
         brush = snapshot.brush or (self._last_snapshot.brush if self._last_snapshot is not None else None)
         for clicked_at, x, y in clicks:
+            # 确认按钮必须先排除。用户 2026-11-22：两个阶段都是「点卡片 → 再点确认」
+            # 两步操作，而确认按钮的几何落在面板下半部（``board_rect.h * 0.86``），
+            # 按下面的 Y 分带会被算成「点了第二张卡」——于是每点一次确认就凭空记一次
+            # card_index=1 的卡片点击，把真实选择覆盖掉。
+            confirm_rect = snapshot.regions.get(RegionKind.CONFIRM_BUTTON.value)
+            if confirm_rect is None and self._last_snapshot is not None:
+                confirm_rect = self._last_snapshot.regions.get(RegionKind.CONFIRM_BUTTON.value)
+            if confirm_rect is not None and _point_in_rect(x, y, confirm_rect):
+                continue
             if brush is not None and brush.stage2_options and _point_in_rect(x, y, brush.panel_rect):
                 relative_y = (y - brush.panel_rect.y) / max(1, brush.panel_rect.h)
                 index = 0 if relative_y < 0.52 else 1
@@ -1271,31 +1356,38 @@ class AutomaticRunRecorder:
                     )
                     continue
             if brush is not None and brush.stage1_options and _point_in_rect(x, y, brush.panel_rect):
-                # 阶段一的三张卡横排在面板上部（占面板高度上 34%，与视觉层的
-                # ``_brush_stage1_crop`` 同一比例），按横向位置反推点了第几张。
+                # 阶段一同样是**上下排列**（用户 2026-11-22 明确纠正：不是横排三张）。
+                # 之前这里按「面板顶部 34% 之内 + X 坐标等分」反推，两个后果：
+                #   * 点下面那张卡（relative_y > 0.34）永远记不到；
+                #   * 点上面那张卡时用 X 反推索引，与真实位置无关，等于随机。
+                # 现在改成按 Y 分带，和阶段二同一套几何。
                 relative_y = (y - brush.panel_rect.y) / max(1, brush.panel_rect.h)
                 count = len(brush.stage1_options)
-                if relative_y <= STAGE1_CLICK_HEIGHT_RATIO:
-                    relative_x = (x - brush.panel_rect.x) / max(1, brush.panel_rect.w)
-                    index = min(count - 1, max(0, int(relative_x * count)))
-                    name = brush.stage1_options[index]
-                    self._clicked_stage1 = (name, clicked_at, index)
-                    emitted.append(
-                        self._emit(
-                            "brush_stage1_card_clicked",
-                            {
-                                "selected": name,
-                                "selected_name": _brush_name(name),
-                                "code": brush_code(name),
-                                "card_index": index,
-                                "options": list(brush.stage1_options),
-                                "names": [_brush_name(option) for option in brush.stage1_options],
-                                "confidence": 0.99,
-                            },
-                            clicked_at,
-                        )
+                index = min(count - 1, max(0, int(relative_y * count)))
+                name = brush.stage1_options[index]
+                self._clicked_stage1 = (name, clicked_at, index)
+                emitted.append(
+                    self._emit(
+                        "brush_stage1_card_clicked",
+                        {
+                            "selected": name,
+                            "selected_name": _brush_name(name),
+                            "code": brush_code(name),
+                            "card_index": index,
+                            "options": list(brush.stage1_options),
+                            "names": [_brush_name(option) for option in brush.stage1_options],
+                            "confidence": 0.99,
+                        },
+                        clicked_at,
                     )
-                    continue
+                )
+                continue
+            # 落到这里 = 点在笔触面板里，但这一帧还没读出「有哪几张卡」。
+            # 先按坐标存住，等卡片读出来后由 ``_resolve_buffered_panel_click`` 回填。
+            if brush is not None and _point_in_rect(x, y, brush.panel_rect):
+                self._buffered_panel_clicks.append((x, y, clicked_at))
+                del self._buffered_panel_clicks[:-PENDING_CLICK_BUFFER_MAX]
+                continue
             force_rect = snapshot.regions.get(RegionKind.FORCE_COMPLETE.value)
             if force_rect is None and self._last_snapshot is not None:
                 force_rect = self._last_snapshot.regions.get(RegionKind.FORCE_COMPLETE.value)

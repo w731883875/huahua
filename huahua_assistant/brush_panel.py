@@ -353,6 +353,14 @@ PANEL_READ_INTERVAL = 0.35
 #: 读到的面板又变成空——那是 2026-11-20 之前的老毛病。3.0s ≈ 两个泵周期。
 PANEL_READ_STALE = 3.0
 
+#: 一笔异步 OCR 最多允许在飞这么久（秒）。超过就当它卡死，重新放行请求。
+#:
+#: 2026-11-22 实机：OCR 子进程卡住后 ``pending`` 永久为 True，而
+#: :func:`read_brush_panel_async` 的放行条件要求 ``not pending``，于是整局再也不
+#: 请求 OCR——阶段二永远是空，``affix_card_clicked`` 一条都没有。一次正常读取远
+#: 低于 1 秒，给到 6 秒足够宽松。
+PANEL_READ_PATIENCE = 6.0
+
 _ASYNC_LOCK = threading.Lock()
 _ASYNC_STATE: dict[str, object] = {
     "key": None,
@@ -362,6 +370,9 @@ _ASYNC_STATE: dict[str, object] = {
     "pending": False,
     "thread": None,
     "generation": 0,
+    #: 当前占着 ``pending`` 的那笔请求是哪个 generation。worker 回来时靠它判断
+    #: 「这是我占的位吗」，只清自己那一笔，不清后来者的。
+    "inflight_generation": None,
     #: 上一次成功读取时的 32x12 灰度缩略图，用来判断「面板换了没有」。
     "reading_vector": None,
 }
@@ -416,6 +427,7 @@ def reset_cache() -> None:
                 "reading_at": 0.0,
                 "requested_at": 0.0,
                 "pending": False,
+                "inflight_generation": None,
                 "generation": int(_ASYNC_STATE["generation"]) + 1,
                 "reading_vector": None,
             }
@@ -531,6 +543,15 @@ def read_brush_panel_async(crop: np.ndarray) -> BrushPanelReading | None:
                 _ASYNC_STATE["reading_vector"] = None
             else:
                 _ASYNC_STATE["reading_vector"] = vector
+        # 看门狗：OCR 子进程卡死时 ``pending`` 会一直挂着，而放行条件要求
+        # ``not pending`` —— 结果就是**整局再也不请求 OCR**，阶段二永远为空。
+        # 2026-11-22 实机就是读到 17:21 之后彻底停摆。超过
+        # :data:`PANEL_READ_PATIENCE` 秒就当那笔已经死了，重新放行。
+        if _ASYNC_STATE["pending"] and (
+            now - float(_ASYNC_STATE["requested_at"]) > PANEL_READ_PATIENCE
+        ):
+            _ASYNC_STATE["pending"] = False
+            _ASYNC_STATE["inflight_generation"] = None
         should_request = not _ASYNC_STATE["pending"] and (
             now - float(_ASYNC_STATE["requested_at"]) >= PANEL_READ_INTERVAL
         )
@@ -538,6 +559,7 @@ def read_brush_panel_async(crop: np.ndarray) -> BrushPanelReading | None:
             _ASYNC_STATE["pending"] = True
             _ASYNC_STATE["requested_at"] = now
             _ASYNC_STATE["key"] = key
+            _ASYNC_STATE["inflight_generation"] = int(_ASYNC_STATE["generation"])
     if should_request:
         thread = threading.Thread(
             target=_async_read_worker,
@@ -563,10 +585,20 @@ def _async_read_worker(key: str, crop: np.ndarray, generation: int) -> None:
         reading = read_brush_panel(crop)
     finally:
         with _ASYNC_LOCK:
-            # 期间调过 reset_cache（换了面板/换了局）就丢掉这次结果，
-            # 免得旧面板的读数盖到新面板上。
-            if generation == int(_ASYNC_STATE["generation"]):
+            # ``pending`` 必须能复位，否则**整局再也不请求 OCR**。
+            #
+            # 2026-11-22 实机：整局读到 17:21 就再也读不到词缀，``brush_options``
+            # 之后一条都不产生。原实现只在 generation 相等时复位 ``pending``：
+            # worker 在 ``reset_cache()`` 之前拿到旧 generation、之后才回来，两者
+            # 不等，``pending`` 就永久停在 True。而放行条件要求 ``not pending``，
+            # 于是彻底停摆，阶段二永远是空、``affix_card_clicked`` 一条都没有。
+            #
+            # 现在按「是不是自己占的位」来判：只清自己那一笔，不清后来者的。
+            # 读数是否采用仍然只看 generation，旧面板的结果不会串到新面板上。
+            if _ASYNC_STATE.get("inflight_generation") == generation:
                 _ASYNC_STATE["pending"] = False
+                _ASYNC_STATE["inflight_generation"] = None
+            if generation == int(_ASYNC_STATE["generation"]):
                 if reading is not None:
                     _remember_async(key, reading)
                     _ASYNC_STATE["reading_vector"] = panel_signature_vector(crop)

@@ -163,11 +163,12 @@ class BrushChoiceRecordingTests(unittest.TestCase):
         self.assertEqual(1, clicked["card_index"])
 
     def test_confirm_button_click_is_not_a_card_click(self) -> None:
-        """点「确认」不能被记成点了下面那张词缀卡。
+        """同一条词缀卡连点两下（点卡片 + 点确认）只算一次选择。
 
-        确认按钮几何落在面板下半部（``board_rect.h * 0.86``），按 Y 分带会被算成
-        ``card_index=1``。用户 2026-11-22 实机记录里 22:08:29 / 22:08:31 连续两次
-        ``affix_card_clicked`` 就是这种污染。
+        为什么不按「确认按钮矩形」硬排除：那个矩形是**几何估算**的
+        （``y+0.80h ~ 0.91h``），而下面那张词缀卡正好也占到 0.9h，硬排除会把
+        「点下面那张卡」一起吃掉——2026-11-22 17:21 那局就是这样整局 0 条
+        ``affix_card_clicked``。
         """
 
         tiles = [_blank_tile(index) for index in range(36)]
@@ -177,14 +178,42 @@ class BrushChoiceRecordingTests(unittest.TestCase):
         )
         _feed(self.recorder, _snapshot(tiles, brush=panel), 340.0)
 
-        confirm = Rect(100, 200, 120, 40)  # 落在面板 (100,40,300,200) 的下半部
+        # 连点两下同一条卡（下面那条），间隔 2 秒。
+        for offset in (0.3, 2.3):
+            self.recorder.process(
+                _snapshot(tiles, brush=panel),
+                observed_at=340.0 + offset,
+                clicks=((340.0 + offset - 0.05, 160.0, 220.0),),
+            )
+
+        clicked = self._events("affix_card_clicked")
+        self.assertEqual(1, len(clicked), "点卡片 + 点确认只该记一次")
+        self.assertEqual("范围内颜料变成随机类型颜料", clicked[0]["payload"]["selected"])
+
+    def test_bottom_affix_card_is_not_swallowed(self) -> None:
+        """点下面那张词缀卡必须记到。
+
+        这条是为了锁住上面那个教训：确认按钮的估算矩形和下面那张卡重叠，
+        一旦回到「按矩形硬排除」，这条会立刻红。
+        """
+
+        tiles = [_blank_tile(index) for index in range(36)]
+        panel = _brush(
+            stage1_options=("stack",),
+            stage2_options=("自身提升1级", "范围内颜料变成随机类型颜料"),
+        )
+        _feed(self.recorder, _snapshot(tiles, brush=panel), 360.0)
+
+        confirm = Rect(100, 200, 120, 40)  # 与下面那张卡重叠的估算位置
         self.recorder.process(
             _snapshot(tiles, brush=panel, regions={"confirm_button": confirm}),
-            observed_at=340.3,
-            clicks=((340.25, 160.0, 220.0),),
+            observed_at=360.3,
+            clicks=((360.25, 160.0, 220.0),),
         )
 
-        self.assertEqual([], self._events("affix_card_clicked"))
+        clicked = self._events("affix_card_clicked")
+        self.assertEqual(1, len(clicked))
+        self.assertEqual(1, clicked[0]["payload"]["card_index"])
 
     def test_stage1_choice_read_from_highlight_is_marked_as_such(self) -> None:
         tiles = [_blank_tile(index) for index in range(36)]

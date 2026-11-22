@@ -43,6 +43,9 @@ PENDING_CLICK_BUFFER_MAX = 4
 #: 缓存的点击最多等这么久（秒）。超过就丢——面板早就换了一屏，坐标不再对应。
 PENDING_CLICK_BUFFER_SECONDS = 8.0
 
+#: 「点卡片 + 点确认」两下算一次选择：同一条卡在这个秒数内连点两下，只记第一下。
+CONFIRM_DEDUPE_SECONDS = 3.0
+
 #: 开局时棋盘上自带的颜料块数。
 #:
 #: 游戏开局就送 1 块初始颜料，它不是"上一局的残留"。所以接入时看到 1 块
@@ -362,6 +365,9 @@ class AutomaticRunRecorder:
         #: ``effect_inference`` 猜（16:42/16:43 两局实测就是这样）。
         #: 现在先按坐标存住，等卡片读出来再按 Y 分带回填。
         self._buffered_panel_clicks: list[tuple[float, float, float]] = []
+        #: 最后一次看到的笔触面板矩形。点「确认」那一帧面板往往已经从视觉里消失，
+        #: 没有这个兜底就没法判断「这一下点在面板上」。
+        self._last_panel_rect: Rect | None = None
         #: 已经上报过选择的阶段一候选组。同一组候选只报一次 `brush_stage1_selected`，
         #: 免得每帧都补一条；候选变了（换面板/刷新）就重新允许上报。
         self._stage1_reported: tuple[str, ...] | None = None
@@ -542,6 +548,7 @@ class AutomaticRunRecorder:
         self._clicked_affix = None
         self._clicked_stage1 = None
         self._buffered_panel_clicks = []
+        self._last_panel_rect = None
         self._stage1_reported = None
         self._pending_force_clicked_at = None
         self._events = []
@@ -1227,6 +1234,10 @@ class AutomaticRunRecorder:
                 )
             )
             self._visible_stage2 = ()
+            # 面板消失这一帧再回填一次：点「确认」关闭面板时，视觉里已经看不到
+            # 卡片了，但点击坐标还留在缓存里。这是最容易漏掉的一次机会。
+            if self._clicked_affix is None and before is not None:
+                self._resolve_buffered_panel_click(before, before_stage2, emitted, now)
             clicked = self._clicked_affix
             if clicked is not None and clicked[0] in before_stage2:
                 selected = resolve_affix(clicked[0])
@@ -1283,8 +1294,8 @@ class AutomaticRunRecorder:
         self._buffered_panel_clicks = fresh
         if not fresh:
             return
-        # 取**最后**一次落在面板里的点击：卡片点击之后紧跟着的是「确认」，
-        # 而确认按钮已经在记录时被排除了，所以剩下的最后一下就是点卡片那下。
+        # 取**最后一次**落在面板里的点击。卡片点击之后紧跟着的是「确认」，两下都
+        # 落在卡片区域内，所以「最后一下」和「第一下」只要序号相同就是同一次操作。
         chosen: tuple[float, float, float] | None = None
         for entry in fresh:
             if _point_in_rect(entry[0], entry[1], brush.panel_rect):
@@ -1324,21 +1335,28 @@ class AutomaticRunRecorder:
             return []
         emitted: list[str] = []
         brush = snapshot.brush or (self._last_snapshot.brush if self._last_snapshot is not None else None)
+        if brush is not None:
+            self._last_panel_rect = brush.panel_rect
         for clicked_at, x, y in clicks:
-            # 确认按钮必须先排除。用户 2026-11-22：两个阶段都是「点卡片 → 再点确认」
-            # 两步操作，而确认按钮的几何落在面板下半部（``board_rect.h * 0.86``），
-            # 按下面的 Y 分带会被算成「点了第二张卡」——于是每点一次确认就凭空记一次
-            # card_index=1 的卡片点击，把真实选择覆盖掉。
-            confirm_rect = snapshot.regions.get(RegionKind.CONFIRM_BUTTON.value)
-            if confirm_rect is None and self._last_snapshot is not None:
-                confirm_rect = self._last_snapshot.regions.get(RegionKind.CONFIRM_BUTTON.value)
-            if confirm_rect is not None and _point_in_rect(x, y, confirm_rect):
-                continue
             if brush is not None and brush.stage2_options and _point_in_rect(x, y, brush.panel_rect):
                 relative_y = (y - brush.panel_rect.y) / max(1, brush.panel_rect.h)
                 index = 0 if relative_y < 0.52 else 1
                 if 0 <= index < len(brush.stage2_options):
                     name = brush.stage2_options[index]
+                    # 同一条卡连点两下 = 「点卡片 + 点确认」，只算一次选择。
+                    #
+                    # 为什么不去排除确认按钮的矩形：那个矩形是**几何估算**的
+                    # （``y+0.80h ~ 0.91h``），而下面那张词缀卡正好也占到 0.9h，
+                    # 硬排除会把「点下面那张卡」一起吃掉了——2026-11-22 17:21
+                    # 那一局就是这样，整局 0 条 affix_card_clicked。
+                    # 改按「同序号去重」判断，既不依赖那个不准的矩形，也符合
+                    # 「确认不会改变选择」这个事实。
+                    if (
+                        self._clicked_affix is not None
+                        and self._clicked_affix[0] == name
+                        and clicked_at - self._clicked_affix[1] <= CONFIRM_DEDUPE_SECONDS
+                    ):
+                        continue
                     self._clicked_affix = (name, clicked_at)
                     emitted.append(
                         self._emit(
@@ -1365,6 +1383,14 @@ class AutomaticRunRecorder:
                 count = len(brush.stage1_options)
                 index = min(count - 1, max(0, int(relative_y * count)))
                 name = brush.stage1_options[index]
+                # 同上面阶段二：点卡片后紧跟着的「确认」会落在同一张卡上，
+                # 同序号且时间相邻就不重复记，只保留第一次。
+                if (
+                    self._clicked_stage1 is not None
+                    and self._clicked_stage1[0] == name
+                    and clicked_at - self._clicked_stage1[1] <= CONFIRM_DEDUPE_SECONDS
+                ):
+                    continue
                 self._clicked_stage1 = (name, clicked_at, index)
                 emitted.append(
                     self._emit(
@@ -1384,7 +1410,8 @@ class AutomaticRunRecorder:
                 continue
             # 落到这里 = 点在笔触面板里，但这一帧还没读出「有哪几张卡」。
             # 先按坐标存住，等卡片读出来后由 ``_resolve_buffered_panel_click`` 回填。
-            if brush is not None and _point_in_rect(x, y, brush.panel_rect):
+            panel_rect = brush.panel_rect if brush is not None else self._last_panel_rect
+            if panel_rect is not None and _point_in_rect(x, y, panel_rect):
                 self._buffered_panel_clicks.append((x, y, clicked_at))
                 del self._buffered_panel_clicks[:-PENDING_CLICK_BUFFER_MAX]
                 continue

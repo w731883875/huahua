@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 import time
 from collections import Counter
 from dataclasses import asdict, is_dataclass
@@ -45,40 +46,67 @@ _DIAGNOSTIC_EVENTS = {
     "slow_frame",
 }
 
+#: 最近一次落盘各步骤的耗时（秒）。收尾卡顿时用它定位到底哪一步吃掉了时间。
+#:
+#: 为什么放在模块级而不是直接写一条观测：``record_observation`` 自己就是被埋点
+#: 的对象，从里面再写一条观测会递归。所以这里只记内存，由 ``app.py`` 在写
+#: ``run_session_finished`` 时把快照塞进 payload。
+LAST_PERSIST_TIMING: dict[str, float] = {}
+
 
 def record_observation(event_type: str, payload: dict[str, Any], *, source: str) -> None:
     if source != "real_capture" and event_type not in _DIAGNOSTIC_EVENTS:
         return
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-    session_events = _load_events() if event_type in _RUN_CONTEXT_EVENTS else ()
+    started = time.perf_counter()
+    # 浅拷贝一份：会话上下文只读，但缓存里的那个列表归缓存所有。
+    session_events = list(_load_events()) if event_type in _RUN_CONTEXT_EVENTS else ()
+    loaded = time.perf_counter()
     normalized_payload = normalize_observation_payload(
         event_type,
         _jsonable(payload),
         session_events=session_events,
     )
+    normalized = time.perf_counter()
     event = {
         "ts": time.time(),
         "event": event_type,
         "source": source,
         "payload": normalized_payload,
     }
-    with OBSERVATION_LOG.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+    _append_jsonl_cached(OBSERVATION_LOG, event)
+    written = time.perf_counter()
+    LAST_PERSIST_TIMING.update(
+        {
+            "observation_load": round(loaded - started, 3),
+            "observation_normalize": round(normalized - loaded, 3),
+            "observation_write": round(written - normalized, 3),
+        }
+    )
 
 
 def record_correction(payload: dict[str, Any], *, source: str) -> None:
     if source != "real_capture":
         return
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    started = time.perf_counter()
     event = {
         "ts": time.time(),
         "event": "corrected_observation",
         "source": source,
         "payload": _jsonable(payload),
     }
-    with CORRECTION_LOG.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+    _append_jsonl_cached(CORRECTION_LOG, event)
+    appended = time.perf_counter()
     _write_stats(_load_events(), _load_corrections(), _load_trajectories())
+    finished = time.perf_counter()
+    LAST_PERSIST_TIMING.update(
+        {
+            "correction_append": round(appended - started, 3),
+            "correction_stats": round(finished - appended, 3),
+            "correction_total": round(finished - started, 3),
+        }
+    )
 
 
 def record_high_score_trajectory(payload: dict[str, Any], *, source: str) -> bool:
@@ -86,17 +114,33 @@ def record_high_score_trajectory(payload: dict[str, Any], *, source: str) -> boo
         return False
     if not _trajectory_payload_is_trusted(payload):
         return False
+    started = time.perf_counter()
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     legacy_payload_hash = _payload_hash(payload)
     normalized_payload = normalize_trajectory_payload(_jsonable(payload))
     payload_hash = _payload_hash(normalized_payload)
+    existing = _load_trajectories()
     existing_hashes: set[str] = set()
-    for existing in _load_trajectories():
-        existing_payload = existing.get("payload") or {}
-        existing_hashes.add(str(existing.get("payload_hash") or _payload_hash(existing_payload)))
-        existing_hashes.add(_payload_hash(existing_payload))
-        existing_hashes.add(_payload_hash(normalize_trajectory_payload(existing_payload)))
+    for entry in existing:
+        existing_payload = entry.get("payload") or {}
+        # 新记录里 ``payload_hash`` **就是**规范化后载荷的哈希（见下面写入处），
+        # 直接拿来用即可；只有老记录缺这个字段时才重算。
+        # 重算一条要遍历最多 240 步做 normalize + sha256，32 局实测 4.75 秒——
+        # 这是收尾卡顿的第二大头，不能再无条件跑。
+        stored_hash = str(entry.get("payload_hash") or "")
+        if stored_hash:
+            existing_hashes.add(stored_hash)
+        else:
+            existing_hashes.add(_payload_hash(normalize_trajectory_payload(existing_payload)))
+        existing_hashes.add(str(entry.get("legacy_payload_hash") or _payload_hash(existing_payload)))
+    hashed = time.perf_counter()
     if payload_hash in existing_hashes or legacy_payload_hash in existing_hashes:
+        LAST_PERSIST_TIMING.update(
+            {
+                "trajectory_hash": round(hashed - started, 3),
+                "trajectory_total": round(hashed - started, 3),
+            }
+        )
         return False
     event = {
         "ts": time.time(),
@@ -106,10 +150,23 @@ def record_high_score_trajectory(payload: dict[str, Any], *, source: str) -> boo
         "payload_hash": payload_hash,
         "legacy_payload_hash": legacy_payload_hash,
     }
-    with TRAJECTORY_LOG.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
-    _prune_trajectories()
+    _append_trajectory_event(event)
+    written = time.perf_counter()
+    # 直接读缓存那一份（刚追加的那条已经在里面了，不能再手动 + [event]，
+    # 否则同一条会被算两次）。缓存若因签名不符被丢弃，这里会重读一次，结果仍正确。
+    _prune_trajectories(events=_load_trajectories())
+    pruned = time.perf_counter()
     _write_stats(_load_events(), _load_corrections(), _load_trajectories())
+    stats_done = time.perf_counter()
+    LAST_PERSIST_TIMING.update(
+        {
+            "trajectory_hash": round(hashed - started, 3),
+            "trajectory_write": round(written - hashed, 3),
+            "trajectory_prune": round(pruned - written, 3),
+            "trajectory_stats": round(stats_done - pruned, 3),
+            "trajectory_total": round(stats_done - started, 3),
+        }
+    )
     return True
 
 
@@ -162,22 +219,33 @@ def _trajectory_sort_key(event: dict[str, Any]) -> tuple[float, float]:
     return score, ts
 
 
-def _prune_trajectories(limit: int = MAX_TRAJECTORY_SESSIONS) -> int:
+def _prune_trajectories(
+    limit: int = MAX_TRAJECTORY_SESSIONS,
+    *,
+    events: list[dict[str, Any]] | None = None,
+) -> int:
     """按内部评分降序只保留前 ``limit`` 局，返回丢掉的条数。
 
     只在**超限**时才重写文件：正常一局一次 append，不额外付出 IO。
     先写 ``.tmp`` 再 ``replace``，避免写到一半崩溃把整个高分库搞坏。
+
+    ``events`` 允许调用方把已经读出来的那份传进来，省掉一次整文件解析
+    （13.9 MB 实测 0.7 秒，而它在收尾路径上会被调用两次）。
     """
     if limit <= 0:
         return 0
-    events = _load_trajectories()
+    if events is None:
+        events = _load_trajectories()
     if len(events) <= limit:
         return 0
     keep = sorted(events, key=_trajectory_sort_key, reverse=True)[:limit]
     temp = TRAJECTORY_LOG.with_name(TRAJECTORY_LOG.name + ".tmp")
     try:
         temp.write_text(
-            "".join(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n" for event in keep),
+            "".join(
+                json.dumps(_compact_trajectory_event(event), ensure_ascii=False, sort_keys=True) + "\n"
+                for event in keep
+            ),
             encoding="utf-8",
         )
         temp.replace(TRAJECTORY_LOG)
@@ -186,6 +254,9 @@ def _prune_trajectories(limit: int = MAX_TRAJECTORY_SESSIONS) -> int:
         if temp.exists():
             temp.unlink(missing_ok=True)
         return 0
+    # 整份重写后缓存必然过期。签名检查也能发现，但那要多一次 stat 才发现，
+    # 而且留着一份随时会膨胀的旧列表没意义。
+    _invalidate_jsonl_cache(TRAJECTORY_LOG)
     return len(events) - limit
 
 
@@ -250,19 +321,18 @@ _LEARNING_STATS_CACHE_SIGNATURE: tuple[tuple[bool, int, int], ...] | None = None
 _LEARNING_STATS_CACHE: dict[str, Any] | None = None
 
 
+def _logs_signature() -> tuple[tuple[bool, int, int], ...]:
+    """三个学习日志的 ``(存在, 字节数, mtime_ns)`` 组合签名。"""
+    return tuple(
+        _file_signature(path) for path in (OBSERVATION_LOG, CORRECTION_LOG, TRAJECTORY_LOG)
+    )
+
+
 def load_learning_stats() -> dict[str, Any]:
     # Rebuild only when a source log changes. Re-parsing all JSONL files for
     # every realtime frame consumed most of the 500 ms response budget.
     global _LEARNING_STATS_CACHE_SIGNATURE, _LEARNING_STATS_CACHE
-    paths = (OBSERVATION_LOG, CORRECTION_LOG, TRAJECTORY_LOG)
-    signature: list[tuple[bool, int, int]] = []
-    for path in paths:
-        try:
-            stat = path.stat()
-            signature.append((True, int(stat.st_size), int(stat.st_mtime_ns)))
-        except OSError:
-            signature.append((False, 0, 0))
-    frozen_signature = tuple(signature)
+    frozen_signature = _logs_signature()
     if _LEARNING_STATS_CACHE is not None and frozen_signature == _LEARNING_STATS_CACHE_SIGNATURE:
         return _LEARNING_STATS_CACHE
     stats = _build_complete_stats(_load_events(), _load_corrections(), _load_trajectories())
@@ -271,16 +341,38 @@ def load_learning_stats() -> dict[str, Any]:
     return stats
 
 
+def cached_learning_stats() -> dict[str, Any] | None:
+    """**只取现成的**统计，绝不现算；没有就是 ``None``。
+
+    界面刷新用这个：后台线程算完会顺手把结果放进缓存，界面拿着用即可，不必在主线程
+    上再等 1.8 秒。
+    """
+    return _LEARNING_STATS_CACHE
+
+
 def _load_events() -> list[dict[str, Any]]:
-    return _load_jsonl(OBSERVATION_LOG)
+    return _load_jsonl_cached(OBSERVATION_LOG)
 
 
 def _load_corrections() -> list[dict[str, Any]]:
-    return _load_jsonl(CORRECTION_LOG)
+    return _load_jsonl_cached(CORRECTION_LOG)
 
 
 def _load_trajectories() -> list[dict[str, Any]]:
-    return _load_jsonl(TRAJECTORY_LOG)
+    """读高分轨迹库，**返回展开后的**事件（磁盘上可能存的是压缩形式）。
+
+    所有调用方（统计、推荐、模仿分析、最低分门槛）看到的都是和压缩前一模一样的
+    字段，压缩对它们完全透明。展开结果按文件签名单独缓存，所以只有文件变了才会
+    重新展开。
+    """
+    global _TRAJECTORY_EXPANDED
+    signature = _file_signature(TRAJECTORY_LOG)
+    cached = _TRAJECTORY_EXPANDED
+    if cached is not None and cached[0] == signature:
+        return cached[1]
+    expanded = [_expand_trajectory_event(event) for event in _load_jsonl_cached(TRAJECTORY_LOG)]
+    _TRAJECTORY_EXPANDED = (signature, expanded)
+    return expanded
 
 
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -295,6 +387,274 @@ def _load_jsonl(path: Path) -> list[dict[str, Any]]:
         except json.JSONDecodeError:
             continue
     return events
+
+
+#: 轨迹里**同一局内高度重复**的步骤字段：一批一模一样的快照会被原样存几十遍。
+#:
+#: 实测某局 63 步里 ``backpack_cumulative`` 只有 37 种、``backpack_pages`` 只有
+#: 31 种、``tiles`` 只有 43 种，而这三项（加上 ``backpack_visible``）占了整局
+#: 体积的 49%。压缩方式是**引用去重**：同样的内容只存一份放进 ``snapshots``
+#: 表，步骤里留一个整数下标。内容一个字节不少，只是不再重复存。
+#:
+#: 为什么不直接把字段删掉：这些字段是复盘/训练的证据（背包当时长什么样、
+#: 推荐候选是什么、这一手改了什么）。去重是无损的，删字段是有损的。
+_DEDUPE_STEP_FIELDS = (
+    "tiles",
+    "candidates",
+    "top",
+    "backpack_cumulative",
+    "backpack_pages",
+    "backpack_visible",
+    "decision_context",
+    "inferred_action",
+    "outcome",
+)
+
+#: 压缩结构版本。读取时只认这个标记；老轨迹没有它，按原样读。
+_TRAJECTORY_COMPACTION_VERSION = 2
+
+#: 背包格里那个 96 字符的图标指纹串：整库出现 11789 次只有 1935 种，
+#: 单这一项就占 10.4% 体积。做一张字符串池，格子里的值换成池下标。
+_POOLED_FIELD = "fingerprint"
+
+
+def _pool_fingerprints(node: Any, pool: list[str], index: dict[str, int]) -> None:
+    """递归把 ``fingerprint`` 字符串换成字符串池下标（原地改 ``node``）。"""
+    if isinstance(node, dict):
+        for key, value in list(node.items()):
+            if key == _POOLED_FIELD and isinstance(value, str):
+                slot = index.get(value)
+                if slot is None:
+                    slot = len(pool)
+                    pool.append(value)
+                    index[value] = slot
+                node[key] = slot
+            else:
+                _pool_fingerprints(value, pool, index)
+    elif isinstance(node, list):
+        for item in node:
+            _pool_fingerprints(item, pool, index)
+
+
+def _unpool_fingerprints(node: Any, pool: list[str]) -> None:
+    """``_pool_fingerprints`` 的逆操作。下标越界就原样留着，绝不抛。"""
+    if isinstance(node, dict):
+        for key, value in list(node.items()):
+            if key == _POOLED_FIELD and isinstance(value, int) and not isinstance(value, bool):
+                if 0 <= value < len(pool):
+                    node[key] = pool[value]
+            else:
+                _unpool_fingerprints(value, pool)
+    elif isinstance(node, list):
+        for item in node:
+            _unpool_fingerprints(item, pool)
+
+
+def compact_trajectory_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """把一局轨迹里重复的步骤字段抽成 ``snapshots`` 表，步骤里只留下标。
+
+    完全无损：``expand_trajectory_payload`` 能还原出逐字节等价的结构。
+    序列化不了的值（理论上不该有）原样留在步骤里，绝不丢。
+    """
+    steps = payload.get("steps")
+    if not isinstance(steps, list) or not steps:
+        return payload
+    tables: dict[str, list[Any]] = {}
+    indexes: dict[str, dict[str, int]] = {}
+    compacted_steps: list[Any] = []
+    for step in steps:
+        if not isinstance(step, dict):
+            compacted_steps.append(step)
+            continue
+        new_step = dict(step)
+        for field in _DEDUPE_STEP_FIELDS:
+            if field not in new_step:
+                continue
+            value = new_step.pop(field)
+            try:
+                key = json.dumps(value, ensure_ascii=False, sort_keys=True)
+            except (TypeError, ValueError):
+                new_step[field] = value
+                continue
+            table = tables.setdefault(field, [])
+            index = indexes.setdefault(field, {})
+            slot = index.get(key)
+            if slot is None:
+                slot = len(table)
+                table.append(value)
+                index[key] = slot
+            # ``#字段名`` = 该字段在这张表里的下标。
+            new_step["#" + field] = slot
+        compacted_steps.append(new_step)
+    if not tables:
+        return payload
+    # 第二层：图标指纹串池化。必须放在字段去重**之后**——先去重再池化，
+    # 池里不会留下「只被丢弃的重复快照」引用到的废串。
+    strings: list[str] = []
+    _pool_fingerprints(tables, strings, {})
+    compacted = dict(payload)
+    compacted["steps"] = compacted_steps
+    compacted["snapshots"] = tables
+    if strings:
+        compacted["strings"] = strings
+    compacted["compaction"] = {"version": _TRAJECTORY_COMPACTION_VERSION}
+    return compacted
+
+
+def expand_trajectory_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """把 ``snapshots`` 下标还原成完整字段，结果与压缩前逐字段等价。
+
+    对没有 ``compaction`` 标记的老轨迹原样返回，所以新旧文件混在一个库里没问题。
+    """
+    meta = payload.get("compaction")
+    tables = payload.get("snapshots")
+    if not isinstance(meta, dict) or not isinstance(tables, dict):
+        return payload
+    strings = payload.get("strings")
+    if isinstance(strings, list) and strings:
+        _unpool_fingerprints(tables, [str(item) for item in strings])
+    steps = payload.get("steps")
+    if not isinstance(steps, list):
+        return payload
+    expanded_steps: list[Any] = []
+    for step in steps:
+        if not isinstance(step, dict):
+            expanded_steps.append(step)
+            continue
+        new_step = dict(step)
+        for key in [k for k in new_step if isinstance(k, str) and k.startswith("#")]:
+            field = key[1:]
+            slot = new_step.pop(key)
+            table = tables.get(field) or []
+            if isinstance(slot, int) and 0 <= slot < len(table):
+                new_step[field] = table[slot]
+        expanded_steps.append(new_step)
+    expanded = dict(payload)
+    expanded["steps"] = expanded_steps
+    expanded.pop("snapshots", None)
+    expanded.pop("strings", None)
+    expanded.pop("compaction", None)
+    return expanded
+
+
+def _compact_trajectory_event(event: dict[str, Any]) -> dict[str, Any]:
+    """事件外壳不变，只压 ``payload``；已经压过的原样返回（幂等）。"""
+    if not isinstance(event, dict):
+        return event
+    payload = event.get("payload")
+    if not isinstance(payload, dict) or "compaction" in payload:
+        return event
+    compacted = dict(event)
+    compacted["payload"] = compact_trajectory_payload(payload)
+    return compacted
+
+
+def _expand_trajectory_event(event: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(event, dict):
+        return event
+    payload = event.get("payload")
+    if not isinstance(payload, dict) or "compaction" not in payload:
+        return event
+    expanded = dict(event)
+    expanded["payload"] = expand_trajectory_payload(payload)
+    return expanded
+
+
+#: JSONL 读取缓存：``路径 -> (文件签名, 事件列表)``。
+#:
+#: 为什么必须有：``observations.jsonl`` 实测 35.7 MB / 8000+ 条，``_load_jsonl``
+#: 解析一次 1.9~2.4 秒；``high_score_trajectories.jsonl`` 13.9 MB 解析一次 0.7 秒。
+#: 而一次收尾要读好几遍（``record_observation`` 取会话上下文 1 遍、
+#: ``record_high_score_trajectory`` 去重/裁剪/回写统计各 1 遍）——
+#: 实测合计 11.5 秒，全压在 Tk 主线程上，玩家看到的就是「点完结束本局，界面没反应」。
+#:
+#: 缓存命中只花一次 ``stat()``；写盘走 :func:`_append_jsonl_cached` 原地追加，
+#: 所以下一帧不必重读整个文件。
+_JSONL_CACHE: dict[Path, tuple[tuple[bool, int, int], list[dict[str, Any]]]] = {}
+
+
+def _file_signature(path: Path) -> tuple[bool, int, int]:
+    """``(存在, 字节数, mtime_ns)``——够用且比内容比对便宜得多。"""
+    try:
+        stat = path.stat()
+        return (True, int(stat.st_size), int(stat.st_mtime_ns))
+    except OSError:
+        return (False, 0, 0)
+
+
+def _load_jsonl_cached(path: Path) -> list[dict[str, Any]]:
+    """带签名的读取。**返回的列表归缓存所有，调用方不得原地修改。**
+
+    需要改内容的调用方请自己 ``list(...)`` 一份（浅拷贝只是复制指针，不解析 JSON）。
+    """
+    signature = _file_signature(path)
+    cached = _JSONL_CACHE.get(path)
+    if cached is not None and cached[0] == signature:
+        return cached[1]
+    events = _load_jsonl(path)
+    _JSONL_CACHE[path] = (signature, events)
+    return events
+
+
+def _append_jsonl_cached(path: Path, event: dict[str, Any]) -> None:
+    """追加一条 JSONL，并把缓存同步到最新。
+
+    只在「缓存与磁盘一致」时才增量追加；万一别人改过文件（签名对不上），
+    就把缓存丢掉，下次老老实实重读——宁可慢一次，也不能给出错的数据。
+    """
+    before = _file_signature(path)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+    cached = _JSONL_CACHE.get(path)
+    if cached is None:
+        return
+    signature, events = cached
+    if signature != before:
+        _JSONL_CACHE.pop(path, None)
+        return
+    events.append(event)
+    _JSONL_CACHE[path] = (_file_signature(path), events)
+
+
+def _invalidate_jsonl_cache(path: Path) -> None:
+    """让某个日志的读取缓存作废。
+
+    轨迹库多一层「展开缓存」，重写后必须一起丢，否则会读到展开前的旧快照。
+    """
+    global _TRAJECTORY_EXPANDED
+    _JSONL_CACHE.pop(path, None)
+    if path == TRAJECTORY_LOG:
+        _TRAJECTORY_EXPANDED = None
+
+
+#: ``(文件签名, 展开后的事件列表)``。磁盘上存的是压缩形式，展开一次就够，
+#: 之后所有读取复用这一份（32 局展开实测几十毫秒，比重新解析 JSON 便宜得多）。
+_TRAJECTORY_EXPANDED: tuple[tuple[bool, int, int], list[dict[str, Any]]] | None = None
+
+
+def _append_trajectory_event(event: dict[str, Any]) -> None:
+    """追加一局轨迹：**磁盘写压缩形式，内存缓存存展开形式**。
+
+    两个缓存必须各存各的：磁盘那份要小，内存那份要给调用方看完整字段。
+    """
+    global _TRAJECTORY_EXPANDED
+    disk_event = _compact_trajectory_event(event)
+    before = _file_signature(TRAJECTORY_LOG)
+    with TRAJECTORY_LOG.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(disk_event, ensure_ascii=False, sort_keys=True) + "\n")
+    signature = _file_signature(TRAJECTORY_LOG)
+    raw = _JSONL_CACHE.get(TRAJECTORY_LOG)
+    if raw is not None and raw[0] == before:
+        raw[1].append(disk_event)
+        _JSONL_CACHE[TRAJECTORY_LOG] = (signature, raw[1])
+    else:
+        _JSONL_CACHE.pop(TRAJECTORY_LOG, None)
+    expanded = _TRAJECTORY_EXPANDED
+    if expanded is not None and expanded[0] == before:
+        expanded[1].append(event)
+        _TRAJECTORY_EXPANDED = (signature, expanded[1])
+    else:
+        _TRAJECTORY_EXPANDED = None
 
 
 def _dedupe_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -341,7 +701,21 @@ def _append_unique_events(path: Path, incoming: list[dict[str, Any]], *, event_n
             handle.write(json.dumps(merged, ensure_ascii=False, sort_keys=True) + "\n")
             existing_hashes.add(payload_hash)
             added += 1
+    # 这里绕过了 :func:`_append_jsonl_cached`（一次写多条 + 去重），
+    # 所以事后统一让缓存作废，别让后续读到旧快照。
+    _invalidate_jsonl_cache(path)
     return added
+
+
+#: 统计摘要的后台写盘：``_write_stats`` 只登记「最新一份快照」，由这个线程串行落盘。
+#:
+#: 为什么改后台：``_build_complete_stats`` 里 99% 的时间花在 ``build_outcome_risk_report``
+#: （实测 1.8 s，而 ``_build_stats`` 只要 0.065 s）。它是**派生摘要**——进程内没人读
+#: ``stats.json``，推荐/风险提示用的是内存里的 :func:`load_learning_stats`。所以让主线程
+#: 干等这 1.8 秒纯属白费，玩家看到的是「点完结束本局，界面卡住」。
+_STATS_PENDING: tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]] | None = None
+_STATS_LOCK = threading.Lock()
+_STATS_WORKER: threading.Thread | None = None
 
 
 def _write_stats(
@@ -349,10 +723,77 @@ def _write_stats(
     corrections: list[dict[str, Any]],
     trajectories: list[dict[str, Any]] | None = None,
 ) -> None:
-    STATS_PATH.write_text(
-        json.dumps(_build_complete_stats(events, corrections, trajectories), ensure_ascii=False, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
+    """登记一份统计快照，由后台线程算完写 ``stats.json``（同一时刻只有一个线程）。
+
+    传进来的三个列表会被浅拷贝：调用方拿着的是 JSONL 缓存里的列表，缓存随时可能被
+    原地追加，后台线程不能在它变动的时候遍历。
+    """
+    global _STATS_PENDING, _STATS_WORKER
+    snapshot = (list(events), list(corrections), list(trajectories or []))
+    with _STATS_LOCK:
+        _STATS_PENDING = snapshot
+        if _STATS_WORKER is not None and _STATS_WORKER.is_alive():
+            # 正在算的那一份已经过期了，让它算完自己再取一次最新的。
+            return
+        _STATS_WORKER = threading.Thread(
+            target=_stats_worker_loop,
+            name="HuahuaStatsWriter",
+            daemon=True,
+        )
+        _STATS_WORKER.start()
+
+
+def _stats_worker_loop() -> None:
+    """``latest wins``：有更新就再算一遍，没有就退出。"""
+    global _STATS_PENDING, _STATS_WORKER
+    while True:
+        with _STATS_LOCK:
+            payload = _STATS_PENDING
+            _STATS_PENDING = None
+        if payload is None:
+            with _STATS_LOCK:
+                # 必须在锁内宣布退出，否则下一次 _write_stats 会以为还有人在跑而干等。
+                if _STATS_PENDING is None:
+                    _STATS_WORKER = None
+                    return
+            continue
+        try:
+            stats = _build_complete_stats(payload[0], payload[1], payload[2])
+            # 先写 .tmp 再 replace：后台写也不能让外部读到半截 JSON。
+            temp = STATS_PATH.with_name(STATS_PATH.name + ".tmp")
+            temp.write_text(
+                json.dumps(stats, ensure_ascii=False, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+            temp.replace(STATS_PATH)
+            _publish_stats_cache(stats)
+        except Exception:  # noqa: BLE001 - 统计写不出来不该影响已存下的这一局
+            pass
+
+
+def flush_pending_stats(timeout: float = 60.0) -> bool:
+    """等后台统计写盘跑完，返回「是否已无待写任务」。
+
+    给测试和「关闭前收尾」用：``_write_stats`` 变成异步之后，想立刻读到
+    ``stats.json`` 就必须先等它一下。
+    """
+    worker = _STATS_WORKER
+    if worker is None:
+        return True
+    worker.join(timeout)
+    return not worker.is_alive()
+
+
+def _publish_stats_cache(stats: dict[str, Any]) -> None:
+    """把后台算好的统计塞回内存缓存，界面下次取用就不用再算 1.8 秒。
+
+    签名取「此刻三个日志的签名」：万一算的这段时间里又追加了新记录，签名会对不上，
+    下次 :func:`load_learning_stats` 自然会重算——宁可多算一次，也不能显示旧数据。
+    """
+    global _LEARNING_STATS_CACHE, _LEARNING_STATS_CACHE_SIGNATURE
+    with _STATS_LOCK:
+        _LEARNING_STATS_CACHE = stats
+        _LEARNING_STATS_CACHE_SIGNATURE = _logs_signature()
 
 
 def _build_complete_stats(

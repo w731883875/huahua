@@ -215,6 +215,10 @@ class OutcomeContractTests(unittest.TestCase):
                 }
                 self.assertTrue(learning.record_high_score_trajectory(payload, source="real_capture"))
                 self.assertFalse(learning.record_high_score_trajectory(payload, source="real_capture"))
+                # stats.json 由后台线程写：必须在这里等它写完，原因有两个——
+                # 一是下面要读文件；二是补丁一退出，后台线程用的就是真实
+                # STATS_PATH，会把测试数据写进 runtime/。
+                self.assertTrue(learning.flush_pending_stats(timeout=60))
 
             observation = json.loads(paths["OBSERVATION_LOG"].read_text(encoding="utf-8").strip())
             trajectories = paths["TRAJECTORY_LOG"].read_text(encoding="utf-8").splitlines()

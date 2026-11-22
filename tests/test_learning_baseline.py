@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -115,6 +117,78 @@ class LearningTrustBaselineTests(unittest.TestCase):
         self.assertIsNotNone(identity)
         self.assertEqual({identity: 2}, stats["affix_id_seen"])
         self.assertEqual(2, stats["affix_id_seen_total"])
+
+
+class TrajectoryCompactionTests(unittest.TestCase):
+    """轨迹压缩必须**无损**：库里那 32 局是复盘和训练的唯一证据。"""
+
+    @staticmethod
+    def _payload() -> dict:
+        return {
+            "session": "run-test",
+            "internal_score": 42.0,
+            "high_score_gate": {"passed": True},
+            "steps": [
+                {
+                    "step_index": 0,
+                    "quality": {"ok": True},
+                    "tiles": None,
+                    "backpack_cumulative": [
+                        {"code": "M1-鼠人", "fingerprint": "0908" * 24, "l": 1},
+                    ],
+                    "candidates": [{"rank": 1}],
+                },
+                {
+                    "step_index": 1,
+                    "quality": {"ok": True},
+                    # 与上一步逐字节相同：这正是要去重的部分。
+                    "tiles": None,
+                    "backpack_cumulative": [
+                        {"code": "M1-鼠人", "fingerprint": "0908" * 24, "l": 1},
+                    ],
+                    "candidates": [{"rank": 1}],
+                },
+            ],
+        }
+
+    def test_roundtrip_is_lossless(self) -> None:
+        payload = self._payload()
+
+        restored = learning.expand_trajectory_payload(
+            copy.deepcopy(learning.compact_trajectory_payload(copy.deepcopy(payload)))
+        )
+
+        self.assertEqual(
+            json.dumps(payload, sort_keys=True, ensure_ascii=False),
+            json.dumps(restored, sort_keys=True, ensure_ascii=False),
+        )
+
+    def test_compaction_actually_shrinks_and_pools_fingerprints(self) -> None:
+        payload = self._payload()
+
+        compacted = learning.compact_trajectory_payload(copy.deepcopy(payload))
+
+        # 两个快照相同 -> 表里只留一份；下标在步骤里。
+        self.assertEqual(1, len(compacted["snapshots"]["backpack_cumulative"]))
+        self.assertEqual([0, 0], [step["#backpack_cumulative"] for step in compacted["steps"]])
+        # 指纹串池化后只剩一份原文，格子里换成了池下标。
+        self.assertEqual(1, len(compacted["strings"]))
+        slot = compacted["snapshots"]["backpack_cumulative"][0][0]
+        self.assertIsInstance(slot["fingerprint"], int)
+
+    def test_legacy_payload_without_marker_passes_through(self) -> None:
+        legacy = {"session": "old", "steps": [{"step_index": 0, "tiles": None}]}
+
+        self.assertIs(legacy, learning.expand_trajectory_payload(legacy))
+
+    def test_quality_and_step_index_are_not_compacted(self) -> None:
+        # 可信度判断读的是 quality.ok，压掉它会让 _trajectory_payload_is_trusted 失效。
+        compacted = learning.compact_trajectory_payload(copy.deepcopy(self._payload()))
+
+        for step in compacted["steps"]:
+            self.assertIn("quality", step)
+            self.assertIn("step_index", step)
+            self.assertNotIn("#quality", step)
 
 
 if __name__ == "__main__":

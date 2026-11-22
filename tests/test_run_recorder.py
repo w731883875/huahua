@@ -355,6 +355,43 @@ class AutomaticRunRecorderTests(unittest.TestCase):
         recorder.process(_snapshot(second, current=_current()), observed_at=1062.0, run_boundary="new_run")
         self.assertNotEqual(first_session, recorder.session_id, "应当是独立的两局")
 
+    def test_log_finish_does_not_start_a_phantom_session_from_the_stale_board(self) -> None:
+        """日志报「完成绘制」后，画面上还是那张画满的棋盘，不能拿它起新局。
+
+        实机 2026-11-22 22:51 实测：
+            22:51:22.898 run_finished game_log_finish dur=151.4s  ← 真
+            22:51:22.898 run_started                              ← 假局
+            22:51:40.603 run_finished no_blank_tiles dur=17.7s    ← 假收尾
+        用户看到的是「已经画完了，还要等 8 秒以上才提示收尾」。
+        """
+
+        recorder = AutomaticRunRecorder(path=None, stable_frames=1)
+        tiles = [_blank_tile(index) for index in range(36)]
+        recorder.process(_snapshot(tiles, current=_current()), observed_at=1000.0, run_boundary="new_run")
+
+        full = [_paint_tile(index, "monster", 2) for index in range(36)]
+        # 注意时间要压在 NO_BLANK_MIN_RUN_SECONDS(15s) 之内，否则这一帧就会
+        # 先被 no_blank_tiles 收掉，测不到「日志收尾」这条路。
+        recorder.process(_snapshot(full, current=_current()), observed_at=1005.0)
+        result = recorder.process(
+            _snapshot(full, current=_current()), observed_at=1006.0, run_boundary="finished"
+        )
+        self.assertIn("run_finished", result.events)
+        self.assertEqual("game_log_finish", recorder._last_finish_reason)
+
+        # 之后画面一直挂着那张满铺棋盘：不许再开新局，也不许再收一次尾
+        first_session = recorder.session_id
+        for step in range(30):
+            out = recorder.process(
+                _snapshot(full, current=_current()), observed_at=1007.0 + step * 0.5
+            )
+            self.assertFalse(out.events, f"旧棋盘不该产生任何事件（第 {step} 帧）")
+        self.assertEqual(first_session, recorder.session_id, "不该起假 session")
+
+        # 真换画纸：空白回来了 → 可以起新局
+        recorder.process(_snapshot(tiles, current=_current()), observed_at=1030.0)
+        self.assertNotEqual(first_session, recorder.session_id)
+
     def test_flapping_terrain_conflict_is_reported_once(self) -> None:
         """一格在两个值之间来回抖，``terrain_conflict_resolved`` 只报一次。
 

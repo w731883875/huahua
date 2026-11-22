@@ -432,6 +432,10 @@ class AutomaticRunRecorder:
         self._finished_at: float | None = None
         #: 上一局结束的原因，见 :meth:`_finish_run`。
         self._last_finish_reason: str | None = None
+        #: 日志报过「完成绘制」之后置位：画面上还挂着那张画满的旧棋盘，
+        #: 在真正的「入画」信号到来之前不许拿它起新局（否则造出一个终局盘面
+        #: 完全相同的假 session，用户看到的是「画完了还要等 8 秒才提示收尾」）。
+        self._awaiting_log_new_run = False
         atexit.register(self.close)
 
     def process(
@@ -475,6 +479,7 @@ class AutomaticRunRecorder:
 
             # 日志先说话：它比视觉硬，且不受「换盘那几帧被判成误读」的影响。
             if run_boundary == "new_run":
+                self._awaiting_log_new_run = False
                 if self.phase in {"playing", "opening"}:
                     # 新画纸真的开始了：上一局到此为止。拿 ``self._last_snapshot`` 结算，
                     # 因为当前这一帧已经是新画纸的画面（拿它当终局盘面等于记错局）。
@@ -491,6 +496,14 @@ class AutomaticRunRecorder:
             elif run_boundary == "finished" and self.phase == "playing":
                 emitted.extend(self._finish_run(snapshot, now, reason="game_log_finish"))
                 self.phase = "waiting"
+                # 收尾之后**画面上仍然是那张画满的棋盘**（玩家还没点重绘/入画）。
+                # 绝不能拿它起新局：否则同一毫秒就会开一个假 session，再被
+                # `no_blank_tiles` 收掉一次。2026-11-22 22:51 实测就是这么来的：
+                #   22:51:22.898 run_finished game_log_finish dur=151.4s  ← 真
+                #   22:51:22.898 run_started                     ← 假局，复用旧棋盘
+                #   22:51:40.603 run_finished no_blank_tiles dur=17.7s   ← 假收尾
+                # 用户看到的是「已经画完了，还要等 8 秒以上才提示收尾」。
+                self._awaiting_log_new_run = True
 
             if start_visible:
                 if self.phase == "playing":
@@ -502,8 +515,15 @@ class AutomaticRunRecorder:
                 self.phase = "playing"
                 emitted.append(self._emit("run_active", {"board": _board_payload(snapshot)}, now))
             elif self.phase == "waiting" and _has_active_gameplay(snapshot):
-                emitted.extend(self._start_run(snapshot, now, reason="active_scene"))
-                self.phase = "playing"
+                if self._awaiting_log_new_run and not _board_really_reset(snapshot):
+                    # 等日志里的「入画」再来起局。这一帧的棋盘还是上一局的，
+                    # 拿它起局只会造出一个终局盘面完全相同的假 session。
+                    # 但如果棋盘真的空了（`into` 那条日志漏了、或日志断了），
+                    # 就不能一直卡着 —— 见 :func:`_board_really_reset`。
+                    pass
+                else:
+                    emitted.extend(self._start_run(snapshot, now, reason="active_scene"))
+                    self.phase = "playing"
             elif self.phase == "finished" and _looks_like_new_run(snapshot, self._last_finished_signature):
                 emitted.extend(self._start_run(snapshot, now, reason="board_reset"))
                 self.phase = "playing"
@@ -2104,6 +2124,20 @@ def _level(payload: dict[str, Any]) -> int:
 
 def _has_active_gameplay(snapshot: FastVisionSnapshot) -> bool:
     return bool(snapshot.current is not None or snapshot.brush is not None or snapshot.backpack)
+
+
+def _board_really_reset(snapshot: FastVisionSnapshot) -> bool:
+    """棋盘是不是真的换成新画纸了（而不是还挂着上一局那张画满的）。
+
+    给 ``_awaiting_log_new_run`` 做兜底：正常情况下靠日志里的「入画」起新局，
+    但日志可能断、也可能那一条没被识别出来。真换画纸时盘面一定回到大量空白，
+    而「画满收尾后画面没动」时 ``blank`` 恒为 0 —— 这两者不会混淆。
+
+    门槛取 :data:`INITIAL_PAINTS_AT_START` 同量级：新画纸至少有十来个空白格。
+    """
+
+    blank = int(snapshot.terrain_counts.get(TileState.BLANK.value, 0) or 0)
+    return blank >= 6
 
 
 def _point_in_rect(x: float, y: float, rect) -> bool:

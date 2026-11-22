@@ -51,6 +51,17 @@ PENDING_CLICK_BUFFER_SECONDS = 8.0
 #: 4~6 秒很正常，所以放到 6。
 CONFIRM_DEDUPE_SECONDS = 6.0
 
+#: 「棋盘上没有空白格」不能用来结束一局的最短局龄（秒）。
+#:
+#: 2026-11-22 20:27 实测：新 session 起来 0.02 秒后读到 blank=0，画面上其实还挂着
+#: **上一局**那张满铺棋子，于是 0.55 秒后就被 ``auto_settlement`` 结算掉；那一局
+#: 前后开了 4 次 session（20:27:18 / 20:27:32 / 20:27:39 / 20:27:41），用户看到
+#: 的就是「无法完成，只能重绘」。
+#:
+#: 真人最快的一局实测 41.7 秒（2026-11-22 20:28），所以 15 秒的下限不会误伤任何
+#: 真实结算；而「结束」按钮是强判据，不受这条限制。
+NO_BLANK_MIN_RUN_SECONDS = 15.0
+
 #: 开局时棋盘上自带的颜料块数。
 #:
 #: 游戏开局就送 1 块初始颜料，它不是"上一局的残留"。所以接入时看到 1 块
@@ -443,7 +454,20 @@ class AutomaticRunRecorder:
                 emitted.extend(self._refresh_initial_inventory(snapshot, now))
                 emitted.extend(self._accept_stable_snapshot(snapshot, now))
                 no_blank = int(snapshot.terrain_counts.get(TileState.BLANK.value, 0) or 0) == 0
-                self._finish_frames = self._finish_frames + 1 if finish_visible or no_blank else 0
+                # 「没有空白格」是**弱**判据，必须配上「这一局已经打了足够久」才作数。
+                #
+                # 2026-11-22 20:27 实测：新 session 起来 0.02 秒后读到 blank=0
+                # （画面上还挂着上一局那张满铺棋子，`states` 就是上一局的
+                # `VVVVVVPVPPVPPPPPPPPPPVVPPVPPPPPVVVVP`），于是 0.55 秒后就被
+                # `auto_settlement` 结算掉。那一局前后开了 4 次 session
+                # （20:27:18 / 20:27:32 / 20:27:39 / 20:27:41），用户看到的就是
+                # 「无法完成，只能重绘」。真人最快一局也有 41.7 秒，所以给一个下限
+                # 不会误伤任何真实结算。
+                # 「结束」按钮是强判据，不受这条限制。
+                blank_finish = no_blank and (now - self.started_at) >= NO_BLANK_MIN_RUN_SECONDS
+                self._finish_frames = (
+                    self._finish_frames + 1 if (finish_visible or blank_finish) else 0
+                )
                 if self.phase == "playing" and self._finish_frames >= self._stable_frames:
                     reason = "finish_button" if finish_visible else "no_blank_tiles"
                     # 结算盘面退回最后一张**可信**基准：这一帧若是入画画面（整帧作废），

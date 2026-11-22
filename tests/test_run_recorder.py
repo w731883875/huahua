@@ -13,7 +13,11 @@ from huahua_assistant.fast_vision import (
     FastVisionSnapshot,
 )
 from huahua_assistant.models import Rect, RegionKind, TileState
-from huahua_assistant.run_recorder import AutomaticRunRecorder, _board_payload
+from huahua_assistant.run_recorder import (
+    NO_BLANK_MIN_RUN_SECONDS,
+    AutomaticRunRecorder,
+    _board_payload,
+)
 
 
 def _paint_tile(index: int, category: str, level: int, *, subtype: str | None = None) -> FastTile:
@@ -271,6 +275,49 @@ class AutomaticRunRecorderTests(unittest.TestCase):
         self.assertEqual({"monster_to_gameplay": 1}, conversion["payload"]["directions"])
         resolution = next(event for event in recorder._events if event["event"] == "affix_choice_resolved")
         self.assertEqual("范围内随机1个颜料提升1级", resolution["payload"]["selected"])
+
+    def test_full_board_from_previous_run_does_not_finish_a_fresh_session(self) -> None:
+        """新局刚开的头几帧还挂着上一局那张满铺棋盘，不能因此把新局结算掉。
+
+        2026-11-22 20:27 实测：新 session 起来 0.02 秒就读到 ``blank=0``
+        （画面是上一局的 ``VVVVVVPVPPVPPPPPPPPPPVVPPVPPPPPVVVVP``），0.55 秒后
+        被 ``auto_settlement`` 结算。那一局前后开了 4 次 session
+        （20:27:18 / 20:27:32 / 20:27:39 / 20:27:41），用户看到的就是
+        「无法完成，只能重绘」。
+        """
+
+        recorder = AutomaticRunRecorder(path=None, stable_frames=1)
+        tiles = [_blank_tile(index) for index in range(36)]
+        # 1) 开始画面 → 起一局
+        recorder.process(_snapshot(tiles, regions=(RegionKind.START_DRAWING.value,)), observed_at=1000.0)
+        self.assertEqual("opening", recorder.phase)
+
+        # 2) 紧接着一帧「上一局那种满铺棋盘」（没有空白格）
+        full = [_paint_tile(index, "monster", 2) for index in range(36)]
+        snapshot = _snapshot(full, current=_current())
+        first = recorder.process(snapshot, observed_at=1001.0)
+        second = recorder.process(snapshot, observed_at=1001.5)
+
+        self.assertNotIn("run_finished", first.events)
+        self.assertNotIn("run_finished", second.events, "开局 1.5 秒内不得因无空白格结束")
+        self.assertNotEqual("finished", recorder.phase)
+
+        # 3) 过了下限之后同样的画面才可以结案
+        third = recorder.process(snapshot, observed_at=1000.0 + NO_BLANK_MIN_RUN_SECONDS + 1.0)
+        self.assertIn("run_finished", third.events)
+
+    def test_finish_button_still_settles_immediately(self) -> None:
+        """「结束」按钮是强判据，不受「开局满铺」那条下限影响。"""
+
+        recorder = AutomaticRunRecorder(path=None, stable_frames=1)
+        tiles = [_blank_tile(index) for index in range(36)]
+        recorder.process(_snapshot(tiles, regions=(RegionKind.START_DRAWING.value,)), observed_at=1000.0)
+        full = [_paint_tile(index, "monster", 2) for index in range(36)]
+        result = recorder.process(
+            _snapshot(full, current=_current(), regions=(RegionKind.FINISH_DRAWING.value,)),
+            observed_at=1001.0,
+        )
+        self.assertIn("run_finished", result.events)
 
     def test_initial_single_paint_is_not_mid_run_attach(self) -> None:
         """开局自带 1 块初始颜料，看到 1 块就接入不算「中途接入」。"""

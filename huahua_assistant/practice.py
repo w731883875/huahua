@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass, field, replace
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 from . import game_model as gm
 from . import s8_official_data
@@ -1408,6 +1408,42 @@ def summarize_runs(explanations: Iterable[HighScoreExplanation]) -> PracticeSumm
     )
 
 
+def _paint_observation(paint: gm.Paint | None) -> dict[str, Any] | None:
+    """把一枚颜料压成统计用的裸数据（不带任何内部对象）。"""
+    if paint is None:
+        return None
+    return {
+        'category': paint.category.value,
+        'level': int(paint.level),
+        'is_treasure': bool(paint.is_treasure),
+        'subtype': paint.subtype,
+    }
+
+
+def _rule_observation(rule: gm.CurrentPaintRule | None) -> dict[str, Any] | None:
+    """把一条初始颜料规则压成统计用的裸数据。
+
+    ``effects`` 就是**调色效果**（官方 itemeffect 表那 27 条），一条规则可能
+    因融合带多条，所以这里是列表。
+    """
+    if rule is None:
+        return None
+    return {
+        'direction': rule.direction.value,
+        'target_object': rule.target_object.value,
+        'match_required': int(rule.match_required),
+        'upgrade_amount': int(rule.upgrade_amount),
+        'effects': [
+            {
+                'direction': effect.direction.value,
+                'target_object': effect.target_object.value,
+                'upgrade_amount': int(effect.upgrade_amount),
+            }
+            for effect in rule.effects
+        ],
+    }
+
+
 def auto_play(
     session: PracticeSession,
     *,
@@ -1415,6 +1451,7 @@ def auto_play(
     rng: random.Random | None = None,
     explore: float = 0.0,
     fusion_explore: bool = False,
+    observer: Callable[[dict[str, Any]], None] | None = None,
 ) -> PracticeSession:
     """让策略把这局打完（原地推进 ``session``）。
 
@@ -1538,6 +1575,16 @@ def auto_play(
                     )
             if not session.choose_affix(pick):
                 break
+            if observer is not None:
+                chosen = session.steps[-1]
+                observer(
+                    {
+                        'kind': 'affix',
+                        'name': getattr(chosen, 'affix_id', ''),
+                        'options': [affix.name for affix in options],
+                        'chosen_index': pick,
+                    }
+                )
             continue
         actions = engine.legal_actions(session.state)
         if not actions:
@@ -1572,14 +1619,28 @@ def auto_play(
             break
         if action.kind is ActionKind.PLACE_ANCHOR:
             ok = session.place_anchor(action.row, action.col)
+            if ok and observer is not None:
+                # 每一轮的「初始颜料」和它的「调色效果」：统计脚本要按
+                # 怪物/玩法/宝箱分类算几率，还要按效果算调色效果几率。
+                rule = session.state.current_rule
+                observer(
+                    {
+                        'kind': 'anchor',
+                        'row': action.row,
+                        'col': action.col,
+                        'paint': _paint_observation(rule.paint if rule else None),
+                        'rule': _rule_observation(rule),
+                    }
+                )
         elif action.kind is ActionKind.INSTALL:
             ok = session.install(action.backpack_index, action.row, action.col)
         else:
             ok = session.force_complete()
+            if ok and observer is not None:
+                observer({'kind': 'force'})
         if not ok:
             break
     return session
-
 
 def simulate_practice(
     *,

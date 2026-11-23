@@ -157,6 +157,9 @@ def _paint_to_dict(paint: gm.Paint) -> dict[str, Any]:
     # 等级加成跟着颜料走，只有非 0 才写，老存档读进来默认 0。
     if paint.bonus_level:
         data['bonus'] = int(paint.bonus_level)
+    # 加成的来源账（只有界面说明用，不参与算术）。
+    if paint.bonus_parts:
+        data['bonus_parts'] = [[name, int(value)] for name, value in paint.bonus_parts]
     return data
 
 
@@ -172,17 +175,29 @@ def _paint_from_dict(data: dict[str, Any]) -> gm.Paint:
         subtype=data.get('subtype'),
         is_treasure=bool(raw == 'treasure' or data.get('is_treasure')),
         bonus_level=int(data.get('bonus') or 0),
+        bonus_parts=tuple(
+            (str(name), int(value))
+            for name, value in (data.get('bonus_parts') or ())
+            if int(value)
+        ),
     )
 
 
 def _tile_to_dict(tile: gm.Tile) -> dict[str, Any]:
-    return {
+    data: dict[str, Any] = {
         's': _TILE_STATE_CODE.get(tile.state, 5),
         'p': _paint_to_dict(tile.paint) if tile.paint is not None else None,
         'a': tile.aura_amount,
         'buf': tile.buff_applied_id,
         'aff': tile.affix_applied_id,
     }
+    # 被炸毁初始颜料留在这一格的效果包，只有非空才写。
+    if tile.retained_effects:
+        data['re'] = [
+            [effect.direction.value, effect.target_object.value, int(effect.upgrade_amount)]
+            for effect in tile.retained_effects
+        ]
+    return data
 
 
 def _tile_from_dict(data: dict[str, Any]) -> gm.Tile:
@@ -193,13 +208,21 @@ def _tile_from_dict(data: dict[str, Any]) -> gm.Tile:
         buff_applied_id=data.get('buf'),
         affix_applied_id=data.get('aff'),
         aura_amount=int(data.get('a') or 0),
+        retained_effects=tuple(
+            gm.PaintEffect(
+                gm.PaintDirection(direction),
+                gm.PaintObject(target),
+                int(amount),
+            )
+            for direction, target, amount in (data.get('re') or ())
+        ),
     )
 
 
 def _rule_to_dict(rule: gm.CurrentPaintRule | None) -> dict[str, Any] | None:
     if rule is None:
         return None
-    return {
+    data: dict[str, Any] = {
         'paint': _paint_to_dict(rule.paint),
         'target_object': rule.target_object.value,
         'direction': rule.direction.value,
@@ -208,11 +231,19 @@ def _rule_to_dict(rule: gm.CurrentPaintRule | None) -> dict[str, Any] | None:
         'upgrade_amount': int(rule.upgrade_amount),
         'extra_directions': [item.value for item in rule.extra_directions],
     }
+    # 融合初始颜料有 2 条以上调色效果，只有非单条才写（单条能从上面几个字段推出来）。
+    if len(rule.effects) > 1:
+        data['effects'] = [
+            [effect.direction.value, effect.target_object.value, int(effect.upgrade_amount)]
+            for effect in rule.effects
+        ]
+    return data
 
 
 def _rule_from_dict(data: dict[str, Any] | None) -> gm.CurrentPaintRule | None:
     if not data:
         return None
+    raw_effects = data.get('effects') or ()
     return gm.CurrentPaintRule(
         paint=_paint_from_dict(data['paint']),
         target_object=gm.PaintObject(data['target_object']),
@@ -222,6 +253,15 @@ def _rule_from_dict(data: dict[str, Any] | None) -> gm.CurrentPaintRule | None:
         upgrade_amount=int(data.get('upgrade_amount') or 1),
         extra_directions=tuple(
             gm.PaintDirection(item) for item in data.get('extra_directions') or ()
+        ),
+        # 空元组时 __post_init__ 会从上面的标量字段补出单条效果，行为不变。
+        effects=tuple(
+            gm.PaintEffect(
+                gm.PaintDirection(direction),
+                gm.PaintObject(target),
+                int(amount),
+            )
+            for direction, target, amount in raw_effects
         ),
     )
 
@@ -268,7 +308,7 @@ def serialize_state(state: gm.PuzzleState) -> dict[str, Any]:
     故意不存 ``aura_level``：它是 ``_recompute_auras`` 的派生缓存，存下来反而
     容易和地形不一致。还原后由调用方重新算。
     """
-    return {
+    data: dict[str, Any] = {
         'tiles': [_tile_to_dict(tile) for tile in state.tiles],
         'current_rule': _rule_to_dict(state.current_rule),
         'active_affix': _affix_to_dict(state.active_affix),
@@ -278,6 +318,12 @@ def serialize_state(state: gm.PuzzleState) -> dict[str, Any]:
         'current_rule_pending': bool(state.current_rule_pending),
         'observed_scope_cells': [list(cell) for cell in state.observed_scope_cells],
     }
+    # 融合初始颜料的第二、三条笔触效果，只有非空才写。
+    if state.extra_affixes:
+        data['extra_affixes'] = [
+            _affix_to_dict(affix) for affix in state.extra_affixes
+        ]
+    return data
 
 
 def deserialize_state(data: dict[str, Any]) -> gm.PuzzleState:
@@ -287,6 +333,13 @@ def deserialize_state(data: dict[str, Any]) -> gm.PuzzleState:
         tiles=tuple(_tile_from_dict(item) for item in data.get('tiles') or ()),
         current_rule=_rule_from_dict(data.get('current_rule')),
         active_affix=_affix_from_dict(data.get('active_affix')),
+        extra_affixes=tuple(
+            affix
+            for affix in (
+                _affix_from_dict(item) for item in data.get('extra_affixes') or ()
+            )
+            if affix is not None
+        ),
         backpack=tuple(_paint_from_dict(item) for item in data.get('backpack') or ()),
         current_anchor=(int(anchor[0]), int(anchor[1])) if anchor else None,
         current_buff_id=int(data.get('current_buff_id') or 1),

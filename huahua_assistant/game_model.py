@@ -2260,6 +2260,43 @@ def is_cover_affix(affix: AffixRule | None) -> bool:
     return affix is not None and affix.effect in COVER_EFFECTS
 
 
+def _is_persistent_affix(affix: AffixRule | None) -> bool:
+    """这条笔触是不是**整局有效**（结算后不清空，每次落笔重算）。"""
+    if affix is None:
+        return False
+    if affix.effect in CONSUMABLE_PLACE_EFFECTS:
+        return False
+    return affix.effect in SCOPE_BUFF_EFFECTS or bool(affix.persistent_until_match)
+
+
+def _rule_is_merged(rule: CurrentPaintRule | None) -> bool:
+    """这枚初始颜料是不是**融合**出来的（同时拥有多套调色效果）。"""
+    return rule is not None and len(rule.effects) > 1
+
+
+def _stack_affix(state: PuzzleState, affix: AffixRule) -> PuzzleState:
+    """挂上一条笔触词缀：**融合初始颜料才追加，普通情况仍是覆盖**。
+
+    为什么不一味追加：正常一局每轮只选一条笔触，旧的那条就交棒了；若全都累加，
+    三轮之后每次落笔会把三条笔触一起结算，等级会高得离谱。
+
+    为什么融合时又要追加：用户 2026-11-23 定案，融合初始颜料「同时拥有 2 个调色
+    效果、2 个笔触效果、2 个范围」。它已经自带一套笔触（从被炸毁的初始颜料那里
+    继承来的），这一轮再选的这条是**第二套**，两条都要留着。
+
+    判定依据取 ``current_rule.effects`` 的长度：融合后它就是 2 条以上，
+    普通颜料永远只有 1 条。这样不需要另存一个「是否融合」的布尔量。
+    """
+    existing = state.active_affix
+    if existing is None or existing == affix:
+        return replace(state, active_affix=affix)
+    if not _rule_is_merged(state.current_rule) or not _is_persistent_affix(existing):
+        # 普通颜料 / 旧词条是一次性的 → 直接换掉，额外槽清空
+        return replace(state, active_affix=affix, extra_affixes=())
+    extras = tuple(item for item in state.extra_affixes if item != affix)
+    return replace(state, active_affix=existing, extra_affixes=(*extras, affix))
+
+
 def _scope_affix_phrase(count: int, affix: AffixRule | None, *, unit: str = "颜料") -> str:
     """这一笔笔触的影响措辞；没有影响就返回空串。
 
@@ -2312,7 +2349,7 @@ def settle_place_effects(
     """
     affix = state.active_affix
     covered = 0
-    if affix is not None and affix.effect in COVER_EFFECTS:
+    if any(item.effect in COVER_EFFECTS for item in state.affixes):
         state, covered = _settle_scope_buff(state, rng, placed=placed)
         affix = state.active_affix
 
@@ -2322,7 +2359,10 @@ def settle_place_effects(
     notes: list[str] = []
     if covered:
         notes.append(f"笔触改写范围内{covered}枚颜料")
-    if affix is not None and affix.effect in SCOPE_BUFF_EFFECTS and affix.effect not in COVER_EFFECTS:
+    if any(
+        item.effect in SCOPE_BUFF_EFFECTS and item.effect not in COVER_EFFECTS
+        for item in state.affixes
+    ):
         state, extra = _settle_scope_buff(state, rng, placed=placed)
     elif affix is not None and affix.effect in CONSUMABLE_PLACE_EFFECTS:
         state = replace(state, active_affix=None)
@@ -2336,15 +2376,32 @@ def _settle_scope_buff(
     *,
     placed: tuple[int, int] | None = None,
 ) -> tuple[PuzzleState, int]:
-    """按当前 ``active_affix`` 结算一次作用范围 buff。
+    """按本局挂着的**全部**笔触逐条结算一次作用范围 buff。
 
     ``placed`` 是这一笔刚落下的坐标：作用范围里一个颜料都没有时，
     「随机 N 个提升」兜底提升的就是它（实机口径）。
-    **不清空 ``active_affix``**：这几条是整局有效的 buff，每次落笔都要重算。
+    **不清空词缀**：这几条是整局有效的 buff，每次落笔都要重算。
     返回 ``(新状态, 本次影响的格数)``。
+
+    融合初始颜料可能同时挂 2 条笔触（用户 2026-11-23：「2 个笔触效果」），
+    所以这里遍历 :attr:`PuzzleState.affixes` 而不是只取 ``active_affix``。
     """
-    affix = state.active_affix
-    if affix is None or affix.effect not in SCOPE_BUFF_EFFECTS:
+    total = 0
+    for affix in state.affixes:
+        state, count = _settle_one_scope_buff(state, affix, rng, placed=placed)
+        total += count
+    return state, total
+
+
+def _settle_one_scope_buff(
+    state: PuzzleState,
+    affix: AffixRule,
+    rng: random.Random,
+    *,
+    placed: tuple[int, int] | None = None,
+) -> tuple[PuzzleState, int]:
+    """结算**单条**笔触的作用范围 buff。"""
+    if affix.effect not in SCOPE_BUFF_EFFECTS:
         return state, 0
     if affix.effect is AffixEffect.COPY_SELF_TO_SCOPE:
         return _copy_self_to_scope(state)
@@ -2418,8 +2475,11 @@ def apply_affix_to_state(state: PuzzleState, affix: AffixRule, seed: int | None 
         # 通用规则（实机确认）：作用范围类 buff **落笔才结算**，且**整局有效**。
         # 选词缀时只挂 buff，不动棋盘——提前结算会得到 0 个目标（此时范围里
         # 还没有刚放下的颜料），等于白选。
+        #
+        # 融合初始颜料自带一套笔触，这一轮选的这条是**第二套**，用 _stack_affix
+        # 追加而不是覆盖（用户 2026-11-23：「2 个笔触效果」）。
         return AffixApplyResult(
-            state=replace(state, active_affix=affix),
+            state=_stack_affix(state, affix),
             success=True,
             message=f"已选择词缀：{affix.name}，将初始颜料安装到地块后按作用范围结算",
         )
@@ -2446,13 +2506,13 @@ def apply_affix_to_state(state: PuzzleState, affix: AffixRule, seed: int | None 
     if affix.effect == AffixEffect.UPGRADE_GLOBAL_CATEGORY:
         next_state, count = _upgrade_global_category_paints(state, affix)
         if affix.persistent_until_match:
-            next_state = replace(next_state, active_affix=affix)
+            next_state = _stack_affix(next_state, affix)
         return AffixApplyResult(state=next_state, success=True, message=f"已选择词缀：{affix.name}，全图{count}个颜料已提升")
 
     if affix.effect == AffixEffect.UPGRADE_GLOBAL_SAME_PAINT:
         next_state, count = _upgrade_global_same_paints(state, affix)
         if affix.persistent_until_match:
-            next_state = replace(next_state, active_affix=affix)
+            next_state = _stack_affix(next_state, affix)
         return AffixApplyResult(state=next_state, success=True, message=f"已选择词缀：{affix.name}，全图{count}个同类颜料已提升")
 
     if affix.effect == AffixEffect.CLEAR_RANDOM_TILE_GLOBAL:

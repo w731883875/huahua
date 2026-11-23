@@ -3297,7 +3297,7 @@ def build_affix_catalog() -> tuple[AffixRule, ...]:
         AffixRule(BrushType.TRANSFORM, "作用方向改为相邻", AffixEffect.CHANGE_DIRECTION, direction=PaintDirection.ADJACENT),
         AffixRule(BrushType.TRANSFORM, "作用方向改为全图", AffixEffect.CHANGE_DIRECTION, direction=PaintDirection.GLOBAL),
         AffixRule(BrushType.TRANSFORM, "作用对象改为另一类型", AffixEffect.CHANGE_TARGET_OBJECT),
-        AffixRule(BrushType.TRANSFORM, "完成条件所需数量-2", AffixEffect.MATCH_REQUIRED_DELTA, delta=-2),
+        AffixRule(BrushType.TRANSFORM, "调色目标的进度要求减少2", AffixEffect.MATCH_REQUIRED_DELTA, delta=-2),
         AffixRule(BrushType.TRANSFORM, "调色目标的进度要求减少1", AffixEffect.MATCH_REQUIRED_DELTA, delta=-1),
         AffixRule(BrushType.TRANSFORM, "当前颜料等级随机改变", AffixEffect.RANDOMIZE_CURRENT_LEVEL),
         AffixRule(BrushType.TRANSFORM, "随机改变自身的等级，内容不变", AffixEffect.RANDOMIZE_CURRENT_LEVEL),
@@ -3337,10 +3337,10 @@ def build_affix_catalog() -> tuple[AffixRule, ...]:
         AffixRule(BrushType.STACK, "将作用范围内的颜料转变为同等级的随机怪物颜料", AffixEffect.RANDOMIZE_SCOPE_CATEGORY, target_object=PaintObject.MONSTER),
         AffixRule(BrushType.STACK, "范围内颜料变成随机类型颜料", AffixEffect.RANDOMIZE_SCOPE_ANY),
         AffixRule(BrushType.STACK, "将作用范围内的颜料转变为同等级的随机颜料", AffixEffect.RANDOMIZE_SCOPE_ANY),
-        AffixRule(BrushType.SPREAD, "横向随机阻挡地块变为空白地块", AffixEffect.CLEAR_TILE_IN_SCOPE, direction=PaintDirection.HORIZONTAL, target_object=PaintObject.BLOCKED_TILE, count=1),
-        AffixRule(BrushType.SPREAD, "纵向随机阻挡地块变为空白地块", AffixEffect.CLEAR_TILE_IN_SCOPE, direction=PaintDirection.VERTICAL, target_object=PaintObject.BLOCKED_TILE, count=1),
-        AffixRule(BrushType.SPREAD, "相邻随机阻挡地块变为空白地块", AffixEffect.CLEAR_TILE_IN_SCOPE, direction=PaintDirection.ADJACENT, target_object=PaintObject.BLOCKED_TILE, count=1),
-        AffixRule(BrushType.SPREAD, "对角斜向随机阻挡地块变为空白地块", AffixEffect.CLEAR_TILE_IN_SCOPE, direction=PaintDirection.DIAGONAL, target_object=PaintObject.BLOCKED_TILE, count=1),
+        AffixRule(BrushType.SPREAD, "将横向范围中最近1个阻挡地块转变为空白地块", AffixEffect.CLEAR_TILE_IN_SCOPE, direction=PaintDirection.HORIZONTAL, target_object=PaintObject.BLOCKED_TILE, count=1, nearest=True),
+        AffixRule(BrushType.SPREAD, "将纵向范围中最近1个阻挡地块转变为空白地块", AffixEffect.CLEAR_TILE_IN_SCOPE, direction=PaintDirection.VERTICAL, target_object=PaintObject.BLOCKED_TILE, count=1, nearest=True),
+        AffixRule(BrushType.SPREAD, "将相邻范围中随机1个阻挡地块转变为空白地块", AffixEffect.CLEAR_TILE_IN_SCOPE, direction=PaintDirection.ADJACENT, target_object=PaintObject.BLOCKED_TILE, count=1),
+        AffixRule(BrushType.SPREAD, "将对角斜向范围中最近1个阻挡地块转变为空白地块", AffixEffect.CLEAR_TILE_IN_SCOPE, direction=PaintDirection.DIAGONAL, target_object=PaintObject.BLOCKED_TILE, count=1, nearest=True),
         AffixRule(BrushType.SPREAD, "将距离最近的1个阻挡地块转变为空白地块", AffixEffect.CLEAR_TILE_IN_SCOPE, target_object=PaintObject.BLOCKED_TILE, count=1, nearest=True),
         AffixRule(BrushType.SPREAD, "将作用范围中最近1个阻挡地块转变为空白地块", AffixEffect.CLEAR_TILE_IN_SCOPE, target_object=PaintObject.BLOCKED_TILE, count=1, nearest=True),
         AffixRule(BrushType.SPREAD, "范围内所有阻挡地块变为空白地块", AffixEffect.CLEAR_TILE_IN_SCOPE, target_object=PaintObject.BLOCKED_TILE),
@@ -3537,7 +3537,17 @@ def _canonicalize_affix_catalog(legacy_catalog: tuple[AffixRule, ...]) -> tuple[
             aliases=aliases,
             legacy_codes=existing.legacy_codes + (legacy_code,),
         )
-    return _attach_official_metadata(tuple(canonical.values()))
+    enriched = _attach_official_metadata(tuple(canonical.values()))
+    # **以官方为准**（用户 2026-11-23）：官方 S8_Gameplay_SelectableEffect 里找不到
+    # 出处的条目一律不进可选目录。早期凭实机推测补的 9 条（「作用方向改为全图」、
+    # 转锋版的三条 randomize_scope、范围内同内容提升、全图怪物/玩法+2、
+    # 全图随机1块失色地块）都在此被剔掉。
+    #
+    # 过滤放在**规范化之后**：``_CANONICAL_AFFIX_ID_BY_LEGACY_CODE`` 是按
+    # legacy 列表里的**位置**编号的，直接删 legacy 条目会让后续编号整体前移，
+    # 把官方 ID 挂错。这里只从输出里拿掉，编号体系保持不动，
+    # 老存档里的 1-5 之类的码仍能解析（只是不再出现在可选列表里）。
+    return tuple(affix for affix in enriched if affix.verified)
 
 
 def _attach_official_metadata(catalog: tuple[AffixRule, ...]) -> tuple[AffixRule, ...]:

@@ -115,10 +115,15 @@ class DeferredScopeUpgradeTest(unittest.TestCase):
         self.assertIn("笔触额外提升1个颜料", result.message)
 
     def test_same_content_scope_upgrade_also_defers(self) -> None:
-        affix = next(
-            a
-            for a in gm.build_affix_catalog()
-            if a.effect is gm.AffixEffect.UPGRADE_SCOPE_SAME_PAINT and a.amount == 2
+        # 官方 S8_Selectable_Effect 里没有「作用范围内与自身内容相同」这一条
+        # （只有 2014~2016 的**全图**同内容版本），该条目已按「以官方为准」剔除。
+        # 这里直接构造等价规则来测「落笔才结算」这条通用行为。
+        affix = gm.AffixRule(
+            gm.BrushType.STACK,
+            "作用范围内与自身内容相同的颜料额外提升2级",
+            gm.AffixEffect.UPGRADE_SCOPE_SAME_PAINT,
+            amount=2,
+            grants_bonus=True,
         )
         state = _state_with(_rule(), (2,))
         result = gm.apply_affix_to_state(state, affix, seed=4)

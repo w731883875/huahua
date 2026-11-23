@@ -25,6 +25,9 @@ from huahua_assistant import game_model as gm
 from huahua_assistant.codes import resolve_affix
 from huahua_assistant.game_model import (
     BOARD_SIZE,
+    AffixEffect,
+    AffixRule,
+    BrushType,
     CurrentPaintRule,
     Paint,
     PaintCategory,
@@ -42,7 +45,16 @@ ANCHOR_ROW = 4
 RANDOM_ONE = resolve_affix("对调色范围内的随机1个颜料额外提升1级")
 RANDOM_TWO = resolve_affix("对调色范围内的随机2个颜料额外提升1级")
 ALL_ONE = resolve_affix("范围内所有颜料提升1级")
-SAME_PAINT_ONE = resolve_affix("对调色范围内与自身内容相同的颜料额外提升1级")
+# 官方 S8_Selectable_Effect 里没有「作用范围内与自身内容相同」这一条（只有 2014~2016
+# 的**全图**同内容版本），所以它已按「以官方为准」从可选目录剔除。这里直接构造一条
+# 等价规则的 AffixRule 来测 scope_upgrade_targets 的筛选逻辑，不再依赖目录条目。
+SAME_PAINT_ONE = AffixRule(
+    BrushType.STACK,
+    "作用范围内与自身内容相同的颜料额外提升1级",
+    AffixEffect.UPGRADE_SCOPE_SAME_PAINT,
+    amount=1,
+    grants_bonus=True,
+)
 
 
 def _state(

@@ -152,8 +152,14 @@ def simulate(
     prefer: str = 'greedy',
     record: bool = False,
     library_path: str | Path | None = None,
+    fusion_explore: bool = False,
 ) -> SimulationResult:
-    """批量跑局并收集观测数据。``record=True`` 时同时写进高分库。"""
+    """批量跑局并收集观测数据。``record=True`` 时同时写进高分库。
+
+    ``fusion_explore=True`` 打开融合专线（见 :func:`practice.auto_play`）：
+    默认策略几乎永远走不到融合颜料上（5 万局实测 0 次），打开后才会主动
+    强制完成 + 抽「可放置于失色地块」把效果包并进新规则。
+    """
     result = SimulationResult(
         runs=0, pet_level=int(pet_level), rules=rules, prefer=prefer
     )
@@ -176,7 +182,7 @@ def simulate(
             if paint.is_treasure:
                 result.treasure_backpack_total += 1
 
-        pr.auto_play(session, prefer=prefer)
+        pr.auto_play(session, prefer=prefer, fusion_explore=fusion_explore)
 
         for tile in session.state.tiles:
             if tile.state is gm.TileState.PAINT and tile.paint is not None:

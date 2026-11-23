@@ -3668,6 +3668,30 @@ def _is_current_anchor_placeable(tile: Tile, affix: AffixRule | None) -> bool:
     return False
 
 
+def _kept_effect_placeable(state: PuzzleState) -> bool:
+    """这一轮能不能把锚点落到「带残留效果包的格子」上（= 能不能融合）。
+
+    融合的唯一入口：上一条规则被强制完成、随机炸毁恰好炸到锚点格时，那一格
+    变成失色并留下 ``retained_effects``；后续在某格放锚点时，
+    :func:`_merge_retained_effects` 会把地块上的效果包并进新规则。
+
+    所以判定条件只有一条：**存在带效果包的地块，且当前词缀允许锚点落上去**。
+    失色格默认放不了，必须拿到「可放置于失色地块中」（官方 3017）。
+
+    模拟器（``practice.auto_play`` 的 ``fusion_explore``）用它决定是否值得
+    去那一格落笔；UI 也可以用它提示"这一格现在能融合"。
+    """
+    affix = state.active_affix
+    for row in range(BOARD_SIZE):
+        for col in range(BOARD_SIZE):
+            tile = state.tile(row, col)
+            if not tile.retained_effects:
+                continue
+            if _is_current_anchor_placeable(tile, affix):
+                return True
+    return False
+
+
 def _tile_after_current_anchor_placement(
     tile: Tile,
     paint: Paint,

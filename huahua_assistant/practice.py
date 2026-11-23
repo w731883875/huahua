@@ -1287,15 +1287,29 @@ class HighScoreExplanation:
         return '\n'.join(lines)
 
 
+# 阶级阈值，按 ``board_value`` 的**绝对分**定。
+#
+# 2026-11-23 重新标定：旧阈值是 1.5 / 0.9 / 0.4 / 0.1，那是给**归一化分数**
+# 用的刻度；而 ``board_value`` 早就换成了绝对分（7 级宝箱 70 分、7 级怪物 7 分），
+# 于是一局正常棋（5 万局均值 120）永远 >= 1.5，**结果 100% 全是 S 级**，
+# 阶级等于没有。归档的旧模拟库 3000 条也都是清一色 S 级，说明这个错配
+# 比本次改动更早。
+#
+# 新阈值取自 5 万局 greedy 模拟的分位数（runtime/monte_50k_result.json）：
+#   p90=196  p70=148  p40=101  p15=56
+# 换策略（lookahead / 融合专线）或换权重后应当重新标定，不要照抄。
+GRADE_THRESHOLDS: tuple[tuple[int, str], ...] = (
+    (196, 'S 顶级'),   # 前 ~10%
+    (148, 'A 高分'),   # 前 ~30%
+    (101, 'B 中等'),   # 前 ~60%
+    (56, 'C 偏低'),    # 前 ~85%
+)
+
+
 def _grade(score: float) -> str:
-    if score >= 1.5:
-        return 'S 顶级'
-    if score >= 0.9:
-        return 'A 高分'
-    if score >= 0.4:
-        return 'B 中等'
-    if score >= 0.1:
-        return 'C 偏低'
+    for threshold, name in GRADE_THRESHOLDS:
+        if score >= threshold:
+            return name
     return 'D 低分'
 
 
@@ -1396,6 +1410,7 @@ def auto_play(
     prefer: str = 'lookahead',
     rng: random.Random | None = None,
     explore: float = 0.0,
+    fusion_explore: bool = False,
 ) -> PracticeSession:
     """让策略把这局打完（原地推进 ``session``）。
 
@@ -1413,6 +1428,16 @@ def auto_play(
     在大批量模拟里几乎永远采不到（实测 4000 局里 0 次，50000 局理论也只有
     约 2 次）。纯 greedy 跑多少次都只是在重复同一个盲区。
 
+    ``fusion_explore``: **融合专线**（2026-11-23）。默认策略永远不会走到
+    融合颜料上去，因为融合要三个条件同时成立：
+
+    1. 用掉一次强制调色，并且随机炸毁恰好炸到**当前锚点格**（炸到才留效果包）；
+    2. 下一轮抽到「可放置于失色地块中」(官方 3017) —— 失色格默认放不了锚点；
+    3. 在这一格放新锚点，才把地块上的效果包并进新规则。
+
+    实测 5 万局纯 greedy **0 次融合**，等于新规则完全没被验证。打开这个开关后，
+    策略会主动凑这条路：有带效果包的失色格时优先刷出 3017 并去那格落笔。
+
     探索用的随机流是独立的，不影响 ``_rng``，所以回放仍然确定。
     """
     from .engine.actions import ActionKind
@@ -1425,6 +1450,22 @@ def auto_play(
     # 探索决策单独一条流：不能动 _rng，否则回放会漂。
     explore_rng = random.Random((session.seed << 16) ^ 0xB5297A4D)
     explore = max(0.0, min(1.0, float(explore)))
+
+    def _kept_effect_cell() -> tuple[int, int] | None:
+        """找一格「炸毁后留下效果包的失色格」—— 融合的唯一入口。"""
+        for row in range(gm.BOARD_SIZE):
+            for col in range(gm.BOARD_SIZE):
+                tile = session.state.tile(row, col)
+                if tile.retained_effects:
+                    return row, col
+        return None
+
+    def _place_on_kept_effect() -> bool:
+        """把新初始颜料落在留有效果包的失色格上，完成一次融合。"""
+        cell = _kept_effect_cell()
+        if cell is None:
+            return False
+        return session.place_anchor(*cell)
 
     guard = 0
     while not session.done():
@@ -1439,6 +1480,26 @@ def auto_play(
             # 只要还没刷出替换、且还有刷新次数，就先刷再说。
             settled = session.settled_rule_paint
             is_treasure_round = settled is not None and settled.is_treasure
+            # 融合专线：棋盘上已经有留效果包的失色格，就必须拿到「可放置于失色
+            # 地块中」才能进那格，否则那条效果包永远白留着。优先级高于宝箱刷替换
+            # ——否则两个都在抢刷新次数，融合永远排不上。
+            fusion_pending = fusion_explore and _kept_effect_cell() is not None
+            if fusion_pending:
+                wanted_fusion = gm.AffixEffect.ALLOW_PLACE_ON_FADED
+                has_it = any(a.effect is wanted_fusion for a in session.affix_options)
+                while not has_it and session.refresh_remaining > 0:
+                    if not session.refresh_rule():
+                        break
+                    has_it = any(a.effect is wanted_fusion for a in session.affix_options)
+                if has_it:
+                    options = session.affix_options
+                    pick_fusion = next(
+                        i for i, a in enumerate(options) if a.effect is wanted_fusion
+                    )
+                    if session.choose_affix(pick_fusion):
+                        if _place_on_kept_effect():
+                            continue
+                    continue
             if not (explore and explore_rng.random() < explore):
                 wanted = gm.AffixEffect.COPY_SELF_TO_SCOPE
                 hunting = (
@@ -1471,6 +1532,28 @@ def auto_play(
         actions = engine.legal_actions(session.state)
         if not actions:
             break
+        # 融合专线第二部分：手上已经拿到「可放置于失色地块中」、且棋盘上留着
+        # 效果包，就直接把锚点放进那一格，别听策略的（它看不懂融合的价值）。
+        if (
+            fusion_explore
+            and gm.current_rule_is_pending(session.state)
+            and gm._kept_effect_placeable(session.state)
+        ):
+            if _place_on_kept_effect():
+                continue
+        # 融合专线第三部分：想让锚点格被炸到、留下效果包，就得**主动用掉强制
+        # 完成**。策略自己几乎不会选它（贪心只看即时收益）。这里在一局的前半段
+        # 主动消耗一次，把融合的种子埋下去；炸不炸得中锚点是随机的（实测约 51%），
+        # 中不中交给种子分布去覆盖。
+        if (
+            fusion_explore
+            and not gm.current_rule_is_pending(session.state)
+            and gm.backpack_paint_placed(session.state)
+            and _kept_effect_cell() is None
+            and session._force_used == 0
+        ):
+            if session.force_complete():
+                continue
         action = policy.choose(session.state, engine, rng, force_used=session._force_used)
         if action is None:
             break

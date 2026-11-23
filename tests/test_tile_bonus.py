@@ -1,19 +1,30 @@
-"""地块等级加成（服务端 ``FacadeLevel``）。
+"""等级加成（服务端 ``FacadeLevel - RawLevel``）的归属与记账。
 
-实机确认的三条事实，构成了这套模型的全部约束：
+2026-11-23 定案改过一次模型，这里把口径写清楚，别再改回去：
 
-1. **加成挂在「地块」上，不挂在颜料上**——颜料被覆盖、炸毁、清空后加成仍在原地，
-   所以「先把一格加成叠满，再放一枚颜料」可以直接到 7 级。
-2. 最终等级 = min(MaxPlotLevel, 颜料等级 + 地块加成)，上限 7。
-3. 游戏内没有「拆下颜料」，只有强制调色；强制调色炸毁的是颜料，不是加成。
+1. **加成挂在「颜料」上，不挂在「地块」上**（``Paint.bonus_level``）。依据是解包
+   出来的客户端结构：地块（``Plot``）只有 ``RawLevel`` / ``FacadeLevel`` 和一张
+   来源清单 ``OriItemList``，每条来源指向一个**颜料实例** ``UniqueId``，
+   **没有**「地块自己攒了多少级」这种字段。
+2. 最终等级 = min(MaxPlotLevel, 颜料等级 + 颜料加成 + 光环加成)，上限 7。
+3. 于是「先把一格加成叠满，再放一枚颜料」这条路**不存在**了：空地就是空地，
+   没有残留加成。
 
-各级加成的落点（2026-11-22 口径）：
+和「笔触光环」的分工（两套东西，别混）：
 
-* 「额外提升 N 级」类**笔触** → 地块加成；
+* ``Paint.bonus_level`` —— 颜料自己的加成，颜料被炸毁/清掉就一起没了；
+* ``Tile.aura_amount`` —— 「全图和自身相同的颜料提升N级」这类**笔触**的强度，
+  挂在**地块**上，作用对象等于「这一格当前那枚颜料」的同种颜料。所以初始颜料
+  被炸毁后它仍在，恢复后换一枚新颜料又能吃到（用户 2026-11-23 实机口径）。
+
+各级加成的落点：
+
+* 「额外提升 N 级」类**笔触** → 颜料加成；
 * 普通「提升 N 级」**笔触** → 颜料等级；
-* **初始颜料的调色效果** → 地块加成。依据：用户那局 c4r5 被转成机械之神后仍吃到
+* **初始颜料的调色效果** → 颜料加成。依据：用户那局 c4r5 被转成机械之神后仍吃到
   +2/+1 到 6 级，点击该地块游戏提示 +3（= 2+1）。写进颜料等级的话，颜料一被覆盖
-  这 N 级就没了，与画面永远对不上。
+  这 N 级就没了，与画面永远对不上；写成颜料加成则能在「内容变了但颜料还在」的
+  转化里跟着走。
 """
 
 from __future__ import annotations
@@ -56,7 +67,7 @@ def _with_tile(state: gm.PuzzleState, row: int, col: int, tile: gm.Tile) -> gm.P
 
 
 def _bonus_affix(amount: int = 3) -> gm.AffixRule:
-    """官方「对作用范围内的所有颜料额外提升 N 级」——加的是地块加成。"""
+    """官方「对作用范围内的所有颜料额外提升 N 级」——加的是颜料加成。"""
     return next(
         affix
         for affix in gm.build_affix_catalog()
@@ -69,7 +80,7 @@ def _bonus_affix(amount: int = 3) -> gm.AffixRule:
 
 
 def _plain_affix(amount: int = 1) -> gm.AffixRule:
-    """同形但**不加地块加成**的规则——提升直接写在颜料等级上。
+    """同形但**不加颜料加成**的规则——提升直接写在颜料等级上。
 
     2026-11-19 核对官方表后发现：``UPGRADE_IN_SCOPE`` 这一族在
     ``S8_Gameplay_SelectableEffect`` 里**全部**是「额外提升」（2004~2008），
@@ -84,29 +95,37 @@ def _plain_affix(amount: int = 1) -> gm.AffixRule:
     )
 
 
-class TileBonusArithmeticTest(unittest.TestCase):
+class PaintBonusArithmeticTest(unittest.TestCase):
     def test_final_level_is_paint_level_plus_bonus(self) -> None:
-        tile = gm.Tile(gm.TileState.PAINT, gm.Paint(GAMEPLAY, 3), bonus_level=2)
+        tile = gm.Tile(gm.TileState.PAINT, gm.Paint(GAMEPLAY, 3, bonus_level=2))
         self.assertEqual(gm.tile_bonus_level(tile), 2)
         self.assertEqual(gm.tile_final_level(tile), 5)
 
     def test_final_level_is_capped_at_seven(self) -> None:
-        tile = gm.Tile(gm.TileState.PAINT, gm.Paint(GAMEPLAY, 5), bonus_level=6)
+        tile = gm.Tile(gm.TileState.PAINT, gm.Paint(GAMEPLAY, 5, bonus_level=6))
         self.assertEqual(gm.tile_final_level(tile), gm.MAX_LEVEL)
 
     def test_effective_paint_carries_final_level(self) -> None:
-        tile = gm.Tile(gm.TileState.PAINT, gm.Paint(GAMEPLAY, 1), bonus_level=4)
+        tile = gm.Tile(gm.TileState.PAINT, gm.Paint(GAMEPLAY, 1, bonus_level=4))
         effective = gm.tile_effective_paint(tile)
         self.assertIsNotNone(effective)
         self.assertEqual(effective.level, 5)
 
     def test_empty_tile_has_no_effective_paint(self) -> None:
-        self.assertIsNone(gm.tile_effective_paint(gm.Tile(gm.TileState.BLANK, bonus_level=6)))
+        self.assertIsNone(gm.tile_effective_paint(gm.Tile(gm.TileState.BLANK)))
+
+    def test_blank_tile_cannot_hold_a_bonus(self) -> None:
+        """空地就是空地：没有颜料就没有加成，加成无处可挂。"""
+        self.assertEqual(gm.tile_bonus_level(gm.Tile(gm.TileState.BLANK)), 0)
+        self.assertEqual(gm.tile_bonus_level(gm.Tile(gm.TileState.FADED)), 0)
+        self.assertEqual(gm.tile_bonus_level(gm.Tile(gm.TileState.VOID)), 0)
 
 
-class BonusSurvivesOnTileTest(unittest.TestCase):
-    def test_bonus_survives_clearing_the_paint(self) -> None:
-        state = _with_tile(_state(), 2, 3, gm.Tile(gm.TileState.PAINT, gm.Paint(GAMEPLAY, 3), bonus_level=4))
+class BonusDiesWithThePaintTest(unittest.TestCase):
+    """用户 2026-11-23 规则一：炸毁普通背包颜料 → 加成随颜料一起销毁。"""
+
+    def test_clearing_the_paint_drops_the_bonus(self) -> None:
+        state = _with_tile(_state(), 2, 3, gm.Tile(gm.TileState.PAINT, gm.Paint(GAMEPLAY, 3, bonus_level=4)))
 
         cleared, count = gm._clear_tile_indices(state, [2 * gm.BOARD_SIZE + 3])
 
@@ -114,11 +133,16 @@ class BonusSurvivesOnTileTest(unittest.TestCase):
         tile = cleared.tile(2, 3)
         self.assertEqual(tile.state, gm.TileState.BLANK)
         self.assertIsNone(tile.paint)
-        self.assertEqual(gm.tile_bonus_level(tile), 4)
+        self.assertEqual(gm.tile_bonus_level(tile), 0, "颜料没了，加成也该没")
 
-    def test_bonus_survives_force_complete_destruction(self) -> None:
-        # 规则本身不额外提升，单看「炸毁后加成还在」这件事
-        state = _with_tile(_state(rule=_rule(amount=0)), 2, 3, gm.Tile(gm.TileState.PAINT, gm.Paint(GAMEPLAY, 3), bonus_level=4))
+    def test_force_complete_destruction_drops_the_bonus(self) -> None:
+        # 规则本身不额外提升，单看「炸毁后加成是否还在」这件事
+        state = _with_tile(
+            _state(rule=_rule(amount=0)),
+            2,
+            3,
+            gm.Tile(gm.TileState.PAINT, gm.Paint(GAMEPLAY, 3, bonus_level=4)),
+        )
         # 只留这一格有颜料，强制完成必定炸它
         result = gm.force_complete_current_rule(state, force_used=0, rng=random.Random(0))
 
@@ -126,15 +150,15 @@ class BonusSurvivesOnTileTest(unittest.TestCase):
         tile = result.state.tile(2, 3)
         self.assertEqual(tile.state, gm.TileState.FADED)
         self.assertIsNone(tile.paint)
-        self.assertEqual(gm.tile_bonus_level(tile), 4)
+        self.assertEqual(gm.tile_bonus_level(tile), 0, "炸毁 = 颜料销毁，加成不许残留")
 
-    def test_new_paint_inherits_tile_bonus(self) -> None:
-        # 清空后剩下 BLANK + 加成 4，落一枚 Lv1（规则本身不额外提升）直接变 5
+    def test_new_paint_on_a_blank_tile_starts_from_zero(self) -> None:
+        """恢复成空白地块后再放一枚：全新颜料，无任何残留加成。"""
         state = _with_tile(
             _state(rule=_rule(amount=0), backpack=(gm.Paint(GAMEPLAY, 1),)),
             2,
             3,
-            gm.Tile(gm.TileState.BLANK, bonus_level=4),
+            gm.Tile(gm.TileState.BLANK),
         )
 
         result = gm.install_backpack_paint(state, 0, 2, 3, rng=random.Random(0))
@@ -142,8 +166,44 @@ class BonusSurvivesOnTileTest(unittest.TestCase):
         self.assertTrue(result.success)
         tile = result.state.tile(2, 3)
         self.assertEqual(tile.paint.level, 1)
-        self.assertEqual(gm.tile_bonus_level(tile), 4)
-        self.assertEqual(gm.tile_final_level(tile), 5)
+        self.assertEqual(gm.tile_bonus_level(tile), 0)
+        self.assertEqual(gm.tile_final_level(tile), 1)
+
+    def test_transform_keeps_the_bonus_because_the_paint_survives(self) -> None:
+        """改写内容不是炸毁：颜料实例还在，那笔加成跟着它走。
+
+        2026-11-22 c4r5 实测：被转成 3 级机械之神后仍吃到此前积累的 +2/+1，
+        显示 6 级，点击地块提示 +3。
+        """
+        other = gm.Paint(PaintCategory.MONSTER, 3, subtype="机械之神")
+        state = _with_tile(
+            _state(),
+            2,
+            3,
+            gm.Tile(gm.TileState.PAINT, gm.Paint(GAMEPLAY, 3, bonus_level=3)),
+        )
+
+        placed = gm._tile_after_current_anchor_placement(state.tile(2, 3), other, None)
+
+        self.assertEqual(placed.paint.level, 3)
+        self.assertEqual(gm.tile_bonus_level(placed), 3, "转化不改加成")
+
+    def test_frame_gap_zeroes_the_bonus(self) -> None:
+        """视觉上「这一格中间断了一帧空」= 颜料被销毁过，加成不许续上。"""
+        previous = _with_tile(
+            _state(),
+            2,
+            3,
+            gm.Tile(gm.TileState.PAINT, gm.Paint(GAMEPLAY, 3, bonus_level=4)),
+        )
+        carried = gm._carried_tile_buffs(previous)
+        bonus, _aura, previous_paint = carried[(2, 3)]
+        self.assertEqual(bonus, 4)
+        self.assertIsNotNone(previous_paint, "上一帧有颜料，调用方才会继承")
+
+        # 上一帧是空的 → 根本没有可继承的加成
+        blank_previous = _with_tile(_state(), 2, 3, gm.Tile(gm.TileState.BLANK))
+        self.assertEqual(gm._carried_tile_buffs(blank_previous), {})
 
 
 class UpgradeLandsOnTheRightLayerTest(unittest.TestCase):
@@ -156,6 +216,7 @@ class UpgradeLandsOnTheRightLayerTest(unittest.TestCase):
         tile = upgraded.tile(2, 3)
         self.assertEqual(tile.paint.level, 3, "「额外提升」不该改颜料等级")
         self.assertEqual(gm.tile_bonus_level(tile), 3)
+        self.assertEqual(tile.paint.bonus_level, 3, "加成记在颜料自己身上")
         self.assertEqual(gm.tile_final_level(tile), 6)
 
     def test_plain_upgrade_writes_paint_level(self) -> None:
@@ -168,12 +229,12 @@ class UpgradeLandsOnTheRightLayerTest(unittest.TestCase):
         self.assertEqual(tile.paint.level, 4)
         self.assertEqual(gm.tile_bonus_level(tile), 0)
 
-    def test_rule_effect_writes_tile_bonus(self) -> None:
-        """初始颜料的调色加成也落在地块上（用户 2026-11-22 口径）。
+    def test_rule_effect_writes_bonus_on_the_paint(self) -> None:
+        """初始颜料的调色加成落在**颜料**上（用户 2026-11-22 / 2026-11-23 口径）。
 
         证据：c4r5 被转成机械之神后仍吃到 +2/+1 到 6 级，且点击该地块游戏提示 +3。
         所以断言最终等级，并锁住「加成没写进颜料等级」——写进颜料等级的话，
-        那格颜料一被覆盖，这 N 级就跟着旧颜料一起没了。
+        那格颜料一被转化，这 N 级就跟着旧等级一起没了。
         """
 
         state = _with_tile(_state(rule=_rule(amount=2)), 2, 3, gm.Tile(gm.TileState.PAINT, gm.Paint(GAMEPLAY, 2)))
@@ -188,7 +249,12 @@ class UpgradeLandsOnTheRightLayerTest(unittest.TestCase):
 
     def test_rule_effect_is_wasted_once_bonus_fills_the_cap(self) -> None:
         # 加成 +6 时 Lv1 已经是 7 级，再提升颜料等级不产生收益
-        state = _with_tile(_state(rule=_rule(amount=2)), 2, 3, gm.Tile(gm.TileState.PAINT, gm.Paint(GAMEPLAY, 1), bonus_level=6))
+        state = _with_tile(
+            _state(rule=_rule(amount=2)),
+            2,
+            3,
+            gm.Tile(gm.TileState.PAINT, gm.Paint(GAMEPLAY, 1, bonus_level=6)),
+        )
 
         upgraded, _count = gm._apply_current_rule_upgrade(state, state.current_rule)
 
@@ -199,17 +265,18 @@ class UpgradeLandsOnTheRightLayerTest(unittest.TestCase):
 
 class ValueUsesFinalLevelTest(unittest.TestCase):
     def test_level_one_treasure_with_six_bonus_is_worth_a_level_seven(self) -> None:
-        treasure = gm.Paint(GAMEPLAY, 1, subtype="宝箱", is_treasure=True)
+        stacked_paint = gm.Paint(GAMEPLAY, 1, subtype="宝箱", is_treasure=True, bonus_level=6)
+        plain_paint = gm.Paint(GAMEPLAY, 1, subtype="宝箱", is_treasure=True)
         empty = _state()
-        plain = _with_tile(empty, 2, 3, gm.Tile(gm.TileState.PAINT, treasure))
-        stacked = _with_tile(empty, 2, 3, gm.Tile(gm.TileState.PAINT, treasure, bonus_level=6))
+        plain = _with_tile(empty, 2, 3, gm.Tile(gm.TileState.PAINT, plain_paint))
+        stacked = _with_tile(empty, 2, 3, gm.Tile(gm.TileState.PAINT, stacked_paint))
 
         baseline = board_value(empty)
         # 落一枚 Lv1 宝箱：这一格从 blank 变成 paint，差值应等于 Lv1 宝箱价值
         self.assertAlmostEqual(
             board_value(plain) - (baseline - DEFAULT_WEIGHTS.blank), DEFAULT_WEIGHTS.treasure[1]
         )
-        # 同样的 Lv1 宝箱，地块加成 +6 之后价值等于 7 级宝箱
+        # 同样的 Lv1 宝箱，颜料加成 +6 之后价值等于 7 级宝箱
         self.assertAlmostEqual(
             board_value(stacked) - (baseline - DEFAULT_WEIGHTS.blank), DEFAULT_WEIGHTS.treasure[gm.MAX_LEVEL]
         )
@@ -219,37 +286,68 @@ class ValueUsesFinalLevelTest(unittest.TestCase):
         )
 
     def test_level7_counts_uses_final_level(self) -> None:
-        treasure = gm.Paint(GAMEPLAY, 1, subtype="宝箱", is_treasure=True)
-        state = _with_tile(_state(), 2, 3, gm.Tile(gm.TileState.PAINT, treasure, bonus_level=6))
+        treasure = gm.Paint(GAMEPLAY, 1, subtype="宝箱", is_treasure=True, bonus_level=6)
+        state = _with_tile(_state(), 2, 3, gm.Tile(gm.TileState.PAINT, treasure))
 
         from huahua_assistant.engine.value import level7_counts
 
         self.assertEqual(level7_counts(state), (1, 1))
 
 
-class BankedBonusValueTest(unittest.TestCase):
-    def test_blank_tile_holding_bonus_is_not_worthless(self) -> None:
-        empty = _state()
-        loaded = _with_tile(empty, 2, 3, gm.Tile(gm.TileState.BLANK, bonus_level=6))
+class AuraStaysOnTheTileTest(unittest.TestCase):
+    """用户 2026-11-23 规则二：初始颜料的笔触效果留在**锚点地块**上。
 
-        self.assertAlmostEqual(
-            board_value(loaded) - board_value(empty),
-            DEFAULT_WEIGHTS.empty_tile_value(gm.TileState.BLANK, 6) - DEFAULT_WEIGHTS.blank,
+    实机过程：初始颜料（幽灵）+ 笔触「全图相同内容颜料提升2级」→ 全图幽灵 +2；
+    把它强制完成炸毁 → 其他幽灵 -2；失色恢复成空白后装一枚「存活」→ 全图存活 +2。
+
+    这就是 ``Tile.aura_amount`` 的语义：强度挂地块，作用对象 = 这一格当前那枚颜料
+    的同种颜料。所以「范围」和「笔触效果」都还在，只是当格没有颜料时加不到任何人。
+    """
+
+    def test_aura_strength_survives_the_destruction(self) -> None:
+        anchor = gm.Tile(gm.TileState.PAINT, gm.Paint(PaintCategory.MONSTER, 3, subtype="幽灵"), aura_amount=2)
+        state = _with_tile(_state(), 2, 2, anchor)
+        destroyed = _with_tile(state, 2, 2, gm.Tile(gm.TileState.FADED, aura_amount=2))
+
+        self.assertEqual(destroyed.tile(2, 2).aura_amount, 2, "笔触强度挂在锚点地块上，炸毁不删")
+
+    def test_aura_finds_no_targets_while_the_anchor_is_empty(self) -> None:
+        """锚点格空了 → 光环加不到任何人，别处同种颜料掉回原级。"""
+        tiles = list(_state().tiles)
+        tiles[2 * gm.BOARD_SIZE + 2] = gm.Tile(gm.TileState.FADED, aura_amount=2)
+        tiles[3 * gm.BOARD_SIZE + 3] = gm.Tile(
+            gm.TileState.PAINT, gm.Paint(PaintCategory.MONSTER, 3, subtype="幽灵")
         )
-        self.assertGreater(board_value(loaded), board_value(empty))
+        state = gm.PuzzleState(tiles=tuple(tiles), current_anchor=(2, 2))
 
-    def test_loaded_blank_beats_a_fresh_level_one_treasure(self) -> None:
-        treasure = gm.Paint(GAMEPLAY, 1, subtype="宝箱", is_treasure=True)
-        empty = _state()
-        loaded = _with_tile(empty, 2, 3, gm.Tile(gm.TileState.BLANK, bonus_level=6))
-        fresh = _with_tile(empty, 2, 3, gm.Tile(gm.TileState.PAINT, treasure))
+        recomputed = gm._recompute_auras(state)
 
-        # 一格 +6 的空地比一枚 Lv1 宝箱更值钱——这正是"先叠 buff 再落一枚"的理由
-        self.assertGreater(board_value(loaded), board_value(fresh))
+        self.assertEqual(recomputed.tile(3, 3).aura_level, 0, "锚点没颜料，加不到")
+        self.assertEqual(gm.tile_final_level(recomputed.tile(3, 3)), 3)
+
+    def test_aura_reattaches_to_a_new_paint_on_the_recovered_tile(self) -> None:
+        """失色地块恢复后放一枚「存活」→ 光环立刻改挂到存活上。"""
+        tiles = list(_state().tiles)
+        tiles[2 * gm.BOARD_SIZE + 2] = gm.Tile(
+            gm.TileState.PAINT, gm.Paint(PaintCategory.GAMEPLAY, 3, subtype="存活"), aura_amount=2
+        )
+        tiles[3 * gm.BOARD_SIZE + 3] = gm.Tile(
+            gm.TileState.PAINT, gm.Paint(PaintCategory.GAMEPLAY, 3, subtype="存活")
+        )
+        # 地图上另有一枚幽灵，它不该再吃到光环
+        tiles[4 * gm.BOARD_SIZE + 4] = gm.Tile(
+            gm.TileState.PAINT, gm.Paint(PaintCategory.MONSTER, 3, subtype="幽灵")
+        )
+        state = gm.PuzzleState(tiles=tuple(tiles), current_anchor=(2, 2))
+
+        recomputed = gm._recompute_auras(state)
+
+        self.assertEqual(recomputed.tile(3, 3).aura_level, 2, "存活吃到了原来给幽灵的 +2")
+        self.assertEqual(recomputed.tile(4, 4).aura_level, 0, "幽灵吃不到了")
 
 
 class SelfCorrectionKeepsAuraTest(unittest.TestCase):
-    """反推基础等级「小于 1 级」时，只能清地块加成，**不许动光环**。
+    """反推基础等级「小于 1 级」时，只能清颜料加成，**不许动光环**。
 
     2026-11-22 全库实测：``runtime/auto_run_records.jsonl`` 里 2559 个颜料格样本
     的 ``aura_level`` **全是 0**。根因就是 ``_rebase_observed_levels`` 的自纠正分支
@@ -269,8 +367,7 @@ class SelfCorrectionKeepsAuraTest(unittest.TestCase):
             3,
             gm.Tile(
                 gm.TileState.PAINT,
-                gm.Paint(GAMEPLAY, observed),
-                bonus_level=bonus,
+                gm.Paint(GAMEPLAY, observed, bonus_level=bonus),
                 aura_amount=aura,
                 aura_level=aura,
             ),
@@ -278,10 +375,10 @@ class SelfCorrectionKeepsAuraTest(unittest.TestCase):
         return gm._rebase_observed_levels(state).tile(2, 3)
 
     def test_base_below_one_clears_bonus_but_keeps_aura_amount(self) -> None:
-        # 画面 4 级，模型认为 +5 地块加成、+3 光环 → 反推 -4 级，落在自纠正分支
+        # 画面 4 级，模型认为 +5 颜料加成、+3 光环 → 反推 -4 级，落在自纠正分支
         tile = self._rebased(4, bonus=5, aura=3)
 
-        self.assertEqual(gm.tile_bonus_level(tile), 0, "多算的地块加成该清掉")
+        self.assertEqual(gm.tile_bonus_level(tile), 0, "多算的颜料加成该清掉")
         self.assertEqual(tile.aura_amount, 3, "光环强度是词缀，不许清")
         self.assertEqual(tile.aura_level, 3, "派生缓存也不许清")
 

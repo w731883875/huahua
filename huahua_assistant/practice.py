@@ -148,12 +148,16 @@ def paint_signature(paint: gm.Paint) -> str:
 
 
 def _paint_to_dict(paint: gm.Paint) -> dict[str, Any]:
-    return {
+    data: dict[str, Any] = {
         'category': ('treasure' if paint.is_treasure else paint.category.value),
         'level': int(paint.level),
         'subtype': paint.subtype,
         'is_treasure': bool(paint.is_treasure),
     }
+    # 等级加成跟着颜料走，只有非 0 才写，老存档读进来默认 0。
+    if paint.bonus_level:
+        data['bonus'] = int(paint.bonus_level)
+    return data
 
 
 def _paint_from_dict(data: dict[str, Any]) -> gm.Paint:
@@ -167,6 +171,7 @@ def _paint_from_dict(data: dict[str, Any]) -> gm.Paint:
         level=int(data.get('level') or 1),
         subtype=data.get('subtype'),
         is_treasure=bool(raw == 'treasure' or data.get('is_treasure')),
+        bonus_level=int(data.get('bonus') or 0),
     )
 
 
@@ -174,7 +179,6 @@ def _tile_to_dict(tile: gm.Tile) -> dict[str, Any]:
     return {
         's': _TILE_STATE_CODE.get(tile.state, 5),
         'p': _paint_to_dict(tile.paint) if tile.paint is not None else None,
-        'b': tile.bonus_level,
         'a': tile.aura_amount,
         'buf': tile.buff_applied_id,
         'aff': tile.affix_applied_id,
@@ -188,7 +192,6 @@ def _tile_from_dict(data: dict[str, Any]) -> gm.Tile:
         paint=_paint_from_dict(paint_raw) if paint_raw else None,
         buff_applied_id=data.get('buf'),
         affix_applied_id=data.get('aff'),
-        bonus_level=int(data.get('b') or 0),
         aura_amount=int(data.get('a') or 0),
     )
 

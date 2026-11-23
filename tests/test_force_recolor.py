@@ -99,8 +99,8 @@ class ForceRecolorTest(unittest.TestCase):
         self.assertEqual(session.force_remaining, 0)
         self.assertFalse(session.force_complete())
 
-    def test_destroyed_tile_becomes_faded_and_keeps_bonus(self) -> None:
-        """炸毁 → 失色，但地块加成必须留下。"""
+    def test_destroyed_tile_becomes_faded_and_drops_the_bonus(self) -> None:
+        """炸毁 → 失色，颜料身上那笔加成跟着颜料一起销毁（用户 2026-11-23 规则一）。"""
         session = _ready_session(39)
         tiles = list(session.state.tiles)
         painted = [
@@ -109,18 +109,21 @@ class ForceRecolorTest(unittest.TestCase):
         ]
         self.assertTrue(painted, '本局应当已有颜料')
         for index in painted:
-            tiles[index] = gm.replace(tiles[index], bonus_level=2)
+            tiles[index] = gm.replace(
+                tiles[index], paint=gm.replace(tiles[index].paint, bonus_level=2)
+            )
         session.state = gm.replace(session.state, tiles=tuple(tiles))
 
         self.assertTrue(session.force_complete())
-        faded_with_bonus = [
-            (index // gm.BOARD_SIZE, index % gm.BOARD_SIZE, tile.bonus_level)
+        lingering = [
+            (index // gm.BOARD_SIZE, index % gm.BOARD_SIZE, gm.tile_bonus_level(tile))
             for index, tile in enumerate(session.state.tiles)
-            if tile.state is gm.TileState.FADED and tile.bonus_level > 0
+            if tile.state is gm.TileState.FADED and gm.tile_bonus_level(tile) > 0
         ]
-        self.assertTrue(
-            faded_with_bonus,
-            '失色格必须保留地块加成，否则"炸完再放一枚到 7 级"就不成立',
+        self.assertEqual(
+            lingering,
+            [],
+            '失色格不许保留加成：加成挂在颜料上，颜料被炸毁就一起没了',
         )
 
     def test_shortfall_is_reported_not_silent(self) -> None:

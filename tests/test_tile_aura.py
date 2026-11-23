@@ -12,15 +12,23 @@
 不可能继承。它继承了，说明 **buff 挂在那一格地块上**，「自身」指的是这一格当前
 放着的那枚颜料。
 
-**设定 2：「范围内颜料变成随机颜料」会覆盖之前的 buff。**
+**设定 2：「范围内颜料变成随机颜料」是**改写内容**，不是炸毁。**
 
-被随机化的格子，之前累积的地块加成清零，光环锚点也失效。
+被随机化的格子，颜料实例还在（只是内容变了），所以：
+
+- 它身上那笔**颜料加成**（``Paint.bonus_level``）跟着这枚颜料继续存在；
+- 它作为锚点挂着的**笔触光环强度**（``Tile.aura_amount``）也还在，只是作用对象
+  改成了改写后的新内容 —— 原来吃这条光环的旧种颜料立刻掉级。
+
+只有**炸毁**（强制完成 → 失色）才是真销毁：颜料没了，它自己的加成一并消失；
+但光环强度因为挂在**地块**上，仍然留着，等这一格重新落笔后改挂到新颜料上。
 
 模型上的落地：
 
-- ``Tile.aura_amount`` 记在锚点地块上，是强度；
+- ``Paint.bonus_level`` 是颜料自己的加成，跟着颜料生命周期；
+- ``Tile.aura_amount`` 记在锚点地块上，是光环强度；
 - ``Tile.aura_level`` 是派生缓存，每次棋盘变动后由 ``_recompute_auras`` 重算；
-- 最终等级 = 颜料等级 + ``bonus_level`` + ``aura_level``，封顶 7。
+- 最终等级 = 颜料等级 + 颜料加成 + ``aura_level``，封顶 7。
 """
 
 from __future__ import annotations
@@ -138,29 +146,30 @@ class AuraFollowsTheTileTest(unittest.TestCase):
         self.assertEqual(restored.tile(2, 3).aura_level, 0, "幽灵不再吃")
 
     def test_bonus_level_alone_is_not_an_aura(self) -> None:
-        """普通地块加成不参与光环重算，清空后照样留着。"""
-        state = _with_tile(_state(), 2, 3, gm.Tile(gm.TileState.PAINT, GHOST, bonus_level=4))
+        """颜料加成不参与光环重算；颜料被清掉时它跟着走。"""
+        state = _with_tile(_state(), 2, 3, gm.Tile(gm.TileState.PAINT, replace(GHOST, bonus_level=4)))
 
         cleared, _count = gm._clear_tile_indices(state, [2 * gm.BOARD_SIZE + 3])
 
-        self.assertEqual(gm.tile_bonus_level(cleared.tile(2, 3)), 4)
+        self.assertEqual(gm.tile_bonus_level(cleared.tile(2, 3)), 0, "颜料没了，加成也没了")
         self.assertEqual(cleared.tile(2, 3).aura_level, 0)
 
 
 class RandomizeOverwritesTheBuffTest(unittest.TestCase):
-    def test_randomize_clears_tile_bonus(self) -> None:
+    def test_randomize_keeps_the_paint_bonus(self) -> None:
+        """随机化是改写内容、不是炸毁 → 颜料身上那笔加成跟着走。"""
         state = _state(_rule())
         state = _paint_at(state, 2, 2, GHOST)
-        state = _with_tile(state, 2, 3, gm.Tile(gm.TileState.PAINT, GHOST, bonus_level=4, aura_level=2))
+        state = _with_tile(state, 2, 3, gm.Tile(gm.TileState.PAINT, replace(GHOST, bonus_level=4)))
 
         randomized, count = gm._randomize_scope_paints(state, _randomize_affix(), random.Random(0))
 
         self.assertEqual(count, 1)
         tile = randomized.tile(2, 3)
-        self.assertEqual(gm.tile_bonus_level(tile), 0, "随机化覆盖之前的地块加成")
-        self.assertEqual(tile.aura_amount, 0, "随机化也清掉光环锚点")
+        self.assertEqual(gm.tile_bonus_level(tile), 4, "转化不是销毁，加成不丢")
 
-    def test_randomize_breaks_the_anchor_aura(self) -> None:
+    def test_randomize_retargets_the_anchor_aura(self) -> None:
+        """光环强度留在地块上，但作用对象改成改写后的新内容。"""
         state = _board_with_aura()
         # 再给 (2,3) 也挂一条 +3 光环：两条同种光环叠加，幽灵吃 6 级
         tiles = list(state.tiles)
@@ -170,8 +179,13 @@ class RandomizeOverwritesTheBuffTest(unittest.TestCase):
 
         randomized, _count = gm._randomize_scope_paints(state, _randomize_affix(), random.Random(0))
 
-        self.assertEqual(randomized.tile(2, 3).aura_amount, 0, "被随机化的格子丢掉光环")
-        self.assertEqual(randomized.tile(2, 2).aura_level, 3, "只剩锚点(2,2)自己的 +3")
+        self.assertEqual(
+            randomized.tile(2, 3).aura_amount, 3, "笔触强度挂在锚点地块上，改写内容不删它"
+        )
+        if not gm._is_same_paint_kind(randomized.tile(2, 3).paint, GHOST):
+            self.assertEqual(
+                randomized.tile(2, 2).aura_level, 3, "那格改成别的颜料了，幽灵只剩锚点自己那条 +3"
+            )
 
 
 if __name__ == "__main__":

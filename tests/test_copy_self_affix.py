@@ -125,12 +125,14 @@ class CopySelfLevelTest(unittest.TestCase):
 
         for bonus in (1, 2):
             tiles = list(settled.tiles)
-            tiles[index] = gm.replace(tiles[index], bonus_level=bonus)
+            tiles[index] = gm.replace(
+                tiles[index], paint=gm.replace(tiles[index].paint, bonus_level=bonus)
+            )
             boosted = gm.replace(settled, tiles=tuple(tiles))
             self.assertEqual(
                 gm.tile_final_level(boosted.tile(row, col)),
                 min(gm.MAX_LEVEL, self_level + bonus),
-                f'地块 +{bonus} 应当叠加到自身等级上',
+                f'颜料 +{bonus} 应当叠加到自身等级上',
             )
 
     def test_level_capped_at_max(self) -> None:
@@ -142,7 +144,10 @@ class CopySelfLevelTest(unittest.TestCase):
         row, col = placed[0]
         tiles = list(settled.tiles)
         tiles[row * gm.BOARD_SIZE + col] = gm.replace(
-            tiles[row * gm.BOARD_SIZE + col], bonus_level=gm.MAX_LEVEL
+            tiles[row * gm.BOARD_SIZE + col],
+            paint=gm.replace(
+                tiles[row * gm.BOARD_SIZE + col].paint, bonus_level=gm.MAX_LEVEL
+            ),
         )
         boosted = gm.replace(settled, tiles=tuple(tiles))
         self.assertEqual(gm.tile_final_level(boosted.tile(row, col)), gm.MAX_LEVEL)

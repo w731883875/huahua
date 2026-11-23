@@ -35,8 +35,7 @@ def _state_with_boost() -> PuzzleState:
     tiles = [Tile(state=TileState.BLANK) for _ in range(BOARD_SIZE * BOARD_SIZE)]
     tiles[2 * BOARD_SIZE + 3] = Tile(
         state=TileState.PAINT,
-        paint=Paint(PaintCategory.MONSTER, 2, "鼠人"),
-        bonus_level=3,
+        paint=Paint(PaintCategory.MONSTER, 2, "鼠人", bonus_level=3),
     )
     tiles[1 * BOARD_SIZE + 2] = Tile(
         state=TileState.PAINT,

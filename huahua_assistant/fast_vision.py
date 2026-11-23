@@ -33,8 +33,8 @@ class FastTile:
     paint_subtype: str | None
     paint_is_treasure: bool
     confidence: float
-    #: 地块等级加成（`game_model.Tile.bonus_level`）。
-    #: **视觉上读不到**：棋盘只渲染最终等级，空地上叠的加成完全不可见。
+    #: 颜料自己的等级加成（`game_model.Paint.bonus_level`）。
+    #: **视觉上读不到**：棋盘只渲染最终等级，加成完全不可见。
     #: 这个字段由上层从规则推演出的模型状态回填，用于记录/回放两套数的区别。
     bonus_level: int = 0
     #: 「与自身相同的颜料额外提升 x 级」这类光环给这一格带来的等级
@@ -221,6 +221,9 @@ def _tile_buffs(model: object | None) -> dict[tuple[int, int], tuple[int, int]]:
     - ``None`` → 全 0；
     - 有 ``.tiles`` 的对象（``game_model.PuzzleState``）→ 按行主序换算坐标；
     - 直接给 ``{(row, col): (bonus, aura)}`` 或 ``{(row, col): tile}``。
+
+    ``bonus_level`` 读的是**颜料**身上的加成（``Paint.bonus_level``，2026-11-23
+    改成颜料加成）：地块上没有颜料时那一格就是 0，与模型口径一致。
     """
     if model is None:
         return {}
@@ -228,8 +231,9 @@ def _tile_buffs(model: object | None) -> dict[tuple[int, int], tuple[int, int]]:
     if model_tiles is not None:
         buffs: dict[tuple[int, int], tuple[int, int]] = {}
         for index, tile in enumerate(model_tiles):
+            paint = getattr(tile, "paint", None)
             buffs[divmod(index, BOARD_SIZE)] = (
-                max(0, int(getattr(tile, "bonus_level", 0) or 0)),
+                max(0, int(getattr(paint, "bonus_level", 0) or 0)) if paint is not None else 0,
                 max(0, int(getattr(tile, "aura_level", 0) or 0)),
             )
         return buffs

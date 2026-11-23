@@ -98,6 +98,21 @@ class Paint:
     level: int
     subtype: str | None = None
     is_treasure: bool = False
+    #: 这枚颜料身上累计的**等级加成**（官方 `FacadeLevel - RawLevel`）。
+    #:
+    #: **加成挂在颜料上，不挂在地块上**（用户 2026-11-23 定案，依据是解包资源：
+    #: 客户端``Plot``结构里只有 ``RawLevel`` / ``FacadeLevel`` 和一张来源清单
+    #: ``OriItemList``，每条来源指向一个颜料实例 ``UniqueId``，**没有**「地块自己
+    #: 攒了多少级」这种字段）。所以：
+    #:
+    #: * 普通背包颜料被炸毁（强制作画 → 地块失色）→ 颜料没了，加成一起消失；
+    #: * 地块恢复到空白后再放一枚颜料 → 那是一枚**全新颜料**，加成从 0 开始；
+    #: * 换成另一种颜料 → 新的那枚从 0 开始，旧的那份跟着旧颜料走掉。
+    #:
+    #: 「与自身内容相同的颜料额外提升N级」这类**笔触效果**不在这里 —— 它记在
+    #: ``Tile.aura_amount`` 上（挂地块、按锚点当前那枚颜料决定加给谁），
+    #: 所以初始颜料被炸毁后笔触效果仍在，换一枚新颜料又能吃到。
+    bonus_level: int = 0
 
 
 @dataclass(frozen=True)
@@ -106,13 +121,14 @@ class Tile:
     paint: Paint | None = None
     buff_applied_id: int | None = None
     affix_applied_id: int | None = None
-    # 等级加成（服务端 FacadeLevel）：挂在**地块**上，不是挂在颜料上。
-    # 颜料被覆盖、被炸毁、被清空后，加成仍留在这一格，下一次落笔直接吃满。
-    bonus_level: int = 0
     # 「与自身相同的颜料额外提升x级」这类光环的**强度**，记在锚点地块上。
     # 光环的作用对象不是固定的：它永远等于「和这一格当前颜料同种」的全部颜料。
     # 所以初始颜料被炸掉（这一格变失色）→ 光环失效，别处同种颜料掉级；
     # 失色地块恢复后放一枚新颜料 → 光环自动改挂到新颜料上，别处同种又涨回来。
+    #
+    # 用户 2026-11-23 实机口径确认了这个行为：初始颜料（幽灵）+ 笔触「全图相同
+    # 内容颜料提升2级」→ 全图幽灵 +2；把它强制完成炸毁 → 其他幽灵 -2；
+    # 失色恢复成空白后装一枚「存活」→ 全图存活 +2。
     aura_amount: int = 0
     # 派生缓存：这一格从全场所有光环里吃到的等级。每次棋盘变动后由
     # ``_recompute_auras`` 重算，不要手写。
@@ -120,8 +136,12 @@ class Tile:
 
 
 def tile_bonus_level(tile: Tile) -> int:
-    """地块上累计的等级加成（不含光环）。"""
-    return max(0, int(tile.bonus_level))
+    """这枚颜料身上累计的等级加成（不含光环）。
+
+    **加成读自颜料**，颜料不在（空白 / 虚空 / 失色）就是 0。以前存 ``Tile`` 上，
+    导致「颜料被炸掉加成还留在原地」，与客户端数据结构不符（2026-11-23 定案）。
+    """
+    return max(0, int(tile.paint.bonus_level)) if tile.paint is not None else 0
 
 
 def tile_aura_level(tile: Tile) -> int:
@@ -171,17 +191,24 @@ def tile_effective_paint(tile: Tile) -> Paint | None:
 
 
 def _tile_with_upgrade(tile: Tile, amount: int, *, as_bonus: bool) -> Tile:
-    """把一次"N 级提升"落到地块上。
+    """把一次"N 级提升"落到**这枚颜料**上。
 
-    ``as_bonus=True`` 对应官方「额外提升」类笔触 → 记到**地块加成**上，
-    所以颜料被覆盖后这笔加成还在；否则加到颜料自身等级上。
-    两条路径都受 7 级封顶约束：加成已经顶满时，再提升颜料等级不产生任何收益。
+    ``as_bonus=True`` 对应官方「额外提升」类笔触 → 记到**颜料自己的加成**上
+    （``Paint.bonus_level``），颜料被炸毁/换掉时这笔加成随之消失；否则直接加到
+    颜料自身等级上。两条路径都受 7 级封顶约束：加成已经顶满时，再提升颜料等级
+    不产生任何收益。
     """
     if tile.paint is None or amount <= 0:
         return tile
     headroom = max(0, MAX_LEVEL - tile_bonus_level(tile) - tile_aura_level(tile))
     if as_bonus:
-        return replace(tile, bonus_level=min(MAX_LEVEL, tile_bonus_level(tile) + amount))
+        return replace(
+            tile,
+            paint=replace(
+                tile.paint,
+                bonus_level=min(MAX_LEVEL, tile_bonus_level(tile) + amount),
+            ),
+        )
     return replace(
         tile,
         paint=replace(tile.paint, level=max(tile.paint.level, min(headroom, tile.paint.level + amount))),
@@ -539,8 +566,19 @@ def state_from_observation(
     carried = _carried_tile_buffs(previous)
     tiles = []
     for tile in board.tiles:
-        bonus, aura_amount = carried.get((tile.row, tile.col), (0, 0))
+        bonus, aura_amount, previous_paint = carried.get((tile.row, tile.col), (0, 0, None))
         paint = _paint_from_tile_observation(tile)
+        # 加成挂在**颜料**上：只有「这一格上一帧也有颜料」才继承那笔加成。
+        # 这一格空了（炸毁失色 / 被清成空白）就说明那枚颜料连同它身上的加成一
+        # 起没了 —— 用户 2026-11-23 定案：普通背包颜料被炸毁后，地块恢复成空白
+        # 再放一枚，是**全新颜料、无任何残留加成**。
+        #
+        # 反过来，上一帧有颜料、这一帧还有颜料（哪怕内容被转成了别的颜料）就照旧
+        # 继承：2026-11-22 c4r5 实测样本是被转成 3 级机械之神后仍吃到此前积累的
+        # +2/+1 显示 6 级。视觉上分不清「转化」和「销毁后立刻补一枚」，但**中间
+        # 那一帧是不是空的**是明确信号，所以用「有没有断帧」来判，不比较颜料种类。
+        if bonus and (paint is None or previous_paint is None):
+            bonus = 0
         if anchor == (tile.row, tile.col) and rule is not None:
             # 锚点格要区分两件事：面板给的是颜料**自己的**等级，棋盘角标给的是
             # **最终等级**（颜料等级 + 地块加成 + 光环）。
@@ -564,8 +602,11 @@ def state_from_observation(
         tiles.append(
             Tile(
                 state=tile.state,
-                paint=paint,
-                bonus_level=bonus,
+                paint=(
+                    replace(paint, bonus_level=bonus)
+                    if paint is not None and bonus != int(paint.bonus_level)
+                    else paint
+                ),
                 aura_amount=aura_amount,
             )
         )
@@ -661,21 +702,31 @@ def _tile_is_family(tile, category: PaintCategory) -> bool:
     return paint is not None and paint.category == category
 
 
-def _carried_tile_buffs(previous: PuzzleState | None) -> dict[tuple[int, int], tuple[int, int]]:
-    """从上一帧状态里取出每格要继承的 ``(bonus_level, aura_amount)``。
+def _carried_tile_buffs(
+    previous: PuzzleState | None,
+) -> dict[tuple[int, int], tuple[int, int, Paint | None]]:
+    """从上一帧状态里取出每格要继承的 ``(bonus_level, aura_amount, 上一帧的颜料)``。
+
+    两项的继承规则**不一样**，这也是「加成挂颜料、光环挂地块」的直接体现：
+
+    * ``bonus_level`` 是**颜料自己的**加成，所以调用方要判断这一格上一帧有没有
+      颜料：有就继承，空了（炸毁失色 / 清成空白）就归零 —— 用户 2026-11-23 定案：
+      普通背包颜料被炸毁 → 加成直接消失，恢复成空白地块后无任何残留加成。
+      这里把上一帧的颜料带出去，就是为了让调用方做这个「有没有断帧」的判断。
+    * ``aura_amount`` 是**笔触效果**的强度，挂在锚点**地块**上，与颜料生命周期
+      无关，永远按格子继承 —— 初始颜料被炸毁后笔触效果仍在，失色恢复后装一枚
+      新颜料又能吃到（用户 2026-11-23 实机口径）。
 
     只带这两项，不带 ``aura_level``——它是派生缓存，交给 :func:`_recompute_auras` 重算。
-    按格子继承而不是按颜料继承，是因为这两项挂在**地块**上：颜料被炸掉、地块失色、
-    恢复后重新落笔，加成仍在原地（实机验证过）。
     """
     if previous is None:
         return {}
-    carried: dict[tuple[int, int], tuple[int, int]] = {}
+    carried: dict[tuple[int, int], tuple[int, int, Paint | None]] = {}
     for index, tile in enumerate(previous.tiles):
         bonus = tile_bonus_level(tile)
         aura = max(0, int(tile.aura_amount))
         if bonus or aura:
-            carried[divmod(index, BOARD_SIZE)] = (bonus, aura)
+            carried[divmod(index, BOARD_SIZE)] = (bonus, aura, tile.paint)
     return carried
 
 
@@ -690,7 +741,7 @@ def _rebase_observed_levels(state: PuzzleState, anchor: tuple[int, int] | None =
 
     - 加成是 0 的格子完全不动（老路径一字不改）；
     - 观测到 7 级说明已经封顶，反推不唯一，保持原样；
-    - 反推出来小于 1 级，说明模型比现实多算了 → 就地清掉这一格的**地块加成**，
+    - 反推出来小于 1 级，说明模型比现实多算了 → 就地清掉**这枚颜料的加成**，
       但**保留** ``aura_amount``（那是「同种颜料光环」这条词缀的强度，见下方注释）。
     """
     tiles: list[Tile] = []
@@ -708,7 +759,7 @@ def _rebase_observed_levels(state: PuzzleState, anchor: tuple[int, int] | None =
         if base >= 1:
             tiles.append(replace(tile, paint=replace(tile.paint, level=base)))
             continue
-        # 反推出来小于 1 级：模型比现实多算了。**只清地块加成，保留 aura_amount**。
+        # 反推出来小于 1 级：模型比现实多算了。**只清这枚颜料的加成，保留 aura_amount**。
         #
         # 以前这里连 ``aura_amount`` / ``aura_level`` 一起清零，本意是自我纠正，
         # 实际把「同种颜料光环」那条词缀的强度也抹掉了 —— 它是挂在**地块**上的
@@ -726,8 +777,11 @@ def _rebase_observed_levels(state: PuzzleState, anchor: tuple[int, int] | None =
         tiles.append(
             replace(
                 tile,
-                bonus_level=0,
-                paint=replace(tile.paint, level=remaining if remaining >= 1 else 1),
+                paint=replace(
+                    tile.paint,
+                    bonus_level=0,
+                    level=remaining if remaining >= 1 else 1,
+                ),
             )
         )
     return replace(state, tiles=tuple(tiles))
@@ -1514,10 +1568,12 @@ def install_backpack_paint(
     tiles = list(state.tiles)
     tiles[row * BOARD_SIZE + col] = Tile(
         state=TileState.PAINT,
-        paint=paint,
+        # 加成跟着**颜料**走：落下去的这枚是全新颜料，加成本来是 0；如果这一格
+        # 原来就有颜料（覆盖类词缀允许盖在颜料上），那笔加成挂在旧颜料上，
+        # 按「上一帧有颜料就继承」的口径转给新颜料。
+        paint=replace(paint, bonus_level=tile_bonus_level(target_tile)),
         buff_applied_id=None,
         affix_applied_id=None,
-        bonus_level=tile_bonus_level(target_tile),
         aura_amount=max(0, int(target_tile.aura_amount)),
     )
     backpack = sort_backpack_for_rule(
@@ -1572,10 +1628,9 @@ def _simulate_install_without_next_rule(
     tiles = list(state.tiles)
     tiles[row * BOARD_SIZE + col] = Tile(
         state=TileState.PAINT,
-        paint=paint,
+        paint=replace(paint, bonus_level=tile_bonus_level(state.tile(row, col))),
         buff_applied_id=None,
         affix_applied_id=None,
-        bonus_level=tile_bonus_level(state.tile(row, col)),
         aura_amount=max(0, int(state.tile(row, col).aura_amount)),
     )
     backpack = sort_backpack_for_rule(_remove_one_paint(state.backpack, source_paint), rule)
@@ -2559,9 +2614,12 @@ def placement_data_bias(state: PuzzleState, paint: Paint, row: int, col: int) ->
         else:
             bias += 1.5 * int(paint.level) - 4.5
     tile = state.tile(row, col)
-    # 已经有地块加成的格子，再放一枚等于白拿加成，实测这类格子更容易出高等级。
-    if tile.bonus_level > 0:
-        bias += 2.0 * int(tile.bonus_level)
+    # 这一格原来就有一枚带加成的颜料（覆盖类词缀才放得上去），那笔加成会转给新颜料，
+    # 等于白拿。实测这类格子更容易出高等级。空白格没有残留加成，不再给这个倾向分
+    # （2026-11-23 加成改挂颜料后，「先叠满一格再落笔」这条路不存在了）。
+    carried_bonus = tile_bonus_level(tile)
+    if carried_bonus > 0:
+        bias += 2.0 * carried_bonus
     return bias
 
 
@@ -3346,18 +3404,24 @@ def _is_current_anchor_placeable(tile: Tile, affix: AffixRule | None) -> bool:
 
 
 def _tile_after_current_anchor_placement(tile: Tile, paint: Paint, affix: AffixRule | None) -> Tile:
-    # 地块上的加成和光环锚点都跟着地块走，不跟着颜料走：
-    # 初始颜料被炸掉、地块恢复后换一枚新颜料，光环就改挂到新颜料上。
+    # 两项跟着不同的东西走：
+    # * ``aura_amount``（笔触光环强度）跟着**地块**走 —— 初始颜料被炸掉、地块恢复后
+    #   换一枚新颜料，光环就改挂到新颜料上（用户 2026-11-23 实机口径）；
+    # * ``bonus_level``（等级加成）跟着**颜料**走 —— 落一枚新颜料就是全新的，
+    #   只在「这一格原来就有颜料」时把那笔加成转过来。
     bonus = tile_bonus_level(tile)
     aura = max(0, int(tile.aura_amount))
 
     def _placed(state: TileState = TileState.PAINT, new_paint: Paint | None = paint) -> Tile:
         return Tile(
             state=state,
-            paint=new_paint,
+            paint=(
+                replace(new_paint, bonus_level=bonus)
+                if new_paint is not None and bonus
+                else new_paint
+            ),
             buff_applied_id=None,
             affix_applied_id=None,
-            bonus_level=bonus,
             aura_amount=aura,
             aura_level=0,
         )
@@ -5460,13 +5524,13 @@ def _randomize_scope_paints(state: PuzzleState, affix: AffixRule, rng: random.Ra
         tiles[index] = replace(
             tile,
             state=TileState.PAINT,
-            paint=next_paint,
+            # 加成挂在**颜料**上：这里是「内容变了但颜料还在」的转化，不是炸毁，
+            # 所以那笔加成跟着这枚颜料转过来。2026-11-22 的 c4r5 样本就是反例——
+            # 被转成机械之神后仍吃到此前积累的 +2/+1 到 6 级，点击地块提示 +3。
+            # 光环是派生量，交给 _recompute_auras 按当前锚点重算。
+            paint=replace(next_paint, bonus_level=tile_bonus_level(tile)),
             buff_applied_id=None,
             affix_applied_id=None,
-            # 地块加成保留：用户 2026-11-22 的 c4r5 就是反例样本——被转成机械之神后
-            # 仍吃到此前积累的 +2/+1 到 6 级，点击地块提示 +3。光环是派生量，
-            # 交给 _recompute_auras 按当前锚点重算。
-            bonus_level=tile_bonus_level(tile),
         )
         count += 1
     return _recompute_auras(replace(state, tiles=tuple(tiles))), count

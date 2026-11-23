@@ -289,8 +289,8 @@ class InitialPaintBonusLivesOnTheTileTests(unittest.TestCase):
         self.assertEqual(2, tile_bonus_level(tile))   # 加成记在地块上
         self.assertEqual(5, tile_final_level(tile))   # 最终等级照样是 5
 
-    def test_tile_bonus_survives_a_paint_being_replaced(self) -> None:
-        """加成在地块上：那格换成别的颜料，这 N 级不能丢。"""
+    def test_bonus_survives_a_paint_being_transformed(self) -> None:
+        """加成在颜料上：那格被**改写内容**（还是同一枚颜料），这 N 级不能丢。"""
 
         with_bonus = _state(
             {(ROW, 1): Paint(PaintCategory.GAMEPLAY, 3, "赛季")}, match_current=3, pending=True
@@ -298,28 +298,42 @@ class InitialPaintBonusLivesOnTheTileTests(unittest.TestCase):
         after = place_current_rule_anchor(with_bonus, ROW, 0).state
         self.assertEqual(2, tile_bonus_level(after.tile(ROW, 1)))
 
-        # 模拟「这格被覆盖成另一枚 3 级颜料」：只换 paint，地块加成原地不动。
+        # 模拟「这格内容被改成另一枚 3 级颜料」：颜料实例没变，加成跟着它走。
         tile = after.tile(ROW, 1)
-        replaced = replace(tile, paint=Paint(PaintCategory.GAMEPLAY, 3, "机械之神"))
+        replaced = replace(tile, paint=replace(tile.paint, subtype="机械之神"))
 
         self.assertEqual(2, tile_bonus_level(replaced))
         self.assertEqual(5, tile_final_level(replaced))
 
+    def test_bonus_disappears_with_the_paint(self) -> None:
+        """加成在颜料上：那格颜料没了（失色 / 清空），这 N 级跟着一起没。"""
+
+        with_bonus = _state(
+            {(ROW, 1): Paint(PaintCategory.GAMEPLAY, 3, "赛季")}, match_current=3, pending=True
+        )
+        after = place_current_rule_anchor(with_bonus, ROW, 0).state
+        self.assertEqual(2, tile_bonus_level(after.tile(ROW, 1)))
+
+        gone = replace(after.tile(ROW, 1), state=TileState.FADED, paint=None)
+
+        self.assertEqual(0, tile_bonus_level(gone))
+
     def test_cover_affix_keeps_the_tile_bonus(self) -> None:
-        """覆盖类笔触改的是颜料类型，不该顺带把地块加成清零。"""
+        """覆盖类笔触改的是颜料类型，不该顺带把颜料身上的加成清零。"""
 
         previous = _state({(ROW, 1): Paint(PaintCategory.MONSTER, 3, "伊吉")}, match_current=3)
         tiles = list(previous.tiles)
         index = ROW * BOARD_SIZE + 1
-        tiles[index] = replace(tiles[index], bonus_level=3)
+        tiles[index] = replace(
+            tiles[index], paint=replace(tiles[index].paint, bonus_level=3)
+        )
         previous = replace(previous, tiles=tuple(tiles))
 
         # 画面上它已经被转成同等级的机械之神。
         current_tiles = list(previous.tiles)
         current_tiles[index] = replace(
             current_tiles[index],
-            paint=Paint(PaintCategory.GAMEPLAY, 3, "机械之神"),
-            bonus_level=3,
+            paint=replace(current_tiles[index].paint, subtype="机械之神", bonus_level=3),
         )
         current = replace(previous, tiles=tuple(current_tiles))
 

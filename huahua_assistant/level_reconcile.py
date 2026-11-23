@@ -201,16 +201,19 @@ def _level(paint: Paint | None) -> int:
 def _place_paint(
     state: PuzzleState, row: int, col: int, paint: Paint
 ) -> PuzzleState:
-    """把一枚颜料放到 ``(row, col)``，地块自带的加成/光环原样保留。"""
+    """把一枚颜料放到 ``(row, col)``，地块上的光环强度原样保留。
+
+    等级加成跟着**颜料**走（``Paint.bonus_level``），这一格原来就有颜料时把那笔
+    加成转过来；原来是空的就没有可继承的。
+    """
     tiles = list(state.tiles)
     index = row * BOARD_SIZE + col
     base = tiles[index]
     tiles[index] = Tile(
         state=TileState.PAINT,
-        paint=paint,
+        paint=replace(paint, bonus_level=tile_bonus_level(base)),
         buff_applied_id=base.buff_applied_id,
         affix_applied_id=base.affix_applied_id,
-        bonus_level=tile_bonus_level(base),
         aura_amount=tile_aura_level(base),
     )
     return replace(state, tiles=tuple(tiles))
@@ -257,7 +260,7 @@ def _cover_intermediate(
         if observed is None:
             continue
         keep = tiles[index]
-        # 地块加成跟着地块走，不跟着颜料走：覆盖不改变它。
+        # 等级加成挂在**颜料**上：覆盖只换内容不换实例，所以这笔加成跟着过来。
         bonus = tile_bonus_level(keep)
         if copy_self:
             base = self_level
@@ -269,8 +272,7 @@ def _cover_intermediate(
             continue
         tiles[index] = Tile(
             state=TileState.PAINT,
-            paint=replace(observed, level=min(MAX_LEVEL, base)),
-            bonus_level=bonus,
+            paint=replace(observed, level=min(MAX_LEVEL, base), bonus_level=bonus),
             aura_amount=aura_amount,
             aura_level=tile_aura_level(tiles[index]),
         )

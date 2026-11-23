@@ -128,9 +128,21 @@ class GradeThresholdTest(unittest.TestCase):
         self.assertEqual(scores, sorted(scores, reverse=True), "阈值必须从高到低")
 
     def test_grades_are_spread_out(self) -> None:
-        """典型的模拟分数要落在不同档位，而不是清一色 S。"""
-        seen = {pr._grade(value) for value in (40, 100, 150, 200, 300)}
-        self.assertGreaterEqual(len(seen), 4, f"阶级几乎没有区分度：{seen}")
+        """典型的模拟分数要落在不同档位，而不是清一色 S。
+
+        取样值从阈值表本身推导，避免以后重标阈值时测试又和实现脱节
+        （这正是当初 ``_grade`` 阈值失效却没人发现的原因）。
+        """
+        samples = [0.0]
+        for threshold, _ in pr.GRADE_THRESHOLDS:
+            samples.append(float(threshold))
+            samples.append(float(threshold) + 1.0)
+        seen = {pr._grade(value) for value in samples}
+        self.assertEqual(
+            len(seen),
+            len(pr.GRADE_THRESHOLDS) + 1,
+            f"阶级档位没有全部用上：{sorted(seen)}（阈值 {pr.GRADE_THRESHOLDS}）",
+        )
 
     def test_low_score_is_not_top_grade(self) -> None:
         self.assertEqual(pr._grade(0.0), "D 低分")

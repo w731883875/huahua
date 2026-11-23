@@ -1,17 +1,23 @@
-@echo off
-cd /d "%~dp0"
-rem Keep this file pure ASCII: cmd.exe parses .bat as ANSI/GBK on zh-CN Windows,
-rem and UTF-8 Chinese comments here previously broke the launch.
+﻿@echo off
+rem 华华助手启动器（S8 画中雪原·作画）
 rem
-rem HUAHUA_SELF_SHOT: 12 seconds after start, take an in-process screenshot of
-rem our own windows into runtime\_selfshot\. Needed because the tool window sets
-rem WDA_EXCLUDEFROMCAPTURE, so every external capture (snipping, OBS, remote
-rem desktop) only sees pure black and cannot tell whether the UI painted.
-set "HUAHUA_SELF_SHOT=runtime\_selfshot"
-if not exist "runtime" mkdir "runtime"
-if exist ".venv\Scripts\pythonw.exe" (
-    start "" ".venv\Scripts\pythonw.exe" run_app.py
-) else (
-    start "" pythonw run_app.py
+rem 控制台输出会同时写进 runtime\app_console_<时间>.log，
+rem 这样工具崩了/退出了也能看到原因，不会像 2026-11-23 那次一样查不到。
+rem
+rem 注意：必须让这个窗口一直开着，关窗口就等于停止记录。
+
+chcp 65001 >nul
+cd /d "%~dp0"
+
+if not exist "run_app.py" (
+    echo [错误] 找不到 run_app.py，请把本文件放在 tools\huahua 根目录。
+    echo.
+    pause
+    exit /b 1
 )
-exit /b
+
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0启动.ps1"
+
+echo.
+echo 按任意键关闭窗口...
+pause >nul

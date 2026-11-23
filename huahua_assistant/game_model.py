@@ -698,6 +698,7 @@ def state_from_observation(
             observed_scope_cells = previous.observed_scope_cells
 
     carried = _carried_tile_buffs(previous)
+    previous_paints = _previous_paints_by_cell(previous)
     tiles = []
     for tile in board.tiles:
         bonus, aura_amount, previous_paint = carried.get((tile.row, tile.col), (0, 0, None))
@@ -713,6 +714,28 @@ def state_from_observation(
         # 那一帧是不是空的**是明确信号，所以用「有没有断帧」来判，不比较颜料种类。
         if bonus and (paint is None or previous_paint is None):
             bonus = 0
+        # 「状态说有颜料、内容没读出来」必须当场处置，不能原样落成坏格。
+        #
+        # 2026-11-23 实机 run-20261123-234819 实测：格 c5r6 在第 56 步读出了
+        # ``G1-狩猎之神 Lv1``，第 57 步短暂读成空白，第 58 步状态又回到 P，
+        # 但颜料内容再也读不出来。原样构造出 ``Tile(state=PAINT, paint=None)``
+        # 之后，这一格同时被两块逻辑认领：``_count_tiles(PAINT)`` 把它算进颜料
+        # 数（看板 paint=21），而 ``_compact_tile_paints`` 又输出 ``None``（落盘
+        # 只有 20 枚）——同一帧自相矛盾，且之后每一步都带着这个幽灵格。
+        #
+        # 处置分两种：
+        # * 上一帧这格有颜料 → 沿用上一帧的颜料。颜料本身是持久的，一帧读不出
+        #   内容不等于它没了；这跟 ``_carried_tile_buffs`` 的「看有没有断帧」是
+        #   同一个判断，只是这里连基础颜料一起继承。
+        # * 上一帧也没有 → 状态不可信，降级成 UNKNOWN 交给下一帧重读。宁可标
+        #   「不知道」，也不能伪造一枚没有内容的颜料。
+        if paint is None and tile.state is TileState.PAINT:
+            paint = previous_paints.get((tile.row, tile.col))
+            if paint is not None:
+                paint = replace(paint, bonus_level=bonus) if bonus != int(paint.bonus_level) else paint
+        resolved_state = tile.state
+        if paint is None and tile.state is TileState.PAINT:
+            resolved_state = TileState.UNKNOWN
         if anchor == (tile.row, tile.col) and rule is not None:
             # 锚点格要区分两件事：面板给的是颜料**自己的**等级，棋盘角标给的是
             # **最终等级**（颜料等级 + 地块加成 + 光环）。
@@ -735,7 +758,7 @@ def state_from_observation(
                     bonus = max(bonus, min(MAX_LEVEL, surplus))
         tiles.append(
             Tile(
-                state=tile.state,
+                state=resolved_state,
                 paint=(
                     replace(paint, bonus_level=bonus)
                     if paint is not None and bonus != int(paint.bonus_level)
@@ -834,6 +857,22 @@ def _infer_anchor_from_progress(
 def _tile_is_family(tile, category: PaintCategory) -> bool:
     paint = _paint_from_tile_observation(tile)
     return paint is not None and paint.category == category
+
+
+def _previous_paints_by_cell(previous: PuzzleState | None) -> dict[tuple[int, int], Paint]:
+    """上一帧每格**有颜料**的格子 → 那枚颜料。
+
+    和 :func:`_carried_tile_buffs` 的区别：那个只带「有 bonus 或 aura」的格子，
+    这里带**所有**有颜料的格子。用途是补「状态读到 P 但内容没读出来」的格子：
+    颜料是持久的，一帧读不出内容不等于它消失了，沿用上一帧才是对的。
+    """
+    if previous is None:
+        return {}
+    result: dict[tuple[int, int], Paint] = {}
+    for index, tile in enumerate(previous.tiles):
+        if tile.state is TileState.PAINT and tile.paint is not None:
+            result[divmod(index, BOARD_SIZE)] = tile.paint
+    return result
 
 
 def _carried_tile_buffs(

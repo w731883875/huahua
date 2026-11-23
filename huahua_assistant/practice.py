@@ -1484,11 +1484,17 @@ def auto_play(
             # 只要还没刷出替换、且还有刷新次数，就先刷再说。
             settled = session.settled_rule_paint
             is_treasure_round = settled is not None and settled.is_treasure
-            # 融合专线：棋盘上已经有留效果包的失色格，就必须拿到「可放置于失色
-            # 地块中」才能进那格，否则那条效果包永远白留着。优先级高于宝箱刷替换
-            # ——否则两个都在抢刷新次数，融合永远排不上。
-            fusion_pending = fusion_explore and _kept_effect_cell() is not None
-            if fusion_pending:
+            # 融合专线：棋盘上已经有留效果包的失色格，且**这次融合值得**
+            # （能推宝箱/玩法到 7 级，或至少能帮上当前调色目标），才去抢
+            # 「可放置于失色地块中」。抢不到就按正常流程走，不再为了融合
+            # 白白浪费刷新次数——用户实机 3 次融合里有 2 次是「正好能完成
+            # 任务」，不是无脑融。
+            fusion_cell = _kept_effect_cell()
+            fusion_ok = False
+            if fusion_explore and fusion_cell is not None:
+                fusion_decision = strategy.decide_fusion(session.state, cell=fusion_cell)
+                fusion_ok = fusion_decision.allowed
+            if fusion_ok:
                 wanted_fusion = gm.AffixEffect.ALLOW_PLACE_ON_FADED
                 has_it = any(a.effect is wanted_fusion for a in session.affix_options)
                 while not has_it and session.refresh_remaining > 0:
@@ -1536,15 +1542,20 @@ def auto_play(
         actions = engine.legal_actions(session.state)
         if not actions:
             break
-        # 融合专线第二部分：手上已经拿到「可放置于失色地块中」、且棋盘上留着
-        # 效果包，就直接把锚点放进那一格，别听策略的（它看不懂融合的价值）。
+        # 融合专线第二部分：手上已经拿到「可放置于失色地块中」、棋盘上留着
+        # 效果包，**且这一步融合确实值得**（推得到 7 级，或对得上调色目标），
+        # 才把锚点放进那一格。判定和选词缀阶段同一个 decide_fusion，避免
+        # 「抢了 3017 但不该融」这种自相矛盾。
         if (
             fusion_explore
             and gm.current_rule_is_pending(session.state)
             and gm._kept_effect_placeable(session.state)
         ):
-            if _place_on_kept_effect():
-                continue
+            pending_cell = _kept_effect_cell()
+            if pending_cell is not None:
+                if strategy.decide_fusion(session.state, cell=pending_cell).allowed:
+                    if _place_on_kept_effect():
+                        continue
         # 强制完成**门槛**（用户 2026-11-23 口径）。它原来是无路可走时的兜底：
         # 实测 100% 由「推荐为空」触发、93% 锚点还不是宝箱，等于白炸颜料换一次
         # 本该自己做出来的升级。现在**仍然只在策略无路可走时才考虑**强制完成

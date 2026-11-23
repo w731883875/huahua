@@ -223,5 +223,72 @@ class AmountPreferenceTest(unittest.TestCase):
         self.assertEqual(gm._amount_preference_bonus(1), 0.0)
 
 
+class FusionGateTest(unittest.TestCase):
+    """融合门槛：能推 7 级才融，推不到就看能不能帮上调色任务。
+
+    用户 2026-11-23：「融合需要看是否将宝箱及其他玩法推向 7 级，如果不能则
+    以能完成任务优先」。实机 3 次融合里有 2 次是「相邻怪物正好是调色目标，
+    放上去就完成任务」——不是无脑融。
+    """
+
+    def _rule(self, target=gm.PaintObject.MONSTER):
+        return gm.CurrentPaintRule(
+            paint=_paint(gm.PaintCategory.GAMEPLAY, 3),
+            direction=gm.PaintDirection.ADJACENT,
+            target_object=target,
+            match_required=3,
+            upgrade_amount=1,
+        )
+
+    def _state_with_kept_effect(self, *, effect_target=gm.PaintObject.GAMEPLAY,
+                                paint_level=6, treasure=True):
+        """在 (0,0) 留效果包，相邻格 (0,1) 放一枚待加强的颜料。"""
+        tiles = _blank_board()
+        tiles[0] = gm.Tile(
+            gm.TileState.FADED,
+            retained_effects=(
+                gm.PaintEffect(gm.PaintDirection.ADJACENT, effect_target, 1),
+            ),
+        )
+        tiles[1] = gm.Tile(
+            gm.TileState.PAINT,
+            paint=_paint(gm.PaintCategory.GAMEPLAY, paint_level, treasure=treasure),
+        )
+        return _state(tiles, current_rule=self._rule())
+
+    def test_fuses_when_treasure_reaches_lv7(self):
+        state = self._state_with_kept_effect(paint_level=6, treasure=True)
+        decision = st.decide_fusion(state, cell=(0, 0))
+        self.assertTrue(decision.allowed, decision.reason)
+        self.assertIn('宝箱', decision.reason)
+
+    def test_fuses_when_gameplay_reaches_lv7(self):
+        state = self._state_with_kept_effect(paint_level=6, treasure=False)
+        decision = st.decide_fusion(state, cell=(0, 0))
+        self.assertTrue(decision.allowed, decision.reason)
+        self.assertIn('玩法', decision.reason)
+
+    def test_refuses_when_cannot_reach_lv7_nor_help_task(self):
+        """宝箱推不到 7 级，且残留效果对象不是当前调色目标 -> 不融。"""
+        state = self._state_with_kept_effect(
+            effect_target=gm.PaintObject.GAMEPLAY, paint_level=1, treasure=True)
+        state = gm.replace(state, current_rule=self._rule(target=gm.PaintObject.MONSTER))
+        decision = st.decide_fusion(state, cell=(0, 0))
+        self.assertFalse(decision.allowed, decision.reason)
+
+    def test_fuses_when_target_matches_even_if_no_lv7(self):
+        """推不到 7 级，但残留效果对象和调色目标一致 -> 有助于完成任务，融。"""
+        state = self._state_with_kept_effect(
+            effect_target=gm.PaintObject.GAMEPLAY, paint_level=2, treasure=False)
+        state = gm.replace(state, current_rule=self._rule(target=gm.PaintObject.GAMEPLAY))
+        decision = st.decide_fusion(state, cell=(0, 0))
+        self.assertTrue(decision.allowed, decision.reason)
+        self.assertIn('完成任务', decision.reason)
+
+    def test_refuses_without_kept_effect_cell(self):
+        state = _state(_blank_board(), current_rule=self._rule())
+        self.assertFalse(st.decide_fusion(state, cell=(0, 0)).allowed)
+
+
 if __name__ == '__main__':
     unittest.main()

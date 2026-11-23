@@ -225,36 +225,126 @@ def decide_force_complete(
     )
 
 
+def _cell_reaches_lv7(tile: gm.Tile, amount: int) -> bool:
+    """这格颜料吃完 +``amount`` 级能不能到 7 级。"""
+    if tile.state is not gm.TileState.PAINT or tile.paint is None:
+        return False
+    current = gm.tile_final_level(tile)
+    if current >= gm.MAX_LEVEL:
+        return False
+    return min(gm.MAX_LEVEL, current + max(1, int(amount))) >= gm.MAX_LEVEL
+
+
+def _merge_preview(
+    state: gm.PuzzleState,
+    row: int,
+    col: int,
+    rule: gm.CurrentPaintRule,
+    stored: tuple[gm.PaintEffect, ...],
+) -> list[tuple[str, int, int, gm.Tile, gm.PaintEffect]]:
+    """融合后的**预览**：合并效果逐条扫范围，列出会被推到 7 级的颜料。
+
+    返回 ``(类别, 行, 列, 地块, 该条效果)``，类别取 ``'treasure'`` /
+    ``'gameplay'`` / ``'other'``。用户强调过「加成必须逐条单独计算，不能取
+    范围并集」，所以这里也是**逐条 effect 各扫各的范围**。
+    """
+    found: list[tuple[str, int, int, gm.Tile, gm.PaintEffect]] = []
+    seen: set[tuple[int, int]] = set()
+    for effect in (*rule.effects, *stored):
+        for cell_row, cell_col in gm._effect_scope_cells_for_anchor(row, col, effect):
+            if (cell_row, cell_col) in seen:
+                continue
+            tile = state.tile(cell_row, cell_col)
+            if tile.state is not gm.TileState.PAINT or tile.paint is None:
+                continue
+            if not gm._paint_matches_target(tile.paint, effect.target_object):
+                continue
+            if not _cell_reaches_lv7(tile, effect.upgrade_amount):
+                continue
+            seen.add((cell_row, cell_col))
+            if tile.paint.is_treasure:
+                kind = 'treasure'
+            elif tile.paint.category is gm.PaintCategory.GAMEPLAY:
+                kind = 'gameplay'
+            else:
+                kind = 'other'
+            found.append((kind, cell_row, cell_col, tile, effect))
+    return found
+
+
 def decide_fusion(
     state: gm.PuzzleState,
     *,
     rule: gm.CurrentPaintRule | None = None,
-    incoming: gm.CurrentPaintRule | None = None,
+    cell: tuple[int, int] | None = None,
 ) -> FusionDecision:
-    """要不要在留有效果包的失色格上融合。
+    """要不要在留效果包的失色格上融合。
 
-    用户口径：**先看能不能把宝箱/其他玩法推向 7 级**；推不到就退一步看
-    「能不能帮助完成当前调色目标」（不要求一装就完成）。
+    用户 2026-11-23 口径（原话整理）：
 
-    ``rule`` 是当前待放的规则（还没合进去），``incoming`` 是地块上残留的
-    效果包将要并进来的那套效果 —— 合并后 ``effects`` 会变成两者的拼接。
-    这里只看**合并后**能覆盖到什么：如果范围内有「再升 1 级就满级」的宝箱
-    或玩法颜料，就算值得。
+    > 融合需要看**是否将宝箱及其他玩法推向 7 级**，如果不能则**以能完成任务
+    > 优先**（不一定安装就完成任务）。
+
+    所以判据分两级，**只有第一级成立才无条件融**：
+
+    1. **推 7 级**：合并后逐条效果扫下来，范围内有宝箱（最优先，用户定的一号
+       目标）或玩法颜料能借此到达 7 级 → 融；
+    2. **帮完成调色任务**：推不到 7 级时，如果残留效果的**作用对象和当前
+       调色目标一致**，那这格本身就在目标类型上、放上去能计入进度 → 融；
+    3. 两者都不成立 → **不融**（用户实机 3 次融合里有 2 次正是「相邻怪物
+       正好是调色目标，放上去就完成任务」，不是无脑融）。
+
+    ``cell`` 不传时自动逐格评估，任意一格成立即算值得。
     """
     rule = rule or state.current_rule
     if rule is None:
         return FusionDecision(False, '没有当前规则')
-    anchor = state.current_anchor
-    if anchor is not None:
-        return FusionDecision(
-            False, '锚点已经放了，融合只能在待放锚点阶段决定'
-        )
+    if state.current_anchor is not None:
+        return FusionDecision(False, '锚点已经放了，融合只能在待放锚点阶段决定')
 
-    stored = [tile for tile in state.tiles if tile.retained_effects]
-    if not stored:
+    stored_cells = [
+        (row, col)
+        for row in range(gm.BOARD_SIZE)
+        for col in range(gm.BOARD_SIZE)
+        if state.tile(row, col).retained_effects
+    ]
+    if not stored_cells:
         return FusionDecision(False, '棋盘上没有留效果包的格子，无从融合')
 
-    return FusionDecision(True, f'棋盘上有 {len(stored)} 格留着效果包，可以融合')
+    if cell is not None:
+        if not state.tile(*cell).retained_effects:
+            return FusionDecision(False, f'({cell[0]},{cell[1]}) 上没有残留效果包')
+        candidates = [cell]
+    else:
+        candidates = stored_cells
+
+    for row, col in candidates:
+        stored = state.tile(row, col).retained_effects
+        preview = _merge_preview(state, row, col, rule, stored)
+        treasures = [item for item in preview if item[0] == 'treasure']
+        if treasures:
+            return FusionDecision(
+                True,
+                f'融合后能把 {len(treasures)} 枚宝箱推到 7 级（一号目标）',
+            )
+        gameplays = [item for item in preview if item[0] == 'gameplay']
+        if gameplays:
+            return FusionDecision(
+                True,
+                f'融合后能把 {len(gameplays)} 枚玩法颜料推到 7 级',
+            )
+        targets = {effect.target_object for effect in stored}
+        if rule.target_object in targets:
+            return FusionDecision(
+                True,
+                f'推不到 7 级，但残留效果的作用对象和当前调色目标'
+                f'（{rule.target_object.value}）一致，融合有助于完成任务',
+            )
+
+    return FusionDecision(
+        False,
+        '融合既推不到 7 级、作用对象也对不上当前调色目标，不如直接完成任务',
+    )
 
 
 def lv7_first_score(state: gm.PuzzleState) -> tuple[int, int, int]:

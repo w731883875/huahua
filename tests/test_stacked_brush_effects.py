@@ -138,5 +138,63 @@ class AffixHelperTest(unittest.TestCase):
         self.assertFalse(gm._rule_is_merged(None))
 
 
+class AddRandomScopeTest(unittest.TestCase):
+    """「随机增加一种作用范围」必须**真的多一条加成来源**。
+
+    2026-11-23 逐条核对 52 条官方笔触时实测发现的 bug：这条只往
+    ``extra_directions`` 里写，没往 ``effects`` 里追加。而加成是按 ``effects``
+    逐条结算的（``CurrentPaintRule.__post_init__`` 在 ``effects`` 非空时直接
+    return），结果新增的范围一点加成都不产生，玩家白吃「调色进度要求 +N」。
+    """
+
+    def _affix(self) -> gm.AffixRule:
+        return next(
+            affix
+            for affix in gm.build_affix_catalog()
+            if affix.effect is gm.AffixEffect.ADD_RANDOM_SCOPE
+            and affix.delta == 0
+        )
+
+    def test_extra_scope_lands_in_effects(self) -> None:
+        import random
+
+        rule = _rule()
+        self.assertEqual(len(rule.effects), 1, "起始只有一条")
+
+        after = gm._apply_rule_affix(
+            rule, self._affix(), gm.PuzzleState(tiles=()), random.Random(7)
+        )
+
+        self.assertEqual(len(after.effects), 2, "新增范围要进 effects，否则不算加成")
+        self.assertEqual(len(after.directions), 2, "显示用的 directions 也要跟着涨")
+        self.assertNotEqual(
+            after.effects[1].direction,
+            PaintDirection.HORIZONTAL,
+            "排除已存在的方向后再抽",
+        )
+        self.assertEqual(
+            after.effects[1].target_object,
+            rule.target_object,
+            "新增范围沿用当前目标类型",
+        )
+
+    def test_progress_penalty_variants_still_change_effects(self) -> None:
+        import random
+
+        for affix in gm.build_affix_catalog():
+            if affix.effect is not gm.AffixEffect.ADD_RANDOM_SCOPE:
+                continue
+            rule = _rule()
+            after = gm._apply_rule_affix(
+                rule, affix, gm.PuzzleState(tiles=()), random.Random(3)
+            )
+            self.assertEqual(len(after.effects), 2, f"{affix.name} 也要多一条效果")
+            self.assertEqual(
+                after.match_required,
+                rule.match_required + max(0, affix.delta),
+                f"{affix.name} 的进度要求惩罚要对得上",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

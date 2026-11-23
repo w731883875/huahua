@@ -5259,14 +5259,21 @@ def _apply_rule_affix(
     if affix.effect == AffixEffect.ADD_RANDOM_SCOPE:
         # 官方 2019 权重：四个方向各约 24.4%，全图仅 2.44%；已存在的方向排除后重新归一化。
         candidates = _SCOPE_DIRECTION_ORDER
-        existing = {rule.direction, *rule.extra_directions}
+        existing = {effect.direction for effect in rule.effects}
         pool = tuple(direction for direction in candidates if direction not in existing) or candidates
         extra = _weighted_option(rng, pool, _official_scope_probabilities())
         if extra is None:
             extra = pool[0]
+        # **必须同时往 ``effects`` 里追加一条**，不能只写 ``extra_directions``。
+        # 加成是按 ``effects`` 逐条结算的（``_apply_current_rule_upgrade``），
+        # 而 ``CurrentPaintRule.__post_init__`` 在 ``effects`` 非空时会直接 return，
+        # 所以只改 ``extra_directions`` 的话这条新增范围**一点加成都不产生**，
+        # 玩家白吃「调色进度要求 +N」的惩罚（2026-11-23 核对时实测发现的 bug）。
+        new_effect = PaintEffect(extra, rule.target_object, int(rule.upgrade_amount))
         return replace(
             rule,
             extra_directions=tuple(dict.fromkeys((*rule.extra_directions, extra))),
+            effects=(*rule.effects, new_effect),
             match_required=max(1, rule.match_required + max(0, affix.delta)),
         )
     return apply_transform_affix(rule, affix)

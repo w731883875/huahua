@@ -312,12 +312,21 @@ class PaintEffect:
 class CurrentPaintRule:
     """当前初始颜料的规则。
 
-    ``effects`` 是**效果清单**，按并集生效（用户 2026-11-23 定案「范围取并集」）。
-    一枚颜料在配置层面只有一条效果（``config_s8_gameplay_plotitem`` 的
-    ``EffectLibraryId`` 是单值，``config_s8_gameplay_itemeffect`` 的 ``LibraryId``
-    也是单值），所以清单里出现多条只可能是**运行期融合**：锚点地块留着一套被炸毁
-    初始颜料的效果包，往上再落一枚初始颜料，两套就叠在一起 —— 用户原话
-    「相当于这个初始颜料融合了2种初始颜料，同时拥有2个调色效果、2个笔触效果、2个范围」。
+    ``effects`` 是**效果清单**。一条效果 = (方向, 目标, 级数)，**各自独立结算**：
+    各条范围可能不同、目标也可能不同，所以绝不能用范围并集去算（用户 2026-11-23：
+    「范围取并集是错误的，因为作用颜料可能不一致需要单独计算」）。
+
+    清单里出现多条只可能是**运行期融合**（用户 2026-11-23 截图口径）：
+
+    * 2 枚初始颜料融合 → 2 条调色效果 + 2 条笔触效果，但**只有 1 个颜料内容**；
+    * 3 枚融合 → 3 条调色效果 + 3 条笔触效果，1 个颜料内容；
+    * **融合没有上限**，清单可以很长；
+    * **允许完全重复**：3 枚融合的实机例子里就有「2 条相邻怪物提升1级」，
+      两条各自生效（合计 +2），所以不能去重。
+
+    为什么只能是运行期融合：``config_s8_gameplay_plotitem`` 的 ``EffectLibraryId``
+    是单值、``config_s8_gameplay_itemeffect`` 的 ``LibraryId`` 也是单值 ——
+    一枚颜料在配置里只有一条效果。
 
     ``direction`` / ``target_object`` / ``upgrade_amount`` 保留为**首条**效果的
     便捷视图（下游几十处按单条读的地方不用改）；要遍历全部请用 ``effects``。
@@ -349,7 +358,11 @@ class CurrentPaintRule:
 
     @property
     def directions(self) -> tuple[PaintDirection, ...]:
-        """全部作用方向（去重保序）——「范围取并集」就是按这个并起来的。"""
+        """全部作用方向（去重保序）。
+
+        只给「画面高亮 / 推荐计数」用。**别拿它算加成** —— 各条效果的目标
+        可能不同，必须逐条按自己的范围+目标结算。
+        """
         return tuple(dict.fromkeys(effect.direction for effect in self.effects))
 
     def effect_for_direction(
@@ -1256,18 +1269,20 @@ def _merge_retained_effects(
     的**范围和效果包还在**，往上落一枚新初始颜料 → 它就有两套：自己的一套 +
     留着的那一套。用户原话「相当于这个初始颜料融合了 2 种初始颜料」。
 
-    去重口径：同方向 + 同对象的效果只留一条（等级取高者）。同一方向不同对象、
-    或同对象不同方向都算两条，因为它们是不同范围/不同目标，确实会各生效一次。
+    用户 2026-11-23 截图补充的口径：
+
+    * 2 枚融合 → **2 个调色效果 + 2 个笔触效果，但只有 1 个颜料内容**；
+    * 3 枚融合 → **3 个调色效果 + 3 个笔触效果，1 个颜料内容**；
+    * **融合没有上限**。
+
+    **绝不去重**。3 枚融合的实机例子里就有「2 条相邻怪物提升1级」——两条各自
+    生效、合起来是 +2。按「同方向同对象取高者」去重会少算 1 级。
+    同理也**不能取范围并集**：各条效果的目标可能不同（相邻怪物 / 斜对角怪物），
+    必须每条各自算自己的范围和目标（见 :func:`_apply_current_rule_upgrade`）。
     """
     if not retained:
         return rule
-    merged: dict[tuple[PaintDirection, PaintObject], PaintEffect] = {}
-    for effect in (*rule.effects, *retained):
-        key = (effect.direction, effect.target_object)
-        existing = merged.get(key)
-        if existing is None or int(effect.upgrade_amount) > int(existing.upgrade_amount):
-            merged[key] = effect
-    effects = tuple(merged.values())
+    effects = (*rule.effects, *retained)
     if effects == rule.effects:
         return rule
     primary = effects[0]
@@ -1279,7 +1294,7 @@ def _merge_retained_effects(
         # extra_directions 是与首条同对象同级数的“附加方向”，融合后口径不够表达，
         # 由 effects 全权负责，这里清空免得算重。
         extra_directions=(),
-        effects=effects,
+        effects=tuple(effects),
     )
 
 
@@ -1303,7 +1318,9 @@ def place_current_rule_anchor(
         return AnchorPlaceResult(state=state, success=False, message="新的初始颜料只能放在空白地块，除非已选择特殊扩散词条")
 
     tiles = list(state.tiles)
-    tiles[row * BOARD_SIZE + col] = _tile_after_current_anchor_placement(tile, rule.paint, state.active_affix)
+    tiles[row * BOARD_SIZE + col] = _tile_after_current_anchor_placement(
+        tile, rule.paint, state.active_affix, rule=rule
+    )
     # 这一格如果留着被炸毁初始颜料的效果包，新落下的初始颜料就**融合**进去：
     # 两套调色效果 + 两套范围同时生效（用户 2026-11-23：融合初始颜料）。
     rule = _merge_retained_effects(rule, tile.retained_effects)
@@ -3641,7 +3658,13 @@ def _is_current_anchor_placeable(tile: Tile, affix: AffixRule | None) -> bool:
     return False
 
 
-def _tile_after_current_anchor_placement(tile: Tile, paint: Paint, affix: AffixRule | None) -> Tile:
+def _tile_after_current_anchor_placement(
+    tile: Tile,
+    paint: Paint,
+    affix: AffixRule | None,
+    *,
+    rule: CurrentPaintRule | None = None,
+) -> Tile:
     # 两项跟着不同的东西走：
     # * ``aura_amount``（笔触光环强度）跟着**地块**走 —— 初始颜料被炸掉、地块恢复后
     #   换一枚新颜料，光环就改挂到新颜料上（用户 2026-11-23 实机口径）；
@@ -3669,7 +3692,25 @@ def _tile_after_current_anchor_placement(tile: Tile, paint: Paint, affix: AffixR
     if tile.state == TileState.BLOCKED and affix.effect == AffixEffect.ALLOW_PLACE_ON_BLOCKED:
         return _placed()
     if tile.state == TileState.VOID and affix.effect == AffixEffect.ALLOW_PLACE_ON_VOID_LOSE_SELF:
-        return _placed(TileState.FADED, None)
+        # 放到虚空：**只失去颜料内容**，调色效果和笔触效果都还在
+        # （用户 2026-11-23 截图口径：「有放在虚空失去内容……但是调色效果和
+        # 笔触效果都还存在」）。
+        #
+        # 所以这里不能像以前那样把整枚颜料丢掉（``_placed(TileState.FADED, None)``
+        # 会把调色效果和笔触光环一起清掉）。改成：地块变失色、没有颜料内容，
+        # 但调色效果包（``retained_effects``）与笔触光环强度（``aura_amount``）保留。
+        #
+        # 保留的调色效果要和这枚初始颜料自带的那套并起来，否则它自己那条就丢了。
+        kept_effects = (*((rule.effects) if rule is not None else ()), *tile.retained_effects)
+        return Tile(
+            state=TileState.FADED,
+            paint=None,
+            buff_applied_id=None,
+            affix_applied_id=None,
+            aura_amount=aura,
+            aura_level=0,
+            retained_effects=kept_effects,
+        )
     if tile.state == TileState.PAINT and affix.effect == AffixEffect.ALLOW_PLACE_ON_PAINT_LOSE_SELF:
         return tile
     if tile.state == TileState.FADED and affix.effect == AffixEffect.ALLOW_PLACE_ON_FADED:
@@ -4342,9 +4383,12 @@ def _scope_cells(row: int, col: int, direction: PaintDirection) -> tuple[tuple[i
 
 
 def _rule_scope_cells_for_anchor(row: int, col: int, rule: CurrentPaintRule) -> tuple[tuple[int, int], ...]:
-    """作用范围 = 各效果方向的**并集**（用户 2026-11-23：「范围取并集」）。
+    """规则涉及的**全部**格子（各效果范围的并集）—— 只用于画面高亮 / 推荐计数。
 
-    融合颜料有两个范围时，两个方向的格子都算在范围内，重叠的只算一次。
+    **不要拿它算加成**（用户 2026-11-23 明确：「范围取并集是错误的，因为作用颜料
+    可能不一致，需要单独计算」）。融合颜料各条效果的**目标**可能不同
+    （例：2 条相邻怪物 + 1 条斜对角怪物），必须每条各自算自己的范围和目标，
+    见 :func:`_apply_current_rule_upgrade` 与 :func:`_effect_scope_cells_for_anchor`。
     """
     cells: list[tuple[int, int]] = []
     for direction in rule.directions:

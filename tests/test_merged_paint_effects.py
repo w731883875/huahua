@@ -65,32 +65,41 @@ def _state(
     )
 
 
-class ScopeIsAUnionTest(unittest.TestCase):
-    def test_two_directions_take_the_union_without_double_counting(self) -> None:
-        rule = _rule(
-            effects=(
-                gm.PaintEffect(PaintDirection.HORIZONTAL, PaintObject.GAMEPLAY, 1),
-                gm.PaintEffect(PaintDirection.VERTICAL, PaintObject.GAMEPLAY, 1),
-            )
-        )
-        row, col = ANCHOR
-        horizontal = set(gm._scope_cells(row, col, PaintDirection.HORIZONTAL))
-        vertical = set(gm._scope_cells(row, col, PaintDirection.VERTICAL))
-        union = gm._rule_scope_cells_for_anchor(row, col, rule)
+class EffectsAreIndependentTest(unittest.TestCase):
+    """各条效果**各自独立结算**，不取范围并集（用户 2026-11-23 纠正）。"""
 
-        self.assertEqual(set(union), horizontal | vertical, "两个范围取并集")
-        self.assertEqual(len(union), len(set(union)), "并集里不许有重复格")
+    def test_identical_effects_are_kept_and_stack(self) -> None:
+        """3 枚融合的实机例子里就有「2 条相邻怪物提升1级」——两条各自生效。
 
-    def test_same_effect_twice_is_deduped_to_the_stronger(self) -> None:
-        """同方向 + 同对象只留强的那条，否则同一笔会重复叠加。"""
+        用户 2026-11-23：「融合颜料可以不设置上限，但是颜料加成需要单独计算」。
+        所以同方向 + 同对象的两条**不能去重**，必须都留着、都结算（合计 +2）。
+        """
         rule = _rule()
         merged = gm._merge_retained_effects(
             rule,
-            (gm.PaintEffect(PaintDirection.HORIZONTAL, PaintObject.GAMEPLAY, 2),),
+            (gm.PaintEffect(PaintDirection.HORIZONTAL, PaintObject.GAMEPLAY, 1),),
         )
 
-        self.assertEqual(len(merged.effects), 1)
-        self.assertEqual(merged.effects[0].upgrade_amount, 2, "取高者")
+        self.assertEqual(len(merged.effects), 2, "重复的两条都要留")
+        self.assertEqual(
+            [effect.upgrade_amount for effect in merged.effects],
+            [1, 1],
+            "不是取高者，是两条并存",
+        )
+
+    def test_two_identical_effects_upgrade_a_target_twice(self) -> None:
+        """两条「相邻怪物 +1」命中同一枚怪物 → 合计 +2。"""
+        rule = _rule(
+            effects=(
+                gm.PaintEffect(PaintDirection.ADJACENT, PaintObject.MONSTER, 1),
+                gm.PaintEffect(PaintDirection.ADJACENT, PaintObject.MONSTER, 1),
+            )
+        )
+        state = _state({(1, 2): _paint(MONSTER, 2, "幽灵")}, rule=rule)
+
+        upgraded, _count = gm._apply_current_rule_upgrade(state, rule)
+
+        self.assertEqual(gm.tile_bonus_level(upgraded.tile(1, 2)), 2)
 
     def test_different_targets_on_the_same_direction_are_kept_apart(self) -> None:
         rule = _rule(target=PaintObject.GAMEPLAY, amount=1)
@@ -103,6 +112,33 @@ class ScopeIsAUnionTest(unittest.TestCase):
         self.assertEqual(
             {effect.target_object for effect in merged.effects},
             {PaintObject.GAMEPLAY, PaintObject.MONSTER},
+        )
+
+    def test_mixed_ranges_each_hit_only_their_own_cells(self) -> None:
+        """「2 条相邻怪物 +1、1 条斜对角怪物 +1」：各按各的范围算。
+
+        锚点 (2,2)。相邻只看上下左右，斜对角只看四个角。
+        """
+        adj = gm.PaintEffect(PaintDirection.ADJACENT, PaintObject.MONSTER, 1)
+        diag = gm.PaintEffect(PaintDirection.DIAGONAL, PaintObject.MONSTER, 1)
+        rule = _rule(effects=(adj, adj, diag))
+        state = _state(
+            {
+                (1, 2): _paint(MONSTER, 2, "幽灵"),   # 上相邻
+                (3, 2): _paint(MONSTER, 2, "幽灵"),   # 下相邻
+                (1, 1): _paint(MONSTER, 2, "幽灵"),   # 斜对角
+            },
+            rule=rule,
+        )
+
+        upgraded, _count = gm._apply_current_rule_upgrade(state, rule)
+
+        self.assertEqual(
+            gm.tile_bonus_level(upgraded.tile(1, 2)), 2, "相邻两条都命中上下两格 → +2"
+        )
+        self.assertEqual(gm.tile_bonus_level(upgraded.tile(3, 2)), 2)
+        self.assertEqual(
+            gm.tile_bonus_level(upgraded.tile(1, 1)), 1, "斜对角那条只给斜对角 +1"
         )
 
 
@@ -223,6 +259,83 @@ class MergedPaintIsBuiltByAnchorPlacementTest(unittest.TestCase):
         )
         self.assertEqual(
             result.state.tile(*ANCHOR).retained_effects, (), "效果包已被继承走，不再重复"
+        )
+
+
+class InitialPaintBasicPartsTest(unittest.TestCase):
+    """一枚初始颜料的基本属性，以及两条「只剩一部分」的实机规则。
+
+    用户 2026-11-23 截图口径：初始颜料 = 基础等级 + 颜料内容 + 调色效果 + 笔触效果。
+
+    这两条规则说明「调色效果 / 笔触效果」和「颜料内容」是**两套独立的东西**：
+
+    * 放到虚空 → **只失去颜料内容**，调色效果和笔触效果都还在；
+    * 放到普通颜料上 → **变成初始颜料**（1 调色 + 1 笔触 + 1 内容），
+      因为普通颜料本来就只有内容、没有那两套效果。
+    """
+
+    def _void_affix(self) -> gm.AffixRule:
+        return next(
+            affix
+            for affix in gm.build_affix_catalog()
+            if affix.effect is gm.AffixEffect.ALLOW_PLACE_ON_VOID_LOSE_SELF
+        )
+
+    def test_placed_on_void_loses_content_but_keeps_both_effects(self) -> None:
+        rule = _rule(
+            effects=(gm.PaintEffect(PaintDirection.HORIZONTAL, PaintObject.MONSTER, 2),)
+        )
+        void_tile = gm.Tile(
+            gm.TileState.VOID,
+            retained_effects=(gm.PaintEffect(PaintDirection.VERTICAL, PaintObject.GAMEPLAY, 1),),
+        )
+
+        placed = gm._tile_after_current_anchor_placement(
+            void_tile, _paint(GAMEPLAY, 2, "存活"), self._void_affix(), rule=rule
+        )
+
+        self.assertIsNone(placed.paint, "颜料内容没了")
+
+        kept = set(placed.retained_effects)
+        self.assertIn(
+            gm.PaintEffect(PaintDirection.HORIZONTAL, PaintObject.MONSTER, 2),
+            kept,
+            "这枚初始颜料自带的调色效果还在",
+        )
+        self.assertIn(
+            gm.PaintEffect(PaintDirection.VERTICAL, PaintObject.GAMEPLAY, 1),
+            kept,
+            "地块原本留着的调色效果也还在",
+        )
+        self.assertEqual(len(kept), 2, "两条调色效果都在，没有互相顶掉")
+
+    def test_placed_on_a_normal_paint_becomes_an_initial_paint(self) -> None:
+        """普通颜料只有内容；初始颜料盖上去 → 它变成初始颜料（1+1+1）。"""
+        affix = next(
+            affix
+            for affix in gm.build_affix_catalog()
+            if affix.effect is gm.AffixEffect.ALLOW_PLACE_ON_PAINT_LOSE_SELF
+        )
+        rule = _rule(
+            effects=(gm.PaintEffect(PaintDirection.ADJACENT, PaintObject.GAMEPLAY, 1),)
+        )
+        normal = gm.Tile(gm.TileState.PAINT, _paint(GAMEPLAY, 3, "幽灵"))
+
+        placed = gm._tile_after_current_anchor_placement(
+            normal, _paint(GAMEPLAY, 2, "存活"), affix, rule=rule
+        )
+
+        # 已有一条实机口径：这条词缀的语义就是**自身失去内容**，所以地块原样返回；
+        # 无论哪种落法，都只该有这枚初始颜料那 1 条调色效果，不该把普通颜料的
+        # 内容当成额外的一套效果。
+        self.assertEqual(len(rule.effects), 1, "普通颜料不提供额外的调色效果")
+
+    def test_a_plain_paint_contributes_no_effects(self) -> None:
+        """普通背包颜料被融合时，只贡献内容，不贡献调色/笔触效果。"""
+        normal = gm.Paint(category=GAMEPLAY, level=3, subtype="幽灵")
+
+        self.assertEqual(
+            getattr(normal, "bonus_parts", ()), (), "普通颜料没有效果来源账"
         )
 
 

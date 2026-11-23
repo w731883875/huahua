@@ -3696,9 +3696,13 @@ def _tile_after_current_anchor_placement(
         # （用户 2026-11-23 截图口径：「有放在虚空失去内容……但是调色效果和
         # 笔触效果都还存在」）。
         #
-        # 所以这里不能像以前那样把整枚颜料丢掉（``_placed(TileState.FADED, None)``
-        # 会把调色效果和笔触光环一起清掉）。改成：地块变失色、没有颜料内容，
-        # 但调色效果包（``retained_effects``）与笔触光环强度（``aura_amount``）保留。
+        # 这里的「笔触效果」就是**这条放置词缀本身**，不是光环 —— 用户 2026-11-23
+        # 明确：「笔触效果就是能放置在虚空，且失去自身内容」，所以不存在
+        # 「光环该加给谁」的问题。
+        #
+        # 之前这里是 ``_placed(TileState.FADED, None)``，会把整枚颜料连同那两套效果
+        # 一起丢掉。改成：地块变失色、没有颜料内容，但调色效果包
+        # （``retained_effects``）保留，地块原有光环强度照旧。
         #
         # 保留的调色效果要和这枚初始颜料自带的那套并起来，否则它自己那条就丢了。
         kept_effects = (*((rule.effects) if rule is not None else ()), *tile.retained_effects)
@@ -3712,7 +3716,17 @@ def _tile_after_current_anchor_placement(
             retained_effects=kept_effects,
         )
     if tile.state == TileState.PAINT and affix.effect == AffixEffect.ALLOW_PLACE_ON_PAINT_LOSE_SELF:
-        return tile
+        # 盖到**已有颜料**上：「失去自身内容」失去的是**这枚初始颜料自己**的内容
+        # （用户 2026-11-23 举例：背包 3 级宝箱 + 初始 4 级怪物 →
+        # 结果是 **3 级宝箱** + 那枚初始颜料的调色效果 / 笔触效果）。
+        #
+        # 也就是说地块保留它原来的颜料，初始颜料只贡献「调色效果 + 笔触效果」这两套。
+        # 这正好对应「普通颜料只有颜料内容」那条 —— 它不提供任何效果。
+        #
+        # 但 ``buff_applied_id`` / ``affix_applied_id`` 必须清掉：那是上一次结算
+        # 留下的去重标记，留着会把这一次的调色效果挡住（这一格现在是新锚点，
+        # 必须按新规则重新吃一次）。
+        return replace(tile, buff_applied_id=None, affix_applied_id=None)
     if tile.state == TileState.FADED and affix.effect == AffixEffect.ALLOW_PLACE_ON_FADED:
         return _placed()
     return _placed()

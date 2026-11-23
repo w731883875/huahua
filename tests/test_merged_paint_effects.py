@@ -309,8 +309,16 @@ class InitialPaintBasicPartsTest(unittest.TestCase):
         )
         self.assertEqual(len(kept), 2, "两条调色效果都在，没有互相顶掉")
 
-    def test_placed_on_a_normal_paint_becomes_an_initial_paint(self) -> None:
-        """普通颜料只有内容；初始颜料盖上去 → 它变成初始颜料（1+1+1）。"""
+    def test_placed_on_a_normal_paint_keeps_that_paint_and_takes_the_effects(self) -> None:
+        """用户 2026-11-23 的具体例子。
+
+        背包颜料 = **3 级宝箱**；初始颜料 = **4 级怪物**，
+        调色效果 = 相邻范围玩法提升1级，笔触 = 放置到已放置颜料但失去自身内容。
+
+        放上去之后变成：**初始颜料 3 级宝箱** + 相邻范围玩法提升1级 + 那条笔触。
+        也就是 **初始颜料自己的 4 级怪物内容丢了**，地块保留原来的 3 级宝箱；
+        初始颜料只贡献「调色效果 + 笔触效果」。
+        """
         affix = next(
             affix
             for affix in gm.build_affix_catalog()
@@ -319,16 +327,27 @@ class InitialPaintBasicPartsTest(unittest.TestCase):
         rule = _rule(
             effects=(gm.PaintEffect(PaintDirection.ADJACENT, PaintObject.GAMEPLAY, 1),)
         )
-        normal = gm.Tile(gm.TileState.PAINT, _paint(GAMEPLAY, 3, "幽灵"))
+        # 地块上已放着的背包颜料：3 级宝箱
+        treasure = gm.Paint(category=GAMEPLAY, level=3, subtype="宝箱", is_treasure=True)
+        normal = gm.Tile(gm.TileState.PAINT, treasure)
+        # 要放下去的初始颜料：4 级怪物
+        initial = _paint(MONSTER, 4, "幽灵")
 
         placed = gm._tile_after_current_anchor_placement(
-            normal, _paint(GAMEPLAY, 2, "存活"), affix, rule=rule
+            normal, initial, affix, rule=rule
         )
 
-        # 已有一条实机口径：这条词缀的语义就是**自身失去内容**，所以地块原样返回；
-        # 无论哪种落法，都只该有这枚初始颜料那 1 条调色效果，不该把普通颜料的
-        # 内容当成额外的一套效果。
-        self.assertEqual(len(rule.effects), 1, "普通颜料不提供额外的调色效果")
+        self.assertEqual(placed.state, gm.TileState.PAINT)
+        self.assertIsNotNone(placed.paint)
+        self.assertEqual(placed.paint.level, 3, "等级来自地块上的宝箱，不是初始颜料的 4")
+        self.assertTrue(placed.paint.is_treasure, "内容仍是宝箱")
+        self.assertEqual(placed.paint.subtype, "宝箱")
+        self.assertNotEqual(
+            placed.paint.category, MONSTER, "初始颜料自己的怪物内容已经失去"
+        )
+        self.assertEqual(len(rule.effects), 1, "调色效果来自初始颜料，只此一条")
+        self.assertIsNone(placed.buff_applied_id, "清掉旧去重标记，好让这次调色生效")
+        self.assertIsNone(placed.affix_applied_id)
 
     def test_a_plain_paint_contributes_no_effects(self) -> None:
         """普通背包颜料被融合时，只贡献内容，不贡献调色/笔触效果。"""

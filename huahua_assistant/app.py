@@ -8117,6 +8117,11 @@ def _quick_capture_quality(
         "unknown_tiles": unknown_tiles,
         "perf": capture_perf or {},
         "capture_source": source,
+        # 本帧用的标定是哪一组、窗口到底多大。2026-11-23 那次「昨天稳定、
+        # 今天全错但自评分没掉」就是缺这一项才查不出来：棋盘定位是按窗口
+        # 尺寸分别标定的，没有匹配尺寸时会**静默**回落到内置默认比例，
+        # 整盘偏移可每格依然读得「很自信」（unknown_tiles 仍是 0）。
+        "layout": layout.last_layout_match(),
     }
     global _FAMILY_STATUS_TICK
     _FAMILY_STATUS_TICK += 1

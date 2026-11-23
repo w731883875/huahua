@@ -136,6 +136,52 @@ def aspect_key(width: int, height: int) -> str:
     return f"{width / max(1, height):.2f}"
 
 
+#: 最近一次 :func:`load_layout` 的匹配情况。
+#:
+#: 为什么要记：棋盘定位是**按窗口尺寸分别标定**的，一旦当前窗口尺寸在标定表里
+#: 找不到匹配，``_pick_calibration`` 会返回 ``None``，而 ``load_layout`` 会
+#: **静默**回落到内置默认比例。此时整盘裁切偏移，每格读数全错，但视觉层
+#: 依然「很自信」——``unknown_tiles`` 还是 0、质量分也不掉。
+#: 2026-11-23 的「昨天稳定、今天全错」正是这种形态，靠自评分根本发现不了。
+_LAST_MATCH: dict[str, object] | None = None
+
+
+def last_layout_match() -> dict[str, object] | None:
+    """最近一次 :func:`load_layout` 的匹配情况，供观测/界面诊断用。
+
+    返回 ``{"width","height","matched":bool,"entry":{...}|None,
+    "fallback_to_default":bool}``。``matched`` 为 False 就是「用了内置默认
+    比例」——这时读数不可信，应当重新自愈标定。
+    """
+    return _LAST_MATCH
+
+
+def _record_match(
+    width: int | None,
+    height: int | None,
+    matched: LayoutRect | None,
+    *,
+    entries: int,
+) -> None:
+    global _LAST_MATCH
+    _LAST_MATCH = {
+        "width": width,
+        "height": height,
+        "matched": matched is not None,
+        "entries": entries,
+        "fallback_to_default": matched is None,
+        "entry": (
+            None
+            if matched is None
+            else {
+                "x_ratio": round(float(matched.x_ratio), 6),
+                "y_ratio": round(float(matched.y_ratio), 6),
+                "size_ratio": round(float(matched.size_ratio), 6),
+            }
+        ),
+    }
+
+
 def load_layout(
     width: int | None = None,
     height: int | None = None,
@@ -157,8 +203,10 @@ def load_layout(
     try:
         payload = json.loads(file.read_text(encoding="utf-8"))
     except (OSError, ValueError):
+        _record_match(width, height, None, entries=0)
         return ScreenLayout()
     entry = _pick_calibration(payload, width, height)
+    _record_match(width, height, entry, entries=len(_payload_entries(payload)))
     if entry is None:
         return ScreenLayout()
     return ScreenLayout(active=(entry, *ACTIVE_LAYOUTS[1:]), start=START_LAYOUTS)

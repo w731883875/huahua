@@ -146,6 +146,68 @@ levelPlots
 `bonusItemId` 同时出现在 `S8CurrentState`、`S8TileCollect` 两个结构里 —— 
 **「加成来自哪个物品」是随地块收集数据一起下发的。**
 
+## 六点五、调色效果表（与工具已核对一致）
+
+`names.json` 里 `S8_Gameplay_ItemEffect|EffectDes|{id}` 共 **27 条**，与
+`huahua_assistant/s8_plot_effect.py` 的 `PLOT_EFFECTS` **逐条核对结果**：
+ID 集合完全相同、文案 0 条不符（2026-11-23 实测）。
+
+全表（按 ID）：
+
+```
+1101 使横向的怪物颜料提升1级      1102 使纵向的怪物颜料提升1级
+1103 使对角的怪物颜料提升1级      1104 使相邻的怪物颜料提升1级
+1105 使横向的玩法颜料提升1级      1106 使纵向的玩法颜料提升1级
+1107 使对角的玩法颜料提升1级      1108 使相邻的玩法颜料提升1级
+2001 使横向的怪物颜料提升2级      2002 使纵向的怪物颜料提升2级
+2003 使对角的怪物颜料提升2级      2004 使相邻的怪物颜料提升2级
+2005 使横向的玩法颜料提升2级      2006 使纵向的玩法颜料提升2级
+2007 使对角的玩法颜料提升2级      2008 使相邻的玩法颜料提升2级
+2010 使横向的所有颜料提升1级      2011 使纵向的所有颜料提升1级
+2012 使对角的所有颜料提升1级      2013 使相邻的所有颜料提升1级
+3001 使横向的所有颜料提升2级      3002 使纵向的所有颜料提升2级
+3003 使对角的所有颜料提升2级      3004 使相邻的所有颜料提升2级
+3005 使全图的怪物颜料提升1级      3006 使全图的玩法颜料提升1级
+4001 使全图的所有颜料提升2级
+```
+
+注意这里**全部写「提升」，没有「额外提升」**——「额外提升」是**笔触效果**
+（`S8_Gameplay_SelectableEffect`）的措辞。这个区分很重要：两类效果都会让
+`FacadeLevel` 上涨，但来源类型不同（`S8_Item_Effect` vs `S8_Selectale_Effect`）。
+
+## 六点六、点击地块的请求/响应字段
+
+`S8GamePlayMgr.lua.bin` 的字符串表里这一段是连续出现的（顺序即字段顺序）：
+
+```
+S8ChangedField
+S8CurrentState
+S8TileCollect
+plotItemId              ← 请求：点了哪一格
+S8Gameplay_CollectPlot  ← 事件名（Config/LuaEventCfg 里也注册了）
+bonusItemId             ← 响应：这一格的加成来自哪个颜料
+```
+
+`S8HomeBtn.lua.bin` 监听 `S8Gameplay_CollectPlot`，收到后取 `PlotItemId` 弹提示。
+
+**`plotItemId` → `bonusItemId` 成对出现，是「点一格，服务器告诉你加成来自哪枚颜料」
+的直接证据。** 也就是说「加成归属于某个颜料」这件事是**服务端定义**并随点格下发的，
+不是客户端自己算的。
+
+## 六点七、`S8Gameplay_DrawPushUpdate` 的两条并列列表
+
+同一文件里这段也连续出现：
+
+```
+PlotList
+BonusPlotList      ← 与 PlotList 并列（V 大写，服务器字段）
+RewardList
+difficultyId
+```
+
+客户端侧的小写版本 `plotList` / `bonusPlotList` 在 `S8Gameplay_MainPushUpdate`
+分支里与 `allPlotNum` / `fixedPlotNum` / `allFreePlotNum` / `donePlotNum` 并列。
+
 ---
 
 ## 七、结论

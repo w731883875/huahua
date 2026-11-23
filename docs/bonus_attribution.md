@@ -4,12 +4,24 @@
 
 ## 结论（2026-11-23 定案）
 
-**加成记在颜料上。** 模型已按此实现：``Paint.bonus_level``。
+**只有一种东西：等级加成。区别只在来源。**
 
-用户 2026-11-23 明确要求「把 buff 改成颜料加成」，并给出了炸毁场景的实机口径。
-解包资源（见 ``docs/s8_bonus_resource_evidence.md``）也支持这个结构：客户端的地块
-（``Plot``）只有 ``RawLevel`` / ``FacadeLevel`` 和一张来源清单 ``OriItemList``，
-每条来源指向一个**颜料实例** ``UniqueId``，**没有**「地块自己攒了多少级」这种字段。
+```
+最终等级 = 颜料基础等级 + 调色效果加成 + 笔触效果加成 + 光环加成
+             （背包/初始自带）  （初始颜料范围）  （词缀「额外提升」）（全图同内容）
+```
+
+用户 2026-11-23 原话：「提升1级和额外提升1级都是涨等级，都是加成，只是区分来源而已，
+并不特殊地方」。所以代码里**没有**「这笔改等级、那笔记加成」的分叉 —— 一律写
+``Paint.bonus_level``，来源只额外记在 ``Paint.bonus_parts`` 里供界面说明用。
+
+这也是 c4r5 实机样本的读法：两笔调色效果（+2、+1）点开地块，游戏提示的是 **+3 加成**，
+不是把基础等级改成了 6。
+
+**加成挂在颜料上**，所以颜料不在（空白 / 虚空 / 失色）就没有加成。依据是解包资源
+（见 ``docs/s8_bonus_resource_evidence.md``）：客户端的地块 ``Plot`` 只有
+``RawLevel`` / ``FacadeLevel`` 和一张来源清单 ``OriItemList``，每条来源指向一个
+**颜料实例** ``UniqueId``，**没有**「地块自己攒了多少级」这种字段。
 
 ### 三条规则（用户 2026-11-23 口述，实机口径）
 
@@ -35,8 +47,15 @@
 
 **规则三：一枚初始颜料可以融合两种效果。**
 
-同时拥有 2 个调色效果、2 个笔触效果、2 个作用范围。这条还没实现，记在下面的
-「待做」里。
+同时拥有 2 个调色效果、2 个笔触效果、2 个作用范围，**范围取并集**（用户 2026-11-23）。
+
+融合**不是配置里写死的**：``config_s8_gameplay_plotitem`` 的 ``EffectLibraryId`` 是单值、
+``config_s8_gameplay_itemeffect`` 的 ``LibraryId`` 也是单值，一枚颜料在配置里只有一条
+效果。融合是运行期把两套并起来的结果 —— 地块留着被炸毁初始颜料的效果包，往上再落一枚
+初始颜料，两套就叠在一起。用户原话：「相当于这个初始颜料融合了2种初始颜料」。
+
+实现见 :class:`huahua_assistant.game_model.PaintEffect`、``CurrentPaintRule.effects``
+和 ``Tile.retained_effects``。
 
 ### 和旧的「记地块」结论为什么不冲突
 
@@ -78,21 +97,25 @@
 
 ## 代码现状（2026-11-23 改造后）
 
-* ``Paint.bonus_level`` —— 颜料自己的等级加成。``tile_bonus_level(tile)`` 读它，
-  地块上没有颜料就是 0。
-* ``Tile.aura_amount`` —— 笔触光环的**强度**，挂在锚点地块上，与颜料生命周期无关。
+* ``Paint.bonus_level`` —— 颜料自己的等级加成，**所有来源共用这一个账**。
+* ``Paint.bonus_parts`` —— 来源账 ``(来源, 级数)``，只供说明，不参与算术。
+  常量 ``BONUS_SOURCE_RULE`` / ``BONUS_SOURCE_AFFIX`` / ``BONUS_SOURCE_AURA``。
+* ``Tile.aura_amount`` —— 光环的**强度**，挂在锚点地块上，与颜料生命周期无关。
+* ``Tile.retained_effects`` —— 被炸毁初始颜料留在地块上的效果包，供下一枚颜料继承（融合）。
+* ``CurrentPaintRule.effects`` —— 效果清单，``direction``/``target_object``/``upgrade_amount``
+  只是首条的便捷视图；``.directions`` 给并集范围用。
 * ``game_model._carried_tile_buffs`` —— 帧间继承：**上一帧这一格有颜料**才继承
   那笔加成；断帧（失色/空白）就归零。不比较颜料种类，因为转化也要继承。
-* ``game_model._tile_with_upgrade(as_bonus=True)`` —— 写 ``Paint.bonus_level``。
+* ``game_model._tile_with_upgrade(as_bonus=True, source=...)`` —— 统一写
+  ``Paint.bonus_level`` 并记账来源。
 * ``level_reconcile._cover_intermediate`` —— 覆盖类笔触改内容不改实例，加成跟着走。
 * ``game_model._randomize_scope_paints`` —— 同理，转化不丢加成。
 * ``fast_vision._tile_buffs`` —— 回填快照时读 ``Paint.bonus_level``。
 
 ## 待做
 
-* **规则三（一枚颜料融合两种效果）**：``CurrentPaintRule`` 目前只有一个
-  ``direction`` + ``extra_directions`` 和一个 ``upgrade_amount``。要支持
-  「2 个调色效果 + 2 个范围 + 2 个笔触效果」需要把这三项都改成列表。
 * **调色效果在炸毁后是否保留**：用户说「暂定为在」，当前实现如此。若日后有反例，
   需要让「来源颜料被销毁」时把那笔加成从目标颜料上撤掉 —— 那要求给它记
   ``source_key``（见 ``docs/s8_bonus_resource_evidence.md`` 里的 ``UniqueId``）。
+* ``PuzzleState.extra_affixes`` 已备好（2 条笔触效果并存），但选词缀路径目前仍只
+  写 ``active_affix``，尚未在「融合」场景里自动填第二条。

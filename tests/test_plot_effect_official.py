@@ -68,7 +68,8 @@ class DeferredScopeUpgradeTest(unittest.TestCase):
 
     def test_placement_stacks_rule_and_affix_to_level_cap(self) -> None:
         # 官方上限：Lv2 + 调色效果 +2 + 笔触额外提升 +3 → 最终等级 7。
-        # 两层分开：调色效果加到颜料等级（2+2=4），「额外提升」记在地块加成上（+3）。
+        # 两笔都记成**颜料加成**（2026-11-23 定案），所以颜料自身仍是 Lv2，
+        # 加成 2+3=5，最终 7。
         state = _state_with(_rule(amount=2), (2,))
         state = gm.apply_affix_to_state(state, _scope_affix(3), seed=1).state
 
@@ -78,9 +79,9 @@ class DeferredScopeUpgradeTest(unittest.TestCase):
         placed = next(
             tile
             for tile in result.state.tiles
-            if tile.paint is not None and tile.paint.level == 4
+            if tile.paint is not None and gm.tile_bonus_level(tile) == 5
         )
-        self.assertEqual(gm.tile_bonus_level(placed), 3)
+        self.assertEqual(placed.paint.level, 2, "调色效果记加成，不改颜料等级")
         self.assertEqual(gm.tile_final_level(placed), gm.MAX_LEVEL)
         self.assertIn("笔触额外提升", result.message)
 

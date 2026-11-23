@@ -219,15 +219,23 @@ class UpgradeLandsOnTheRightLayerTest(unittest.TestCase):
         self.assertEqual(tile.paint.bonus_level, 3, "加成记在颜料自己身上")
         self.assertEqual(gm.tile_final_level(tile), 6)
 
-    def test_plain_upgrade_writes_paint_level(self) -> None:
+    def test_plain_upgrade_also_lands_as_bonus(self) -> None:
+        """「提升1级」和「额外提升1级」都算加成，只是来源不同（用户 2026-11-23）。
+
+        以前 ``grants_bonus`` 会把两者分开：普通提升改颜料等级、额外提升记加成。
+        按实机口径这层区分没有意义 —— 涨的都是等级，最终等级一律是
+        ``基础 + 全部加成``。``bonus_parts`` 只用来记是谁给的。
+        """
         state = _with_tile(_state(rule=_rule()), 2, 3, gm.Tile(gm.TileState.PAINT, gm.Paint(GAMEPLAY, 3)))
 
         upgraded, count = gm._upgrade_scope_paints(state, _plain_affix(1), random.Random(0))
 
         self.assertEqual(count, 1)
         tile = upgraded.tile(2, 3)
-        self.assertEqual(tile.paint.level, 4)
-        self.assertEqual(gm.tile_bonus_level(tile), 0)
+        self.assertEqual(tile.paint.level, 3, "基础等级不动")
+        self.assertEqual(gm.tile_bonus_level(tile), 1)
+        self.assertEqual(gm.tile_final_level(tile), 4)
+        self.assertEqual(tile.paint.bonus_parts, ((gm.BONUS_SOURCE_AFFIX, 1),))
 
     def test_rule_effect_writes_bonus_on_the_paint(self) -> None:
         """初始颜料的调色加成落在**颜料**上（用户 2026-11-22 / 2026-11-23 口径）。

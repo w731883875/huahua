@@ -113,6 +113,15 @@ class Paint:
     #: ``Tile.aura_amount`` 上（挂地块、按锚点当前那枚颜料决定加给谁），
     #: 所以初始颜料被炸毁后笔触效果仍在，换一枚新颜料又能吃到。
     bonus_level: int = 0
+    #: 这笔加成是**谁给的**，按来源拆开记：``(来源, 级数)``。
+    #:
+    #: 用户 2026-11-23 定案：「提升1级」和「额外提升1级」都是涨等级、都是加成，
+    #: **只是区分来源而已，并不特殊**。所以数值上完全一样地累加进
+    #: ``bonus_level``，这里只额外留一份账，用于界面/对账说明
+    #: 「这 3 级里 2 级来自初始颜料的调色效果、1 级来自笔触词缀」。
+    #:
+    #: 来源取值见 :data:`BONUS_SOURCE_RULE` / :data:`BONUS_SOURCE_AFFIX`。
+    bonus_parts: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -133,6 +142,20 @@ class Tile:
     # 派生缓存：这一格从全场所有光环里吃到的等级。每次棋盘变动后由
     # ``_recompute_auras`` 重算，不要手写。
     aura_level: int = 0
+    #: 被炸毁的**初始颜料**留在地块上的效果包（调色效果 + 范围）。
+    #:
+    #: 用户 2026-11-23 实机口径：初始颜料被强制完成炸毁后，「范围和笔触效果还在」。
+    #: 失色地块恢复成空白、再往上落一枚颜料，这一格就把留着的那套效果**继承**过去：
+    #:
+    #: * 落的是一枚**普通背包颜料** → 它变成这一格的「初始颜料」，带着留着的那套效果；
+    #: * 落的是一枚**初始颜料** → 两套叠在一起，成为**融合初始颜料**
+    #:   （2 个调色效果 + 2 个笔触效果 + 2 个范围）。
+    #:
+    #: 这解释了为什么配置表里 ``EffectLibraryId`` 是单值：融合不是配置写死的，
+    #: 是运行期把地块留着的效果包和新颜料自己的效果并起来。
+    #:
+    #: 普通背包颜料被炸毁**不留**这个包（用户规则一：全新空白地块，无任何残留）。
+    retained_effects: tuple["PaintEffect", ...] = ()
 
 
 def tile_bonus_level(tile: Tile) -> int:
@@ -171,6 +194,14 @@ def _paint_kind_key(paint: Paint) -> tuple[str, ...]:
     return (paint.category.value, subtype)
 
 
+#: 等级加成的**来源标签**。用户 2026-11-23 定案：「提升1级」和「额外提升1级」
+#: 都是涨等级、都是加成，只是区分来源而已，数值上没有任何区别。
+#: 这两个常量只用于 ``Paint.bonus_parts`` 记账与界面说明，**不参与算术**。
+BONUS_SOURCE_RULE: str = "调色效果"
+BONUS_SOURCE_AFFIX: str = "笔触效果"
+BONUS_SOURCE_AURA: str = "光环"
+
+
 def tile_final_level(tile: Tile) -> int:
     """最终等级 = min(MaxPlotLevel, 颜料等级 + 地块加成 + 光环加成)（服务端 FinalItemLevel）。"""
     base = tile.paint.level if tile.paint is not None else 0
@@ -190,29 +221,48 @@ def tile_effective_paint(tile: Tile) -> Paint | None:
     return replace(tile.paint, level=final)
 
 
-def _tile_with_upgrade(tile: Tile, amount: int, *, as_bonus: bool) -> Tile:
+def _tile_with_upgrade(
+    tile: Tile, amount: int, *, as_bonus: bool, source: str = ""
+) -> Tile:
     """把一次"N 级提升"落到**这枚颜料**上。
 
-    ``as_bonus=True`` 对应官方「额外提升」类笔触 → 记到**颜料自己的加成**上
-    （``Paint.bonus_level``），颜料被炸毁/换掉时这笔加成随之消失；否则直接加到
-    颜料自身等级上。两条路径都受 7 级封顶约束：加成已经顶满时，再提升颜料等级
-    不产生任何收益。
+    用户 2026-11-23 定案：「提升1级」和「额外提升1级」**都是涨等级、都是加成**，
+    只是来源不同，数值上没有任何区别。所以这里 ``as_bonus=True`` 是**默认路径**，
+    ``source`` 只用来在 ``Paint.bonus_parts`` 里记一笔出处。
+
+    ``as_bonus=False`` 保留给「这枚颜料自己就是 N 级」的场景（落子时按识别到的
+    基础等级写入），它直接改 ``Paint.level``。
+
+    两条路径都受 7 级封顶约束：加成已经顶满时，再提升不产生任何收益。
     """
     if tile.paint is None or amount <= 0:
         return tile
     headroom = max(0, MAX_LEVEL - tile_bonus_level(tile) - tile_aura_level(tile))
     if as_bonus:
+        new_bonus = min(MAX_LEVEL, tile_bonus_level(tile) + amount)
+        applied = new_bonus - tile_bonus_level(tile)
+        parts = _bump_bonus_part(tile.paint.bonus_parts, source, applied)
         return replace(
             tile,
-            paint=replace(
-                tile.paint,
-                bonus_level=min(MAX_LEVEL, tile_bonus_level(tile) + amount),
-            ),
+            paint=replace(tile.paint, bonus_level=new_bonus, bonus_parts=parts),
         )
     return replace(
         tile,
         paint=replace(tile.paint, level=max(tile.paint.level, min(headroom, tile.paint.level + amount))),
     )
+
+
+def _bump_bonus_part(
+    parts: tuple[tuple[str, int], ...], source: str, amount: int
+) -> tuple[tuple[str, int], ...]:
+    """往来源账上加一笔（同来源合并，级数为 0 的丢掉）。"""
+    if not source or amount <= 0:
+        return parts
+    merged: dict[str, int] = {}
+    for name, value in parts:
+        merged[name] = merged.get(name, 0) + int(value)
+    merged[source] = merged.get(source, 0) + int(amount)
+    return tuple((name, value) for name, value in merged.items() if value)
 
 
 def _recompute_auras(state: PuzzleState) -> PuzzleState:
@@ -246,7 +296,33 @@ def _recompute_auras(state: PuzzleState) -> PuzzleState:
 
 
 @dataclass(frozen=True)
+class PaintEffect:
+    """一条**调色效果**：在 ``direction`` 范围内的 ``target_object`` 提升 ``upgrade_amount`` 级。
+
+    官方表（``config_s8_gameplay_itemeffect``）里一条记录就是这三元组 + 进度要求，
+    见 :mod:`huahua_assistant.s8_plot_effect`。
+    """
+
+    direction: PaintDirection
+    target_object: PaintObject
+    upgrade_amount: int
+
+
+@dataclass(frozen=True)
 class CurrentPaintRule:
+    """当前初始颜料的规则。
+
+    ``effects`` 是**效果清单**，按并集生效（用户 2026-11-23 定案「范围取并集」）。
+    一枚颜料在配置层面只有一条效果（``config_s8_gameplay_plotitem`` 的
+    ``EffectLibraryId`` 是单值，``config_s8_gameplay_itemeffect`` 的 ``LibraryId``
+    也是单值），所以清单里出现多条只可能是**运行期融合**：锚点地块留着一套被炸毁
+    初始颜料的效果包，往上再落一枚初始颜料，两套就叠在一起 —— 用户原话
+    「相当于这个初始颜料融合了2种初始颜料，同时拥有2个调色效果、2个笔触效果、2个范围」。
+
+    ``direction`` / ``target_object`` / ``upgrade_amount`` 保留为**首条**效果的
+    便捷视图（下游几十处按单条读的地方不用改）；要遍历全部请用 ``effects``。
+    """
+
     paint: Paint
     direction: PaintDirection
     target_object: PaintObject
@@ -254,6 +330,35 @@ class CurrentPaintRule:
     upgrade_amount: int
     match_current: int = 0
     extra_directions: tuple[PaintDirection, ...] = ()
+    effects: tuple[PaintEffect, ...] = ()
+
+    def __post_init__(self) -> None:
+        # 没显式给 effects 时，从标量字段 + extra_directions 补出来。
+        # 这样所有老构造点（``CurrentPaintRule(paint=..., direction=...,
+        # upgrade_amount=...)``）一个字都不用改就拿到单条效果清单。
+        if self.effects:
+            return
+        effects = [
+            PaintEffect(self.direction, self.target_object, int(self.upgrade_amount))
+        ]
+        for direction in self.extra_directions:
+            effects.append(
+                PaintEffect(direction, self.target_object, int(self.upgrade_amount))
+            )
+        object.__setattr__(self, "effects", tuple(effects))
+
+    @property
+    def directions(self) -> tuple[PaintDirection, ...]:
+        """全部作用方向（去重保序）——「范围取并集」就是按这个并起来的。"""
+        return tuple(dict.fromkeys(effect.direction for effect in self.effects))
+
+    def effect_for_direction(
+        self, direction: PaintDirection
+    ) -> tuple[PaintEffect, ...]:
+        """某个方向上的全部效果。融合颜料同一方向可以有多条。"""
+        return tuple(
+            effect for effect in self.effects if effect.direction == direction
+        )
 
 
 @dataclass(frozen=True)
@@ -293,6 +398,13 @@ class PuzzleState:
     tiles: tuple[Tile, ...]
     current_rule: CurrentPaintRule | None = None
     active_affix: AffixRule | None = None
+    #: 额外的笔触词缀。融合初始颜料可能同时挂着 2 条笔触效果
+    #: （用户 2026-11-23：「同时拥有 2 个调色效果、2 个笔触效果、2 个范围」）。
+    #:
+    #: 为什么不直接把 ``active_affix`` 改成列表：它有 ~90 处引用，绝大多数只需要
+    #: 「当前最主要的那条」。这里保留 ``active_affix`` 当主条目、额外的排在这里，
+    #: 需要遍历全部时用 :attr:`affixes`。
+    extra_affixes: tuple[AffixRule, ...] = ()
     backpack: tuple[Paint, ...] = ()
     current_anchor: tuple[int, int] | None = None
     current_buff_id: int = 1
@@ -311,6 +423,15 @@ class PuzzleState:
 
     def tile(self, row: int, col: int) -> Tile:
         return self.tiles[row * BOARD_SIZE + col]
+
+    @property
+    def affixes(self) -> tuple[AffixRule, ...]:
+        """本局挂着的**全部**笔触词缀（主条目在前，去重保序）。"""
+        items: list[AffixRule] = []
+        for affix in (self.active_affix, *self.extra_affixes):
+            if affix is not None and affix not in items:
+                items.append(affix)
+        return tuple(items)
 
 
 @dataclass(frozen=True)
@@ -1125,6 +1246,43 @@ def recommend_placements(
     return recommendations[:limit]
 
 
+def _merge_retained_effects(
+    rule: "CurrentPaintRule", retained: tuple["PaintEffect", ...]
+) -> "CurrentPaintRule":
+    """把地块留着的效果包并进规则，得到**融合初始颜料**。
+
+    用户 2026-11-23 的实机过程：初始颜料（幽灵）+ 笔触「全图相同内容颜料提升2级」
+    → 全图幽灵 +2；把它强制完成炸毁 → 其他幽灵 -2；失色恢复成空白后，原来那一格
+    的**范围和效果包还在**，往上落一枚新初始颜料 → 它就有两套：自己的一套 +
+    留着的那一套。用户原话「相当于这个初始颜料融合了 2 种初始颜料」。
+
+    去重口径：同方向 + 同对象的效果只留一条（等级取高者）。同一方向不同对象、
+    或同对象不同方向都算两条，因为它们是不同范围/不同目标，确实会各生效一次。
+    """
+    if not retained:
+        return rule
+    merged: dict[tuple[PaintDirection, PaintObject], PaintEffect] = {}
+    for effect in (*rule.effects, *retained):
+        key = (effect.direction, effect.target_object)
+        existing = merged.get(key)
+        if existing is None or int(effect.upgrade_amount) > int(existing.upgrade_amount):
+            merged[key] = effect
+    effects = tuple(merged.values())
+    if effects == rule.effects:
+        return rule
+    primary = effects[0]
+    return replace(
+        rule,
+        direction=primary.direction,
+        target_object=primary.target_object,
+        upgrade_amount=primary.upgrade_amount,
+        # extra_directions 是与首条同对象同级数的“附加方向”，融合后口径不够表达，
+        # 由 effects 全权负责，这里清空免得算重。
+        extra_directions=(),
+        effects=effects,
+    )
+
+
 def place_current_rule_anchor(
     state: PuzzleState,
     row: int,
@@ -1146,9 +1304,19 @@ def place_current_rule_anchor(
 
     tiles = list(state.tiles)
     tiles[row * BOARD_SIZE + col] = _tile_after_current_anchor_placement(tile, rule.paint, state.active_affix)
+    # 这一格如果留着被炸毁初始颜料的效果包，新落下的初始颜料就**融合**进去：
+    # 两套调色效果 + 两套范围同时生效（用户 2026-11-23：融合初始颜料）。
+    rule = _merge_retained_effects(rule, tile.retained_effects)
+    # 效果包已经被这枚颜料继承走了，地块上不再保留，免得以后重复融合。
+    anchor_index = row * BOARD_SIZE + col
+    tiles = [
+        replace(t, retained_effects=()) if index == anchor_index and t.retained_effects else t
+        for index, t in enumerate(tiles)
+    ]
     placed_state = replace(
         state,
         tiles=tuple(tiles),
+        current_rule=rule,
         current_anchor=(row, col),
         current_rule_pending=False,
         # 「自身提升N级」已经在选词缀时加到 ``rule.paint`` 上了（这一笔落的正是它），
@@ -1722,15 +1890,25 @@ def force_complete_current_rule(
     actual_damage = min(damage_count, len(paint_cells))
     destroyed = tuple(sorted(rng.sample(paint_cells, actual_damage))) if paint_cells else ()
     tiles = list(upgraded_state.tiles)
+    anchor = upgraded_state.current_anchor
     for row, col in destroyed:
-        # 炸毁只炸颜料，地块加成留在原地——这是"炸完再放一枚直接 7 级"的来源。
-        # 但锚点上的颜料没了，同种光环随之失效，别处同种颜料会掉级。
+        # 炸毁只炸颜料，颜料身上那笔加成跟着走（2026-11-23 定案）。
+        # 锚点上的颜料没了，同种光环随之失效，别处同种颜料会掉级。
+        #
+        # 但如果炸掉的是**锚点格上的初始颜料**，它那套「范围 + 调色效果」要留在
+        # 地块上：用户 2026-11-23 实机口径「范围和笔触效果还在」，失色恢复成空白后
+        # 再落一枚颜料就能继承（落普通颜料=变成本格初始颜料，落初始颜料=融合）。
+        # 普通背包颜料被炸**不留**东西（规则一：全新空白地块，无任何残留）。
+        retained: tuple[PaintEffect, ...] = ()
+        if (row, col) == anchor:
+            retained = tuple(rule.effects)
         tiles[row * BOARD_SIZE + col] = replace(
             tiles[row * BOARD_SIZE + col],
             state=TileState.FADED,
             paint=None,
             buff_applied_id=None,
             affix_applied_id=None,
+            retained_effects=retained,
         )
     damaged_state = _recompute_auras(replace(upgraded_state, tiles=tuple(tiles)))
     next_state, next_message = _advance_to_next_current_rule(damaged_state, rng)
@@ -3514,27 +3692,44 @@ def _current_match_count(state: PuzzleState, rule: CurrentPaintRule) -> int:
 def _apply_current_rule_upgrade(state: PuzzleState, rule: CurrentPaintRule) -> tuple[PuzzleState, int]:
     """结算初始颜料的「调色效果：范围内目标提升 N 级」。
 
-    **加成落在地块上，不落在颜料身上**（用户 2026-11-22 实机口径）。
+    **加成落在颜料身上**（``Paint.bonus_level``），2026-11-23 定案。
 
     证据链：用户这局 c4r5 原本是 3 级怪物，被第三个初始颜料转成 3 级机械之神，
     随后吃到第二个初始颜料（横向玩法 +2）与第三个（相邻玩法 +1），最终显示 6 级；
-    且**点击该地块，游戏提示的正是 +3** —— 2+1=3，说明这两笔加成是记在地块上的。
+    且**点击该地块，游戏提示的正是 +3** —— 2+1=3。
 
-    之前实现写 ``paint.level``，那格颜料一被覆盖/转换，先前积累的加成跟着旧颜料一起
-    消失，模型只能算出 3 级，而画面是 6 级、``breakdown`` 还是空的，对账天天报红。
+    融合颜料有多条效果时逐条结算：同一格被两条效果都命中就把两笔加起来
+    （比如横向玩法 +2 与相邻玩法 +1 命中同一枚 → +3），这正是点击地块提示 +3 的由来。
     """
 
+    if state.current_anchor is None:
+        return state, 0
+    row, col = state.current_anchor
     tiles = list(state.tiles)
-    upgraded_count = 0
-    for row, col in _placement_scope_cells(state, rule):
-        index = row * BOARD_SIZE + col
-        tile = tiles[index]
-        if tile.paint is None or not _tile_matches_target(tile, rule.target_object):
+    # 先按效果逐条累加每格该涨多少，再一次性落地：
+    # 这样 ``buff_applied_id`` 的去重仍然按「一次安装」为粒度，
+    # 不会因为第二条效果被第一条挡住。
+    pending: dict[int, int] = {}
+    for effect in rule.effects:
+        amount = max(0, int(effect.upgrade_amount))
+        if amount <= 0:
             continue
+        for cell_row, cell_col in _effect_scope_cells_for_anchor(row, col, effect):
+            if (cell_row, cell_col) == state.current_anchor:
+                continue
+            index = cell_row * BOARD_SIZE + cell_col
+            tile = tiles[index]
+            if tile.paint is None or not _tile_matches_target(tile, effect.target_object):
+                continue
+            pending[index] = pending.get(index, 0) + amount
+
+    upgraded_count = 0
+    for index, amount in pending.items():
+        tile = tiles[index]
         if not _tile_can_receive_current_buff(tile, state):
             continue
         tiles[index] = replace(
-            _tile_with_upgrade(tile, max(0, int(rule.upgrade_amount)), as_bonus=True),
+            _tile_with_upgrade(tile, amount, as_bonus=True, source=BONUS_SOURCE_RULE),
             buff_applied_id=state.current_buff_id,
         )
         upgraded_count += 1
@@ -4087,10 +4282,21 @@ def _scope_cells(row: int, col: int, direction: PaintDirection) -> tuple[tuple[i
 
 
 def _rule_scope_cells_for_anchor(row: int, col: int, rule: CurrentPaintRule) -> tuple[tuple[int, int], ...]:
+    """作用范围 = 各效果方向的**并集**（用户 2026-11-23：「范围取并集」）。
+
+    融合颜料有两个范围时，两个方向的格子都算在范围内，重叠的只算一次。
+    """
     cells: list[tuple[int, int]] = []
-    for direction in (rule.direction, *rule.extra_directions):
+    for direction in rule.directions:
         cells.extend(_scope_cells(row, col, direction))
     return tuple(dict.fromkeys(cells))
+
+
+def _effect_scope_cells_for_anchor(
+    row: int, col: int, effect: PaintEffect
+) -> tuple[tuple[int, int], ...]:
+    """单条效果的作用范围（只按它自己的方向算）。"""
+    return _scope_cells(row, col, effect.direction)
 
 
 def _score_candidate(
@@ -5316,7 +5522,7 @@ def _upgrade_scope_paints(
         tile = tiles[index]
         if tile.paint is None:
             continue
-        tiles[index] = _tile_with_upgrade(tile, amount, as_bonus=affix.grants_bonus)
+        tiles[index] = _tile_with_upgrade(tile, amount, as_bonus=True, source=BONUS_SOURCE_AFFIX)
     return replace(state, tiles=tuple(tiles)), len(chosen)
 
 
@@ -5330,7 +5536,7 @@ def _upgrade_global_category_paints(state: PuzzleState, affix: AffixRule) -> tup
         if affix.persistent_until_match and not _tile_can_receive_persistent_affix(tile, state):
             continue
         tiles[index] = replace(
-            _tile_with_upgrade(tile, amount, as_bonus=affix.grants_bonus),
+            _tile_with_upgrade(tile, amount, as_bonus=True, source=BONUS_SOURCE_AFFIX),
             affix_applied_id=state.current_buff_id if affix.persistent_until_match else tile.affix_applied_id,
         )
         count += 1
@@ -5398,7 +5604,7 @@ def _upgrade_scope_same_paints(state: PuzzleState, affix: AffixRule) -> tuple[Pu
         tile = tiles[index]
         if tile.paint is None:
             continue
-        tiles[index] = _tile_with_upgrade(tile, amount, as_bonus=affix.grants_bonus)
+        tiles[index] = _tile_with_upgrade(tile, amount, as_bonus=True, source=BONUS_SOURCE_AFFIX)
         count += 1
     return replace(state, tiles=tuple(tiles)), count
 

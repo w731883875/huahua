@@ -25,6 +25,7 @@ from typing import Any, Iterable, Sequence
 
 from . import game_model as gm
 from . import s8_official_data
+from . import strategy_lv7 as strategy
 from .engine.value import DEFAULT_WEIGHTS, EvalWeights, board_value, level7_counts
 
 
@@ -1544,20 +1545,18 @@ def auto_play(
         ):
             if _place_on_kept_effect():
                 continue
-        # 融合专线第三部分：想让锚点格被炸到、留下效果包，就得**主动用掉强制
-        # 完成**。策略自己几乎不会选它（贪心只看即时收益）。这里在一局的前半段
-        # 主动消耗一次，把融合的种子埋下去；炸不炸得中锚点是随机的（实测约 51%），
-        # 中不中交给种子分布去覆盖。
-        if (
-            fusion_explore
-            and not gm.current_rule_is_pending(session.state)
-            and gm.backpack_paint_placed(session.state)
-            and _kept_effect_cell() is None
-            and session._force_used == 0
-        ):
-            if session.force_complete():
-                continue
+        # 强制完成**门槛**（用户 2026-11-23 口径）。它原来是无路可走时的兜底：
+        # 实测 100% 由「推荐为空」触发、93% 锚点还不是宝箱，等于白炸颜料换一次
+        # 本该自己做出来的升级。现在**仍然只在策略无路可走时才考虑**强制完成
+        # （有正经落子就走落子），但要不要真炸由门槛说了算：
+        #   * 第 1/2 次：棋盘 4 连以上连线 > 2 条，或者场上还有宝箱可养；
+        #   * 第 3 次：范围内有 5/6 级宝箱、且全局只剩 2~3 个空白地块；
+        #   * 已有 7 级宝箱但没有更多宝箱可养时，一律不炸，收尾即可。
         action = policy.choose(session.state, engine, rng, force_used=session._force_used)
+        if action is not None and action.kind is ActionKind.FORCE_COMPLETE:
+            decision = strategy.decide_force_complete(session.state, session._force_used)
+            if not decision.allowed:
+                break
         if action is None:
             break
         if action.kind is ActionKind.PLACE_ANCHOR:

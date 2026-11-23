@@ -3101,13 +3101,101 @@ def _change_target_object_score(state: PuzzleState, affix: AffixRule) -> float:
     return _CHANGE_TARGET_OBJECT_FALLBACK + expected_gain * 320.0
 
 
+def _amount_preference_bonus(amount: int) -> float:
+    """升级类词缀「提升几级」的偏好加权。
+
+    用户 2026-11-23 口径：「调色效果和笔触都有，**优先调色效果**，如果调色效果
+    和笔触效果有提升 2 级则**优先选提升 2 级的**」。
+
+    所以同样是升级词缀，+2 要明显压过 +1、+3 再高一点。这里给的是**额外**
+    权重（不影响原本按局面估出来的过路收益），只负责把「幅度大」的排在前面。
+    """
+    return {1: 0.0, 2: 170.0, 3: 300.0}.get(int(amount), 420.0)
+
+
+def _match_required_delta_score(state: PuzzleState, affix: AffixRule) -> float:
+    """「调色目标的进度要求减少 N」值多少分。
+
+    这条原来是**写死 140 分**（``match_required >= 4`` 时），完全不看局面，
+    比「全图和自身相同的颜料提升 N 级」这类真正能产出 7 级的词缀还高。
+    后果是推荐器把词缀额度全喂给它：实测 200 局里选了 191 次进度减少、
+    7 级宝箱只有 1.05 个。用户 2026-11-23 明确「以 7 级宝箱个数为第一目标」，
+    所以这里改成按局面估算：
+
+    * 它是**省事的词缀，不是产出的词缀**——降低门槛只让你少放几枚颜料，
+      本身不涨任何等级；
+    * 只有在「剩下的颜料根本凑不齐要求」时才有救场价值，那种情况才给高分；
+    * 其余时候给它一个明显低于升级类词缀的底分，让它自然排在后面。
+
+    ``match_required`` 越大、已进度越少，救场价值越高。
+    """
+    rule = state.current_rule
+    if rule is None:
+        return 0.0
+    remaining = max(0, rule.match_required - rule.match_current)
+    if remaining <= 0:
+        # 已经满足了，再降门槛没有任何意义
+        return 5.0
+    # 棋盘上还能落笔的格子数：凑不齐要求时才叫救场
+    placeable = _count_placeable_cells(state)
+    shortfall = max(0, remaining - max(0, placeable))
+    reduction = abs(int(affix.delta))
+    if shortfall > 0:
+        # 真的会卡死：减轻多少就直接值多少救场分
+        return 120.0 + min(reduction, shortfall) * 35.0
+    # 凑得齐：只是省事。给个低底分，输给任何升级类词缀。
+    return 18.0 + min(reduction, remaining) * 4.0
+
+
+def _count_placeable_cells(state: PuzzleState) -> int:
+    """棋盘上当前还能落笔的格子数（按当前词缀允许的状态算）。"""
+    affix = state.active_affix
+    return sum(
+        1
+        for row in range(BOARD_SIZE)
+        for col in range(BOARD_SIZE)
+        if _is_placeable(state.tile(row, col), affix)
+    )
+
+
+def _treasure_brink_bonus_in_scope(state: PuzzleState, affix: AffixRule) -> float:
+    """「作用范围内所有颜料提升 N 级」把宝箱推过 7 级时的额外奖励。
+
+    与 :func:`_treasure_brink_bonus` 同一口径，只是范围限定在当前锚点
+    各条效果的作用格内（范围词缀只对范围内的颜料生效）。
+    """
+    rule = state.current_rule
+    if rule is None or state.current_anchor is None:
+        return 0.0
+    row, col = state.current_anchor
+    cells: set[tuple[int, int]] = set()
+    for effect in rule.effects:
+        cells.update(_effect_scope_cells_for_anchor(row, col, effect))
+    labels = {1: 380.0, 2: 200.0, 3: 90.0}
+    bonus = 0.0
+    for cell_row, cell_col in cells:
+        tile = state.tile(cell_row, cell_col)
+        if tile.state is not TileState.PAINT or tile.paint is None:
+            continue
+        if not tile.paint.is_treasure:
+            continue
+        current = tile_final_level(tile)
+        if current >= MAX_LEVEL:
+            continue
+        after = min(MAX_LEVEL, current + max(1, int(affix.amount)))
+        if after < MAX_LEVEL:
+            continue
+        bonus += labels.get(MAX_LEVEL - current, 0.0)
+    return bonus
+
+
 def _score_affix(state: PuzzleState, affix: AffixRule) -> float:
     rule = state.current_rule
     if rule is None:
         return 0.0
 
     if affix.effect == AffixEffect.MATCH_REQUIRED_DELTA:
-        return 140.0 if rule.match_required >= 4 else 70.0
+        return _match_required_delta_score(state, affix)
     if affix.effect == AffixEffect.CHANGE_DIRECTION:
         return _direction_affix_score(state, affix)
     if affix.effect == AffixEffect.CHANGE_TARGET_OBJECT:
@@ -3131,23 +3219,31 @@ def _score_affix(state: PuzzleState, affix: AffixRule) -> float:
             - max(0, affix.delta) * 35.0
         )
     if affix.effect == AffixEffect.UPGRADE_SELF:
-        return _level_gain_score(rule.paint, affix.amount, multiplier=1.15)
+        return (
+            _level_gain_score(rule.paint, affix.amount, multiplier=1.15)
+            + _amount_preference_bonus(affix.amount)
+        )
     if affix.effect == AffixEffect.UPGRADE_IN_SCOPE:
         return (
             _best_scope_upgrade_gain(state, affix, amount=affix.amount, count=affix.count) * 0.70
             # 已叠加成的格子吃到升级的边际收益远高于普通格子
             + _buffed_scope_gain(state, affix.amount) * 0.85
+            + _treasure_brink_bonus_in_scope(state, affix)
+            + _amount_preference_bonus(affix.amount)
         )
     if affix.effect == AffixEffect.UPGRADE_SCOPE_SAME_PAINT:
         return (
             _scope_same_upgrade_gain(state, affix.amount) * 0.82
             + _buffed_scope_gain(state, affix.amount) * 0.55
+            + _amount_preference_bonus(affix.amount)
         )
     if affix.effect == AffixEffect.UPGRADE_GLOBAL_CATEGORY:
         return (
             _global_category_upgrade_gain(state, affix.target_object, affix.amount) * 0.80
             + (180.0 if affix.persistent_until_match else 0.0)
             + _buffed_global_gain(state, affix.amount) * 0.65
+            + _treasure_brink_bonus(state, affix.target_object, affix.amount)
+            + _amount_preference_bonus(affix.amount)
         )
     if affix.effect == AffixEffect.UPGRADE_GLOBAL_SAME_PAINT:
         return (
@@ -3155,6 +3251,7 @@ def _score_affix(state: PuzzleState, affix: AffixRule) -> float:
             + (220.0 if affix.persistent_until_match else 0.0)
             + _buffed_global_gain(state, affix.amount) * 0.85
             + _treasure_affix_bonus(state, affix)
+            + _amount_preference_bonus(affix.amount)
         )
     if affix.effect == AffixEffect.COPY_SELF_TO_SCOPE:
         return _copy_self_value_gain(state) * 1.15 + _treasure_affix_bonus(state, affix)
@@ -4082,6 +4179,40 @@ def _global_category_upgrade_gain(
         for tile in state.tiles
         if tile.paint is not None and _paint_matches_target(tile.paint, target or PaintObject.ALL)
     )
+
+
+def _treasure_brink_bonus(
+    state: PuzzleState,
+    target: PaintObject | None,
+    amount: int,
+) -> float:
+    """「这波升级刚好把宝箱推过 7 级」的额外奖励。
+
+    用户 2026-11-23 定目标：**以 7 级宝箱个数为第一目标**。实测宝箱平均
+    基础 3.4 级、加成 3.21 级 = 6.61 级，**整体就卡在 7 级门口**，所以
+    「差多少级到 7」这件事必须单独计价，不能混在按阈值差值的普通过路收益里。
+
+    只统计当前 ``target`` 覆盖得到、且升完能到 7 的宝箱，按「差几级」给梯度
+    奖励：差 1 级最高（临门一脚），差 2~3 级递减，差更多则不给（这一波救不了）。
+    """
+    labels = {1: 420.0, 2: 240.0, 3: 120.0}
+    bonus = 0.0
+    for tile in state.tiles:
+        if tile.state is not TileState.PAINT or tile.paint is None:
+            continue
+        if not tile.paint.is_treasure:
+            continue
+        if not _paint_matches_target(tile.paint, target or PaintObject.ALL):
+            continue
+        current = tile_final_level(tile)
+        if current >= MAX_LEVEL:
+            continue
+        gap = MAX_LEVEL - current
+        after = min(MAX_LEVEL, current + max(1, amount))
+        if after < MAX_LEVEL:
+            continue
+        bonus += labels.get(gap, 0.0)
+    return bonus
 
 
 def _global_same_upgrade_gain(state: PuzzleState, amount: int) -> float:

@@ -690,7 +690,8 @@ def _rebase_observed_levels(state: PuzzleState, anchor: tuple[int, int] | None =
 
     - 加成是 0 的格子完全不动（老路径一字不改）；
     - 观测到 7 级说明已经封顶，反推不唯一，保持原样；
-    - 反推出来小于 1 级，说明模型比现实多算了 → 就地清掉这一格的加成，让它自我纠正。
+    - 反推出来小于 1 级，说明模型比现实多算了 → 就地清掉这一格的**地块加成**，
+      但**保留** ``aura_amount``（那是「同种颜料光环」这条词缀的强度，见下方注释）。
     """
     tiles: list[Tile] = []
     for index, tile in enumerate(state.tiles):
@@ -704,10 +705,31 @@ def _rebase_observed_levels(state: PuzzleState, anchor: tuple[int, int] | None =
             tiles.append(tile)
             continue
         base = tile.paint.level - bonus - aura
-        if base < 1:
-            tiles.append(replace(tile, bonus_level=0, aura_amount=0, aura_level=0))
+        if base >= 1:
+            tiles.append(replace(tile, paint=replace(tile.paint, level=base)))
             continue
-        tiles.append(replace(tile, paint=replace(tile.paint, level=base)))
+        # 反推出来小于 1 级：模型比现实多算了。**只清地块加成，保留 aura_amount**。
+        #
+        # 以前这里连 ``aura_amount`` / ``aura_level`` 一起清零，本意是自我纠正，
+        # 实际把「同种颜料光环」那条词缀的强度也抹掉了 —— 它是挂在**地块**上的
+        # 持久效果（官方 2014/2015「全图和自身相同的颜料提升N级」），抹掉等于
+        # 凭空删掉一条已经选过的词缀，没有任何依据。
+        #
+        # 2026-11-22 全库实测的后果：录制路径里 2559 个颜料格样本的
+        # ``aura_level`` **全是 0**，于是 ``2-17`` / ``2-18`` 这类词缀
+        # 从此永远不生效（用户 2026-11-22 那局 2-17 出现 3 次、2-18 出现 2 次）。
+        #
+        # 现在只清 ``bonus_level``，再用剩下的光环重新反推一次；连光环单独都超过
+        # 画面读数时把颜料等级钳到 1，光环原样留着 —— 宁可让对账把差异报出来，
+        # 也不要静默删掉一条词缀。
+        remaining = tile.paint.level - aura
+        tiles.append(
+            replace(
+                tile,
+                bonus_level=0,
+                paint=replace(tile.paint, level=remaining if remaining >= 1 else 1),
+            )
+        )
     return replace(state, tiles=tuple(tiles))
 
 

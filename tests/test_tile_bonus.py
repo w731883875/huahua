@@ -248,5 +248,69 @@ class BankedBonusValueTest(unittest.TestCase):
         self.assertGreater(board_value(loaded), board_value(fresh))
 
 
+class SelfCorrectionKeepsAuraTest(unittest.TestCase):
+    """反推基础等级「小于 1 级」时，只能清地块加成，**不许动光环**。
+
+    2026-11-22 全库实测：``runtime/auto_run_records.jsonl`` 里 2559 个颜料格样本
+    的 ``aura_level`` **全是 0**。根因就是 ``_rebase_observed_levels`` 的自纠正分支
+    把 ``aura_amount`` 一起清零了 —— 而 ``aura_amount`` 是「全图和自身相同的颜料
+    提升N级」（官方 2014/2015，即工具里的 ``2-17``/``2-18``）挂在地块上的**强度**，
+    清掉等于凭空删掉一条玩家已经选过的词缀。
+
+    取舍：光环单独就超过画面读数时，把颜料等级钳到 1、光环原样留着，让
+    ``level_reconcile`` 把差异报出来。宁可看见对账红框，也不静默丢词缀。
+    """
+
+    def _rebased(self, observed: int, *, bonus: int, aura: int) -> gm.Tile:
+        """造一格「画面读数 observed、模型认为加成 bonus+aura」的局面再反推。"""
+        state = _with_tile(
+            _state(),
+            2,
+            3,
+            gm.Tile(
+                gm.TileState.PAINT,
+                gm.Paint(GAMEPLAY, observed),
+                bonus_level=bonus,
+                aura_amount=aura,
+                aura_level=aura,
+            ),
+        )
+        return gm._rebase_observed_levels(state).tile(2, 3)
+
+    def test_base_below_one_clears_bonus_but_keeps_aura_amount(self) -> None:
+        # 画面 4 级，模型认为 +5 地块加成、+3 光环 → 反推 -4 级，落在自纠正分支
+        tile = self._rebased(4, bonus=5, aura=3)
+
+        self.assertEqual(gm.tile_bonus_level(tile), 0, "多算的地块加成该清掉")
+        self.assertEqual(tile.aura_amount, 3, "光环强度是词缀，不许清")
+        self.assertEqual(tile.aura_level, 3, "派生缓存也不许清")
+
+    def test_rebased_level_still_reproduces_the_observed_level(self) -> None:
+        """清掉加成后，颜料等级 + 光环必须仍等于画面读数（这里是 4）。"""
+
+        tile = self._rebased(4, bonus=5, aura=3)
+
+        self.assertEqual(tile.paint.level, 1, "4 - 3 光环 = 1")
+        self.assertEqual(gm.tile_final_level(tile), 4, "最终等级不能和画面对不上")
+
+    def test_aura_alone_over_the_reading_clamps_instead_of_wiping(self) -> None:
+        """光环单独就超过画面读数：颜料等级钳到 1，光环保留，差异交给对账。"""
+
+        tile = self._rebased(2, bonus=0, aura=5)
+
+        self.assertEqual(tile.paint.level, 1, "钳到最低等级，不出现 0 级")
+        self.assertEqual(tile.aura_amount, 5, "光环依然不许清")
+        self.assertGreater(
+            gm.tile_final_level(tile), 2, "宁可对账报差异，也不静默删词缀"
+        )
+
+    def test_no_correction_needed_leaves_aura_untouched(self) -> None:
+        tile = self._rebased(6, bonus=1, aura=2)
+
+        self.assertEqual(tile.paint.level, 3, "6 - 1 - 2 = 3")
+        self.assertEqual(tile.aura_amount, 2)
+        self.assertEqual(gm.tile_bonus_level(tile), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

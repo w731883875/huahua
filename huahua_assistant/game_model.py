@@ -156,6 +156,15 @@ class Tile:
     #:
     #: 普通背包颜料被炸毁**不留**这个包（用户规则一：全新空白地块，无任何残留）。
     retained_effects: tuple["PaintEffect", ...] = ()
+    #: 「这格有等级光环但已经没有颜料内容」的可信度 0~1（视觉实测）。
+    #:
+    #: 用户 2026-11-24 口径：「放到虚空的颜料会留一圈**等级光环**（一般 3-5 级）
+    #: + 中心空」——颜料落到虚空后失去自身内容、退化成笔触效果，画面上只剩底色
+    #: 和光环，没有怪物/玩法图标，也就没有 LvN 角标。实机 c5r6 当时被判成纯
+    #: VOID，那枚颜料的笔触效果就凭空消失了。
+    retained_aura: float = 0.0
+    #: 等级光环颜色读出来的等级（一般 3-5，读不出为 ``None``）。
+    retained_aura_level: int | None = None
 
 
 def tile_bonus_level(tile: Tile) -> int:
@@ -765,6 +774,11 @@ def state_from_observation(
                     else paint
                 ),
                 aura_amount=aura_amount,
+                # 颜料落到虚空后失去自身内容、退化成笔触效果：这格没有颜料，
+                # 但保留了一圈等级光环（用户 2026-11-24 实测一般 3-5 级）。
+                # 不把这份信息带进模型，那枚颜料的笔触效果就等于凭空消失。
+                retained_aura=float(getattr(tile, "retained_aura", 0.0) or 0.0),
+                retained_aura_level=getattr(tile, "retained_aura_level", None),
             )
         )
     # 规则已选定、但棋盘上找不到锚点 → 处于「待落初始颜料」状态。

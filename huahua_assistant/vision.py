@@ -6158,7 +6158,24 @@ def _classify_tile_observation(
             state = TileState.BLANK if looks_placeable else TileState.VOID
             confidence = max(confidence, 0.72)
     elif state in {TileState.BLANK, TileState.UNKNOWN} and label.present:
-        if label.density >= tile_reader.PRESENCE_DENSITY_MIN * 1.25:
+        # 「格子有角标 → 一定有颜料」：角标只有棋盘颜料才会渲染，空白/冰块/漩涡
+        # 地块都没有（见上面 6094 行的注释，这是判断有没有颜料最可靠的一条）。
+        #
+        # 原来这里对 UNKNOWN 也要求密度 ≥ 基准的 1.25 倍，于是「角标读到了、
+        # 但图案偏淡」的格子会一路停在 UNKNOWN。2026-11-24 实机 c6r3 就是
+        # 这样：状态串里明晃晃一个 ``?``，整格从棋盘上消失，玩家看到的就是
+        # 「这格识别不了」。
+        #
+        # 分开对待：
+        #   * UNKNOWN 说明别的判据都没认出来，角标就是唯一证据 → 按基准阈值收；
+        #   * BLANK  保留 1.25 倍，避免作画阶段空白格的白色画笔水印被当角标
+        #     （那条路一松，18/36 格空板全变颜料的旧事故会回来）。
+        threshold = (
+            tile_reader.PRESENCE_DENSITY_MIN
+            if state is TileState.UNKNOWN
+            else tile_reader.PRESENCE_DENSITY_MIN * 1.25
+        )
+        if label.density >= threshold:
             state = TileState.PAINT
             confidence = max(confidence, 0.80)
     if state != TileState.PAINT:
@@ -6168,6 +6185,20 @@ def _classify_tile_observation(
         paint_level_confidence = 0.0
         paint_subtype = None
         paint_is_treasure = False
+    # 空地上还要再分辨一件事：这格是「单纯虚空」，还是「颜料落到虚空后只剩
+    # 底色 + 等级光环」。后者没有图标、没有角标，上面所有颜料判据都不成立，
+    # 只剩「环带颜色落进某个等级色相窗口 + 中心空」这一条形态特征可用
+    # （2026-11-24 实机 c5r6）。光环颜色即等级，通常 3-5 级。
+    retained_aura = 0.0
+    retained_aura_level: int | None = None
+    if state in {TileState.VOID, TileState.BLANK} and not label.present:
+        aura_score, aura_ring, aura_center_edge, aura_level = _tile_retained_aura_score(tile_bgr)
+        features["retained_aura_score"] = aura_score
+        features["retained_aura_ring"] = aura_ring
+        features["retained_aura_center_edge"] = aura_center_edge
+        if aura_score >= RETAINED_AURA_RING_MIN:
+            retained_aura = aura_score
+            retained_aura_level = aura_level
     return TileObservation(
         row=row,
         col=col,
@@ -6185,6 +6216,8 @@ def _classify_tile_observation(
         scope_highlight_confidence=scope_score,
         is_current_anchor=is_current_anchor,
         current_anchor_confidence=anchor_score,
+        retained_aura=retained_aura,
+        retained_aura_level=retained_aura_level,
     )
 
 
@@ -6287,6 +6320,120 @@ def _tile_scope_and_anchor_scores(tile_bgr: np.ndarray) -> tuple[float, float]:
     marker_dark_ratio = float(np.mean(marker_dark)) if marker_dark.size else 0.0
     anchor_score = marker_gold_ratio if marker_dark_ratio >= 0.018 else 0.0
     return scope_score, anchor_score
+
+
+#: 「放到虚空后只剩等级光环」的判定阈值。
+#:
+#: 语义（用户 2026-11-24 明确两次）：
+#:   「还有个放到虚空 c5r6 的也识别不了（需要显示出来只剩底色光圈无怪物/玩法图标）」
+#:   「放到虚空的颜料会留一圈**等级光环**（一般 3-5 级） + 中心空」
+#: 也就是颜料落到虚空后**失去自身内容、退化成笔触效果**，画面上只剩底色 + 一圈
+#: 等级光环：没有怪物/玩法图标，也就没有 LvN 角标（角标是跟着内容走的）。
+#:
+#: 关键是这圈光环**颜色就是等级**，所以不只是「有色环」，而是「色相落在
+#: ``frame_level.HUE_WINDOWS`` 的某一级里」——这比单纯「环上有彩色」强得多，
+#: 虚空边缘的抗锯齿亮边不会落进这些窄色相窗口。判据复用 ``frame_level``
+#: 那套 3/4/5/6 级色相区间，不另造一套（同一个游戏的等级配色只有一份）。
+#: 实测用户说的「一般 3-5 级」正好覆盖 Lv3 青蓝 / Lv4 紫 / Lv5 橙。
+RETAINED_AURA_RING_MIN = 0.16
+RETAINED_AURA_CENTER_EDGE_MAX = 0.12
+#: 环带相对底色的最小对比（取「亮度增幅」与「饱和增幅」中的较大者，按比例算）。
+#: 没有这道闸，纯色虚空会直接得满分——均匀颜色在环带里当然一片「同色」。
+RETAINED_AURA_CONTRAST_MIN = 0.18
+#: 中心与底色的颜色差容忍上限。超过它就认为中心有内容（图标），不是「只剩底色」。
+#: 用颜色差而不是边缘密度：图标常是实心大色块，内部平整、边缘密度极低。
+RETAINED_AURA_CENTER_DIFF_MAX = 0.25
+#: 等级光环只认这几个等级。Lv1 银、Lv2 绿在虚空上几乎不出现（用户实测 3-5），
+#: 而 Lv7 是动画彩虹环，用色相判会误报，一并排除。
+RETAINED_AURA_LEVELS = (3, 4, 5, 6)
+
+
+def _tile_retained_aura_score(
+    tile_bgr: np.ndarray,
+) -> tuple[float, float, float, int | None]:
+    """估「这格有等级光环」的可信度，返回 ``(score, ring_ratio, center_edge, level)``。
+
+    score 在 0~1：环带里落进某个等级色相窗口的占比越高、中心越空、环带相对
+    底色越突出，分越高。``level`` 是光环颜色对应的等级（通常 3-5）。
+
+    **必须要求「环带相对底色有对比」**：只统计「环带上有彩色」是错的——纯色
+    虚空在环带里当然一片同色，会直接得满分（自测时 (110,90,70) 的纯色块拿到
+    score=1.0、level=3 的假阳性）。真正的等级光环是画在底色之上的一圈亮带，
+    所以拿「最外圈（半径>0.95，一定是底色）」当参照，要求环带明显更亮或更艳。
+
+    原始分量一并返回，方便在实机记录里回校阈值——这套判据还没有真值样本。
+    """
+    if tile_bgr.size == 0:
+        return 0.0, 0.0, 1.0, None
+    hsv = cv2.cvtColor(tile_bgr, cv2.COLOR_BGR2HSV)
+    hue = hsv[:, :, 0]
+    saturation = hsv[:, :, 1]
+    value = hsv[:, :, 2]
+    height, width = saturation.shape
+    yy, xx = np.indices((height, width))
+    cx = (width - 1) / 2.0
+    cy = (height - 1) / 2.0
+    radius = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2) / max(1.0, min(height, width) / 2.0)
+
+    annulus = (radius >= 0.55) & (radius <= 0.88)
+    base = radius > 0.95
+    if not np.any(annulus) or not np.any(base):
+        return 0.0, 0.0, 1.0, None
+    annulus_count = max(1, int(np.count_nonzero(annulus)))
+
+    # 参照：最外圈一定是这块地的底色。
+    base_value = float(np.mean(value[base]))
+    base_saturation = float(np.mean(saturation[base]))
+    ring_value = float(np.mean(value[annulus]))
+    ring_saturation = float(np.mean(saturation[annulus]))
+    # 光环是「亮 + 艳」的带子；纯色虚空两项都为 0。
+    contrast = max(
+        (ring_value - base_value) / max(1.0, base_value),
+        (ring_saturation - base_saturation) / max(1.0, base_saturation),
+    )
+    if contrast < RETAINED_AURA_CONTRAST_MIN:
+        return 0.0, 0.0, 1.0, None
+
+    colored = annulus & (saturation > 90) & (value > 90)
+    ring_ratio = float(np.count_nonzero(colored)) / annulus_count
+
+    # 逐级算「环带里有百分之几落在这个等级的色相窗口」。
+    level_scores: dict[int, float] = {}
+    for level in RETAINED_AURA_LEVELS:
+        window = frame_level.HUE_WINDOWS.get(level)
+        if window is None:
+            continue
+        low, high = window
+        hit = colored & (hue >= low) & (hue <= high)
+        level_scores[level] = float(np.count_nonzero(hit)) / annulus_count
+    best_level: int | None = None
+    best_share = 0.0
+    if level_scores:
+        best_level, best_share = max(level_scores.items(), key=lambda item: item[1])
+
+    center = radius <= 0.40
+    center_edge = 1.0
+    if np.any(center):
+        edges = cv2.Canny(tile_bgr, 60, 160)
+        center_edge = float(np.count_nonzero(edges & center)) / max(1, int(np.count_nonzero(center)))
+    # 中心是否「空」用颜色差判断，不用边缘密度：图标常常是实心大色块，内部
+    # 平整无边缘（自测「橙环+实心白方块」的边缘密度只有 0.069，会被误判成空）。
+    # 「只剩底色」的格子中心就是底色本身，与最外圈参照色几乎相等。
+    center_difference = 0.0
+    if np.any(center):
+        center_value = float(np.mean(value[center]))
+        center_saturation = float(np.mean(saturation[center]))
+        center_difference = max(
+            abs(center_value - base_value) / max(1.0, base_value),
+            abs(center_saturation - base_saturation) / max(1.0, base_saturation),
+        )
+    emptiness = 1.0 - min(1.0, center_difference / max(1e-6, RETAINED_AURA_CENTER_DIFF_MAX))
+    # 用「落在等级色相窗口里的占比」而不是「任意彩色占比」算分：
+    # 灰白的虚空底色、边缘亮边都不进窄色相窗口，噪声自然被滤掉。
+    score = max(0.0, best_share * emptiness)
+    if score < RETAINED_AURA_RING_MIN:
+        return score, ring_ratio, center_edge, None
+    return score, ring_ratio, center_edge, best_level
 
 
 def _tile_visual_signature(tile_bgr: np.ndarray) -> tuple[float, ...]:

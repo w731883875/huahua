@@ -85,6 +85,16 @@ class TileObservation:
     scope_highlight_confidence: float = 0.0
     is_current_anchor: bool = False
     current_anchor_confidence: float = 0.0
+    #: 「这格有残留笔触光环」的可信度 0~1。
+    #:
+    #: 颜料落到虚空后失去自身内容、退化成笔触效果，画面上只剩底色 + 一圈等级光环，
+    #: 没有怪物/玩法图标、也就没有 LvN 角标。2026-11-24 实机 c5r6 就是这种格子，
+    #: 当时被判成纯 VOID，笔触效果整个丢失。``features`` 里还有
+    #: ``retained_aura_ring`` / ``retained_aura_center_edge`` 两个原始分量，
+    #: 供后续标定阈值用。
+    retained_aura: float = 0.0
+    #: 等级光环颜色读出来的等级（用户实测一般 3-5 级）；读不出为 ``None``。
+    retained_aura_level: int | None = None
 
 
 @dataclass(frozen=True)

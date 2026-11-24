@@ -171,6 +171,7 @@ from .tile_art import (
     family_name as tile_family_name,
     icon_stem as tile_icon_stem,
 )
+from . import layout
 from . import paint_icon
 from . import vision
 from .vision import VisionTracker, analyze_and_save_debug
@@ -6996,7 +6997,19 @@ def _compact_tile_paints(state: PuzzleState) -> list[dict | None]:
     result: list[dict | None] = []
     for tile in state.tiles:
         if tile.paint is None:
-            result.append(None)
+            # 没有颜料，但可能留着「等级光环」——颜料落到虚空后失去自身内容、
+            # 退化成笔触效果，只剩底色 + 一圈光环（用户 2026-11-24 实测 3-5 级）。
+            # 以前这里直接记账成 None，那枚颜料的笔触效果就从记录里彻底消失了，
+            # 复盘时看不出这格还有东西。用 ``ra``/``ral`` 单独标出来。
+            aura_retained = float(getattr(tile, "retained_aura", 0.0) or 0.0)
+            if aura_retained > 0:
+                entry: dict = {"ra": round(aura_retained, 3)}
+                aura_retained_level = getattr(tile, "retained_aura_level", None)
+                if aura_retained_level is not None:
+                    entry["ral"] = int(aura_retained_level)
+                result.append(entry)
+            else:
+                result.append(None)
             continue
         payload = _compact_paint(tile.paint)
         payload["id"] = paint_id(

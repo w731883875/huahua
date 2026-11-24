@@ -13,6 +13,7 @@ from pathlib import Path
 import numpy as np
 
 from huahua_assistant import paint_kind
+from huahua_assistant import s8_official_data
 
 ROOT = Path(__file__).resolve().parents[1]
 SHEET = ROOT / "runtime" / "paint_sheet"
@@ -37,25 +38,54 @@ class SheetTemplateTests(unittest.TestCase):
         self.assertEqual(missing, [], f"合成模板仍缺家族：{missing}")
 
     def test_sheet_has_every_level_for_each_family(self) -> None:
-        """每个家族要覆盖「官方目录里它真实的等级集合」，一条不能少。
+        """每个家族要覆盖「这个家族在游戏里真实存在的等级」，一条不能少。
 
-        注意玩法家族不是 1~7 全覆盖：``g008``~``g014`` 官方只出 Lv3~Lv7
-        （Lv3/Lv4 共用「赛季」图标），``g015 赛季`` 只有 Lv3/Lv4。
-        所以这里按 ``paint_catalog.json`` 的 ``levels`` 算期望值，
-        不要硬写 7——写死会得出「怪谈只有 20 条，少了 8 条」这种假失败。
+        玩法家族不是 1~7 全覆盖：``g008``~``g014`` 只存在 Lv5~Lv7，
+        ``g015 赛季`` 只有 Lv3/Lv4。官方目录的 ``levels`` 字段对 g008~g014
+        确实含 Lv3/Lv4，但那两级的官方名是「玩法颜料-赛季」——3~4 级是**赛季
+        颜料本体**，而画表时图标取的是 ``entry["icon"]``（家族自己的图标），
+        于是会画出「黑潮图标 + Lv3 框」这种游戏里不存在的组合。用户
+        2026-11-24 明确要求删除，生成脚本也据此跳过。
+
+        所以期望值要按 ``S8_PARTIAL_LEVEL_FAMILIES`` 过滤，不能直接数目录
+        的 ``levels``，也不要硬写 7。
         """
         templates = paint_kind.sheet_templates()
-        expected = {
-            entry["name"]: len(entry.get("levels") or {}) * len(paint_kind.SHEET_SCALES)
-            for entry in CATALOG.values()
-            if entry.get("name")
-        }
+        expected = {}
+        for entry in CATALOG.values():
+            name = entry.get("name")
+            if not name:
+                continue
+            levels = [int(level) for level in (entry.get("levels") or {})]
+            allowed = s8_official_data.S8_PARTIAL_LEVEL_FAMILIES.get(name)
+            if allowed is not None:
+                levels = [level for level in levels if level in allowed]
+            expected[name] = len(levels) * len(paint_kind.SHEET_SCALES)
         short = {
             name: (len(templates.get(name, [])), want)
             for name, want in expected.items()
             if len(templates.get(name, [])) != want
         }
         self.assertEqual(short, {}, f"这些家族的合成模板条数不对（实际, 期望）：{short}")
+
+    def test_impossible_levels_are_not_templated(self) -> None:
+        """游戏里不存在的组合不能进模板库，否则会污染圆形/菱形判据。
+
+        用户 2026-11-24 口径：「赛季只有 Lv3/Lv4，黑潮~玩偶只有 Lv5~Lv7才是正确的。」
+        """
+        templates = paint_kind.sheet_templates()
+        for family in ("黑潮", "黑帆", "魔方", "迷城", "梦魇", "怪谈", "玩偶"):
+            # 5~7 三级 × 尺度数，多一条都说明低等级被当成了有效模板。
+            self.assertEqual(
+                len(templates.get(family, [])),
+                3 * len(paint_kind.SHEET_SCALES),
+                f"{family} 的模板条数不对，3~4 级不该存在",
+            )
+        self.assertEqual(
+            len(templates.get("赛季", [])),
+            2 * len(paint_kind.SHEET_SCALES),
+            "赛季只有 Lv3/Lv4",
+        )
 
     def test_merged_bank_reports_no_missing_family(self) -> None:
         active = paint_kind.bank()

@@ -37,6 +37,8 @@ class LevelStabilizer:
         self.stable_frames = max(1, int(stable_frames))
         self._committed: dict[tuple[int, int], CellIdentity] = {}
         self._pending: dict[tuple[int, int], tuple[CellIdentity, int]] = {}
+        #: 「已确认是颜料，但这几帧读不出」的计数。见 :meth:`observe` 里掉格的处理。
+        self._absent_counts: dict[tuple[int, int], int] = {}
         self._frozen = False
 
     # ---- 生命周期 ---------------------------------------------------
@@ -52,6 +54,7 @@ class LevelStabilizer:
         """新一局开始：清空历史并解除冻结。"""
         self._committed.clear()
         self._pending.clear()
+        self._absent_counts.clear()
         self._frozen = False
 
     # ---- 主流程 -----------------------------------------------------
@@ -62,10 +65,39 @@ class LevelStabilizer:
         for tile in board.tiles:
             key = (tile.row, tile.col)
             if tile.state is not TileState.PAINT:
-                # 不是颜料就没有等级可言，顺手丢掉它的待定读数。
+                # 这一帧没读成颜料。**不能无条件放行**：已经确认过的颜料格会
+                # 因为遮挡（点击看加成的浮窗）、动画中间态、辉光过曝等原因偶尔
+                # 掉成虚空/空白，一帧就把它降级的话，模型里那格的颜料、地块加成
+                # 和光环全都会归零重算。
+                #
+                # 2026-11-24 实机 run-20261124-221208 实测（29 帧、同一块静止棋盘）：
+                #   c4r5  B×9  -> P×2  -> **B×1**  -> P×17
+                #   c3r6  B×17 -> **V×1** -> P×11
+                #   c5r3  B×3  -> P×18 -> V×1 -> P×1 -> V×2 -> P×1 -> V×1 -> P×2
+                # 等级（Lv）本来就有 stable_frames 投票保护，3↔6 那种抖动压得住；
+                # 状态这一路漏了，同一套抖动只防住了一半。
+                #
+                # 所以掉格也要走同样的投票：连续 stable_frames 帧都读不出，才真的
+                # 降级；否则沿用已确认的那份读数。
+                if key in self._committed and not self._frozen:
+                    count = self._absent_counts.get(key, 0) + 1
+                    if count >= self.stable_frames:
+                        # 连续这么多帧都读不出：这回是真的没了，降级。
+                        self._committed.pop(key, None)
+                        self._absent_counts.pop(key, None)
+                        self._pending.pop(key, None)
+                        tiles.append(tile)
+                    else:
+                        self._absent_counts[key] = count
+                        tiles.append(self._apply(tile, self._committed[key]))
+                    continue
+                # 没确认过颜料，或已经冻结：不是颜料就没有等级可言，
+                # 顺手丢掉它的待定读数。
                 self._pending.pop(key, None)
                 tiles.append(tile)
                 continue
+            # 这一帧读成颜料了，之前那串「掉格」计数作废。
+            self._absent_counts.pop(key, None)
             read = self._identity(tile)
             if self._is_blank_read(read):
                 # 这一帧压根没读出颜料：不参与表决，也不算「变化」。
@@ -134,6 +166,11 @@ class LevelStabilizer:
         category, subtype, level, treasure = identity
         return replace(
             tile,
+            # 状态也要恢复：调用方用这个函数表示「沿用已确认的读数」，而
+            # 已确认的读数里这格是**颜料**。以前只改内容不改 state，结果是
+            # 「虚空格上挂着颜料等级」这种自相矛盾的观测——掉格去抖必须有这一步，
+            # 否则压不住 P -> V/B 的抖动（2026-11-24 实测 c5r3 连掉 4 次）。
+            state=TileState.PAINT,
             paint_category=category,
             paint_subtype=subtype,
             paint_level=level,

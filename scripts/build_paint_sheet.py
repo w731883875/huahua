@@ -34,6 +34,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from huahua_assistant import paint_frame  # noqa: E402
+from huahua_assistant import s8_official_data  # noqa: E402
 
 ASSETS = ROOT / "huahua_assistant" / "assets"
 ICON_DIR = ASSETS / "paint_icons"
@@ -147,7 +148,20 @@ def build(out_dir: Path = OUT_DIR) -> tuple[Path, int]:
         if not icon_path.exists():
             raise SystemExit(f"{key} 的图标缺失: {icon_path}")
         cells: dict[int, dict[str, str]] = {}
+        family = str(entry.get("name") or "")
+        allowed_levels = s8_official_data.S8_PARTIAL_LEVEL_FAMILIES.get(family)
         for level in levels:
+            # 只画「这个家族自己在游戏里真实存在」的等级。
+            #
+            # 官方表里 g008~g014（黑潮/黑帆/魔方/迷城/梦魇/怪谈/玩偶）的
+            # ``levels`` 含 Lv3/Lv4，但那两级的官方名是「玩法颜料-赛季」——
+            # 3~4 级是**赛季颜料本体**，升到 5 级才换成这些玩法家族自己的图标。
+            # 而本函数的图标取自 ``entry["icon"]``（**家族自己的图标**），
+            # 所以画出来会是「黑潮图标 + Lv3 框」这种游戏里不存在的组合。
+            # 用户 2026-11-24 明确要求删除；它还会污染 ``paint_kind`` 的
+            # 圆形/菱形模板库（多出 12 条错配图标模板）。
+            if allowed_levels is not None and level not in allowed_levels:
+                continue
             # 背包和白色地块同一套规则：怪物圆形、玩法菱形。
             frame_paths = {bg: _frame_path(shape, level) for bg, _label in BACKGROUNDS}
             for bg, path in frame_paths.items():
@@ -298,7 +312,11 @@ def _render_html(rows: list[dict], specials: list[dict] | None = None) -> str:
   框素材画布带辉光留白（198~233），按各素材自己的画布换算成一个逻辑格。
   早期从截图反推的「框要放大 1.30 倍」是错的——把实心环和含辉光外沿搞混了。
   图标来自 PAK 解包（<code>UI_S8Gameplay_Color*_128</code>），框来自 S8 图集切片，均未从网页下载。
-  共 {len(rows)} 个家族；赛季只有 Lv3/Lv4，黑潮~玩偶只有 Lv3~Lv7，缺的等级显示「—」。
+  共 {len(rows)} 个家族。等级不是每个家族都通吃：
+  <b>赛季只有 Lv3/Lv4</b>，<b>黑潮/黑帆/魔方/迷城/梦魇/怪谈/玩偶只有 Lv5~Lv7</b>，
+  缺的等级显示「—」。这七家在 3~4 级时官方数据里的名字是「玩法颜料-赛季」，
+  但图标字段仍是各自家族的图标——说出来是「黑潮图标 + Lv3 框」，游戏里不存在，
+  所以不画（用户 2026-11-24 要求删除）。
 </p>
 <table>
 <thead><tr><th class="fam">家族</th><th class="bg">形态</th>{head_cells}</tr></thead>

@@ -354,7 +354,18 @@ def _pick_calibration(
             score = 0.5
         else:
             score = abs(item_width - width) / max(1, width) + abs(item_height - height) / max(1, height)
-            if score > WINDOW_MATCH_TOLERANCE * 4:
+            # 容差必须和 ``_same_window`` 一样严（2%），不能放宽到 8%。
+            #
+            # 2026-11-24 实机事故：窗口尺寸从 1922x1030 变成 1920x991（高度差 39px），
+            # 偏差分 0.0404 被 8% 的阈值放行，于是拿「按 1030 高算出来的比例」去套
+            # 991 高的画面：
+            #   size_ratio 0.601942 * min(1920,991) = 596px（本应 620px，小了一圈）
+            #   y_ratio    0.251456 * 991           = 249px（本应 259px，整体上移 10px）
+            # 棋盘小 24px、上移 10px，6x6 每格约 100px，等于每格都裁偏 4px 以上。
+            # 结果是整盘读错，但自评分照旧 0.83、unknown_tiles 0——「自信地读错」。
+            # 收紧到 2% 之后这种尺寸会被判成「没有标定」，转而走自愈并按新尺寸
+            # 重新落盘，这才是对的。
+            if score > WINDOW_MATCH_TOLERANCE:
                 continue
         if best is None or score < best[0]:
             best = (score, rect)

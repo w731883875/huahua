@@ -198,6 +198,21 @@ STATE_COLORS = {
     TileState.UNKNOWN: "#b33030",
 }
 
+#: 「虚空上的等级光环」用的颜色，按 ``frame_level.HUE_WINDOWS`` 的色相配：
+#: Lv3 青蓝(95~122) / Lv4 紫(132~162) / Lv5 橙(10~24) / Lv6 红(168~180 + 0~8)。
+#:
+#: 为什么要单独画：颜料落到虚空后失去自身内容、退化成笔触效果，画面上只剩底色
+#: 和一圈等级光环（用户 2026-11-24 口径，实测一般 3-5 级）。这格没有颜料，
+#: 原来只画一个「虚」字，玩家看不出这里还挂着笔触效果。
+AURA_LEVEL_COLORS = {
+    3: "#3aa6ff",
+    4: "#b45cf0",
+    5: "#ff8a1f",
+    6: "#ff3b3b",
+}
+#: 等级读不出来时的兜底色（中性紫），照样要把「有光环」这件事画出来。
+AURA_UNKNOWN_COLOR = "#8a7cff"
+
 NOTICE_STYLES = {
     "info": ("#18324a", "#d7e3ee"),
     "success": ("#123d30", "#c8ffe8"),
@@ -5191,6 +5206,37 @@ class HuahuaApp(tk.Tk):
                         font=("Microsoft YaHei UI", 12, "bold"),
                         justify=tk.CENTER,
                     )
+                    # 颜料落到虚空后只剩底色 + 等级光环：这格没有颜料，光一个「虚」字
+                    # 看不出它还挂着笔触效果（用户 2026-11-24：「只有虚字，无其他任何
+                    # 东西，不行」）。先把环画出来，再在右下补等级。
+                    #
+                    # 观测和模型两边都取：某一帧漏读时另一边的值还在，不至于闪烁。
+                    retained_aura = max(
+                        float(getattr(tile, "retained_aura", 0.0) or 0.0),
+                        float(getattr(model_tile, "retained_aura", 0.0) or 0.0),
+                    )
+                    if retained_aura > 0:
+                        retained_level = getattr(tile, "retained_aura_level", None)
+                        if retained_level is None:
+                            retained_level = getattr(model_tile, "retained_aura_level", None)
+                        aura_color = AURA_LEVEL_COLORS.get(retained_level, AURA_UNKNOWN_COLOR)
+                        inset = max(6, int(cell * 0.10))
+                        self.canvas.create_oval(
+                            x1 + inset,
+                            y1 + inset,
+                            x2 - inset,
+                            y2 - inset,
+                            outline=aura_color,
+                            width=max(3, int(cell * 0.05)),
+                        )
+                        self._draw_chip(
+                            x2 - 4,
+                            y2 - 4,
+                            f"环L{retained_level}" if retained_level else "环",
+                            fill=aura_color,
+                            fg="#101820",
+                            font_size=8,
+                        )
                 if paint_drawn and (row, col) in scope_cells:
                     # 图标是彩色的，作用范围那圈金色细线会被盖住：重描一次。
                     self.canvas.create_rectangle(

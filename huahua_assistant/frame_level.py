@@ -84,6 +84,27 @@ HUE_WINDOWS: dict[int, tuple[int, int]] = {
 }
 #: 色相峰值的圆周平滑核，避免红色跨 0/180 边界被切开。
 _HUE_SMOOTH_KERNEL = np.array([1, 2, 3, 4, 5, 4, 3, 2, 1], dtype=np.float64)
+#: 红色跨 0/180 边界：Lv6 的纯红实测色相**同时**落在 168~180 和 0~8。
+#:
+#: 只在 ``HUE_WINDOWS[6]`` 里写 ``(168, 180)`` 是错的，会把一半纯红判成
+#: 「不在任何窗口」——2026-11-24 实机 c5r4 真 Lv6 就是这样：边框像素里
+#: hue=179 出现 1020 次、hue=0 出现 1009 次，两边几乎对半，平滑后的峰值
+#: 落到 0 → ``_level_for_hue`` 返回 None → 退到角标那一路给了 4，
+#: 玩家看到的就是「6 级识别成 4 级」。
+RED_HUE_WRAP_MAX = 8
+
+
+def hue_matches_level(hue: np.ndarray | int, level: int) -> np.ndarray | bool:
+    """``hue`` 是否落在 ``level`` 的色相窗口里（Lv6 红色按跨 0/180 处理）。"""
+    window = HUE_WINDOWS.get(level)
+    if window is None:
+        return np.zeros(np.shape(hue), dtype=bool) if isinstance(hue, np.ndarray) else False
+    low, high = window
+    if level == 6:
+        # 红：168~180 与 0~8 是同一段色。
+        return (hue >= low) | (hue <= RED_HUE_WRAP_MAX)
+    return (hue >= low) & (hue <= high)
+
 #: 带内饱和像素少于此数就不敢报色相。
 MIN_SATURATED_PIXELS = 20
 
@@ -145,10 +166,17 @@ def frame_stats(tile_bgr: np.ndarray) -> tuple[float, float, int, float, float] 
 
 
 def _level_for_hue(hue: int) -> tuple[int, int] | None:
-    """返回 ``(level, 距窗口边缘的最小距离)``；不在任何窗口内时返回 None。"""
+    """返回 ``(level, 距窗口边缘的最小距离)``；不在任何窗口内时返回 None。
+
+    Lv6 的红色跨 0/180 边界，``HUE_WINDOWS[6] = (168, 180)`` 只覆盖了一半，
+    另一半（0~8）在这里补上，否则纯红会被判成「不在任何窗口」。
+    """
     for level, (low, high) in HUE_WINDOWS.items():
         if low <= hue <= high:
             return level, min(hue - low, high - hue)
+    if hue <= RED_HUE_WRAP_MAX:
+        # 红色绕回 0 侧：按 Lv6 处理，距离取「离 180 有多远」。
+        return 6, 180 - 168 + hue
     return None
 
 

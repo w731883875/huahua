@@ -549,6 +549,14 @@ class HuahuaApp(tk.Tk):
         )
         overlay_check.pack(side=tk.LEFT, padx=(8, 0))
 
+        calibration_btn = tk.Button(
+            primary_row,
+            text="区域标定",
+            command=self.open_region_calibration,
+            width=10,
+        )
+        calibration_btn.pack(side=tk.LEFT, padx=(6, 0))
+
         auto_follow_check = tk.Checkbutton(
             primary_row,
             text="自动跟随",
@@ -1170,6 +1178,107 @@ class HuahuaApp(tk.Tk):
             if index is not None and 1 <= index <= len(paints):
                 return self._screen_point_for_capture_rect(paints[index - 1].slot_rect)
         return None
+
+    def open_region_calibration(self) -> None:
+        """打开「区域标定」：把识别区域画成可拖动的绿框，拖对后固定。
+
+        用户 2026-11-24 要求：绿框显示棋盘、初始颜料的调色范围、两个笔触卡片，
+        能拖到正确位置再固定。
+
+        为什么要它：``layout.json`` 用窗口像素尺寸当键，而同一次运行里完整识别
+        与实时快路径拿到的尺寸并不一致（实测 1602x939 vs 800x469，正好差 2 倍），
+        总有一条匹配不上就退回内置默认比例。默认比例歪一点也能过 presence 检查，
+        于是**裁偏了还读得很自信**——用户看到的就是「第一个初始颜料的等级和范围
+        都错」。区域改用相对比例存盘后，换尺寸自动跟着走。
+        """
+
+        try:
+            from . import region_calibration as calib
+            from . import region_calibration_ui as calib_ui
+        except Exception as exc:  # 标定层出问题不能连累主流程
+            self._set_notice("区域标定打不开：%s" % exc, "error")
+            return
+
+        window = self.last_capture_window
+        capture_size = self.last_capture_size
+        if window is not None and window.width > 0 and window.height > 0:
+            overlay_w, overlay_h = int(window.width), int(window.height)
+        elif capture_size is not None:
+            overlay_w, overlay_h = int(capture_size[0]), int(capture_size[1])
+        else:
+            overlay_w = int(self.winfo_screenwidth())
+            overlay_h = int(self.winfo_screenheight())
+
+        def current_regions() -> dict[str, calib.Region] | None:
+            """按最近一次识别结果给出四块绿框，转成窗口相对比例。"""
+            scene = getattr(self, "current_scene", None)
+            board_rect = None
+            if scene is not None:
+                board_rect = getattr(scene.board, "rect", None)
+            if board_rect is None:
+                return None
+            x1, y1, x2, y2 = self._window_local_rect_from_capture_rect(board_rect)
+            board = calib.Region.from_pixels(
+                "board", x1, y1, x2 - x1, y2 - y1, overlay_w, overlay_h
+            )
+            regions = {
+                "board": board,
+                # 调色范围在识别结果里没有独立矩形，先与棋盘同框，由用户拖到实际范围。
+                "scope": calib.Region(
+                    key="scope",
+                    x_ratio=board.x_ratio,
+                    y_ratio=board.y_ratio,
+                    w_ratio=board.w_ratio,
+                    h_ratio=board.h_ratio,
+                ),
+            }
+            # 笔触卡片：识别结果只有「面板」矩形（panel_rect），卡片矩形没有
+            # 独立落盘。两张卡默认左右各占面板下半，先给个可拖的占位。
+            brush = getattr(self, "_last_brush_observation", None)
+            panel = getattr(brush, "panel_rect", None) if brush is not None else None
+            if panel is not None:
+                px1, py1, px2, py2 = self._window_local_rect_from_capture_rect(panel)
+                pw, ph = px2 - px1, py2 - py1
+                half = max(calib.MIN_SIDE_PX, int(pw / 2) - 6)
+                height = max(calib.MIN_SIDE_PX, int(ph * 0.42))
+                regions["brush_stage1"] = calib.Region.from_pixels(
+                    "brush_stage1", px1 + 6, py1 + ph - height - 6, half, height,
+                    overlay_w, overlay_h,
+                )
+                regions["brush_stage2"] = calib.Region.from_pixels(
+                    "brush_stage2", px2 - 6 - half, py1 + ph - height - 6, half, height,
+                    overlay_w, overlay_h,
+                )
+            return regions
+
+        saved = calib.load_regions()
+        initial = current_regions() or saved or calib.default_regions(overlay_w, overlay_h)
+        # 用户已固定过的区域优先：那是他亲手拖出来的，不该被自动结果覆盖。
+        for key, region in saved.items():
+            initial.setdefault(key, region)
+
+        def on_recalibrate() -> dict[str, calib.Region] | None:
+            updated = current_regions()
+            if updated is None:
+                self._set_notice("还没识别过棋盘，先点「完整识别」再标定。", "warn")
+                return None
+            return updated
+
+        def on_saved(regions: dict[str, calib.Region]) -> None:
+            self.calibrated_regions = dict(regions)
+            self._set_notice(
+                "区域标定已固定：%d 块区域（棋盘/调色范围/2 个笔触卡片）。"
+                % len(regions),
+                "success",
+            )
+
+        self._calibration_overlay = calib_ui.CalibrationOverlay(
+            self,
+            initial,
+            on_recalibrate=on_recalibrate,
+            on_saved=on_saved,
+        )
+        self._set_notice("区域标定已打开：拖动绿框到正确位置，Ctrl+S 固定。", "info")
 
     def toggle_overlay(self) -> None:
         self._destroy_overlay_window()

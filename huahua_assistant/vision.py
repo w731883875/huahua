@@ -31,6 +31,7 @@ from . import paint_icon
 from . import paint_kind
 from . import paint_panel
 from . import presence
+from . import s8_official_data
 from . import tile_reader
 from .models import (
     BackpackObservation,
@@ -6220,20 +6221,24 @@ def _classify_tile_observation(
             paint_subtype = None
             paint_is_treasure = False
             confidence = max(confidence, 0.70)
-    # 玩法颜料的等级下限（用户 2026-11-24 明确的游戏规则）：
-    #   「1 级迷城是不存在，玩法赛季都是从 3-4 级赛季颜料升级到 5 级才会变成其他
-    #     玩法颜料，例如迷城、梦魇等最低都是 5 级！！」
-    # 所以「Lv1 的迷城」这种组合在游戏里根本不存在，出现了就一定是读错。
-    # 这里把不可能的等级降级成「读不出」，交给上层按未知处理，
-    # 而不是把一个不存在的等级写进棋盘——错的等级比没有等级更难排查。
-    if (
-        paint_category is PaintCategory.GAMEPLAY
-        and paint_level is not None
-        and paint_level < GAMEPLAY_MIN_LEVEL
-    ):
-        features["gameplay_level_impossible"] = float(paint_level)
-        paint_level = None
-        paint_level_confidence = 0.0
+    # 等级与家族必须匹配：官方表里家族和等级段是**绑定**的。
+    #
+    # 用户 2026-11-24 明确过这条规则：「1 级迷城是不存在，玩法赛季都是从 3-4 级
+    # 赛季颜料在升级到 5 级才会变成其他玩法颜料，例如迷城、梦魇等最低都是 5 级！！」
+    # 权威数据在 ``s8_official_data.S8_PARTIAL_LEVEL_FAMILIES``：
+    #   赛季 3~4；黑潮/黑帆/魔方/迷城/梦魇/怪谈/玩偶 5~7。
+    # 其余家族（宝箱、存活、各神、全部 MONSTER）都是 1~7 通吃，不受限制。
+    #
+    # **不能按类别一刀切**——第一版写成「GAMEPLAY 一律 >= 5」是错的：
+    # 宝箱/存活/机械之神等 GAMEPLAY 家族本来就存在于 1~4 级，赛季更是只有 3~4 级，
+    # 一刀切会把正常颜料判成「不可能」并抹掉等级。判据必须落到**具体家族**上，
+    # 而且只有查得到家族时才敢判。
+    if paint_level is not None and paint_subtype:
+        allowed_levels = s8_official_data.S8_PARTIAL_LEVEL_FAMILIES.get(paint_subtype)
+        if allowed_levels and paint_level not in allowed_levels:
+            features["paint_level_impossible"] = float(paint_level)
+            paint_level = None
+            paint_level_confidence = 0.0
     return TileObservation(
         row=row,
         col=col,
@@ -6391,16 +6396,6 @@ RETAINED_AURA_CENTER_BRIGHT_MAX = 150.0
 RETAINED_AURA_CONTRAST_MIN = 0.30
 #: 等级光环只认这几个等级。Lv1 银、Lv2 绿在虚空上几乎不出现（用户实测 3-5），#: 而 Lv7 是动画彩虹环，用色相判会误报，一并排除。
 RETAINED_AURA_LEVELS = (3, 4, 5, 6)
-
-
-#: 玩法颜料（迷城、梦魇等）的最低等级。
-#:
-#: 用户 2026-11-24 明确的游戏规则：
-#:   「1 级迷城是不存在，玩法赛季都是从 3-4 级赛季颜料在升级到 5 级才会变成其他
-#:     玩法颜料，例如迷城、梦魇等最低都是 5 级！！」
-#: 也就是说：3~4 级是**赛季颜料**，升到 5 级才转成迷城/梦魇这类玩法颜料。
-#: 所以「Lv1~4 的玩法颜料」在游戏里不存在，读出来就是错的。
-GAMEPLAY_MIN_LEVEL = 5
 
 
 def _tile_retained_aura_score(

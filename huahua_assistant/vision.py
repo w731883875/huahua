@@ -17,7 +17,13 @@ import numpy as np
 from .capture import write_image
 from .game_model import BRUSH_TYPE_ORDER, BrushType, build_affix_catalog
 from .keyword_match import match_keywords
-from .layout import ScreenLayout, load_layout, save_layout
+from .layout import (
+    ScreenLayout,
+    calibrated_layout,
+    last_layout_match,
+    load_layout,
+    save_layout,
+)
 from . import frame_level
 from . import brush_panel
 from . import paint_frame
@@ -499,6 +505,31 @@ def analyze_scene_realtime(
     height, width = image.shape[:2]
     screen = _screen_layout(width, height)
 
+    # 这个窗口尺寸在标定表里**没有任何匹配**时，固定比例候选往往「歪得刚好能过
+    # presence」——于是被当成有效棋盘一路接受，每格都裁偏却读得很自信。
+    #
+    # 2026-11-24 实测：游戏窗口 1536x792，layout.json 里最近的一条是 1522x885，
+    # 偏差分 0.1265 远超阈值 0.08，整盘用内置默认比例（x=0.187/y=0.256/
+    # size=0.594）。自评分 0.83、unknown_tiles 0，但每格读数全错。这就是
+    # 「昨晚稳定、今天全错」的真身：和代码改动无关，是窗口尺寸变了没标定。
+    #
+    # 所以只要没匹配就先自愈一次并落盘。自愈约 1.6 秒，之后同尺寸都走快路径。
+    match = last_layout_match()
+    if match is not None and not match.get("matched"):
+        key = (width, height)
+        # 同尺寸只自愈一次：自愈约 1.5 秒，如果每帧都跑，实时路径直接废掉
+        # （实测 1.47s/帧）。落盘只在界面进程生效（``_LAYOUT_AUTOSAVE``），
+        # 测试和子进程里存不下，所以必须另有进程内缓存兜底。
+        cached = _RECOVERED_LAYOUTS.get(key)
+        if cached is not None:
+            screen = cached
+        else:
+            recovered = _recover_board_rect(image, screen, width, height, drawing=True)
+            if recovered is not None:
+                _remember_board_layout(width, height, recovered)
+                screen = calibrated_layout(width, height, recovered)
+                _RECOVERED_LAYOUTS[key] = screen
+
     active_rect = _pick_board_rect(image, screen, width, height, drawing=True)
     if active_rect is None:
         # 「等待开画」是另一套布局（棋盘居中），必须先试它再自愈。
@@ -847,6 +878,13 @@ def _board_present(image: np.ndarray, rect: Rect, screen: ScreenLayout) -> bool:
 _LAYOUT_CACHE: ScreenLayout | None = None
 #: 上面这份缓存是按哪个窗口尺寸算的。尺寸一变就要重读标定。
 _LAYOUT_CACHE_KEY: tuple[int | None, int | None] | None = None
+#: 本进程内**自愈**出来的布局，按窗口尺寸缓存。
+#:
+#: 为什么需要：某个尺寸在 ``layout.json`` 里没有标定时（换分辨率/拖窗口/改 DPI
+#: 之后很常见），就要跑一次棋盘自愈，而自愈约 1.5 秒。落盘只在界面进程生效
+#: （``_LAYOUT_AUTOSAVE``），测试与子进程存不下，于是「下一帧又发现没标定→
+#: 再自愈一次」，实时路径直接被拖垮（实测 1.47s/帧）。这里兜住同尺寸的重复自愈。
+_RECOVERED_LAYOUTS: dict[tuple[int, int], ScreenLayout] = {}
 _PRESENCE_LOADED = False
 _PRESENCE_TEMPLATE: np.ndarray | None = None
 
@@ -885,6 +923,9 @@ def reset_vision_caches() -> None:
     global _WAITING_BOARD_CACHE
     _LAYOUT_CACHE = None
     _LAYOUT_CACHE_KEY = None
+    # 自愈缓存也要清：布局文件被替换（用户点了重新标定 / 换了标定）之后，
+    # 继续用旧的实测框就是错的。
+    _RECOVERED_LAYOUTS.clear()
     _PRESENCE_LOADED = False
     _PRESENCE_TEMPLATE = None
     _WAITING_BOARD_CACHE = None

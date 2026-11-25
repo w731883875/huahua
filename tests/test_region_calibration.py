@@ -88,6 +88,38 @@ class RegionRoundTripTests(unittest.TestCase):
         self.assertEqual(after[3] - before[3], 40)
 
 
+class MergeRegionTests(unittest.TestCase):
+    """三层合成必须保证四块区域都在。
+
+    用户 2026-11-25 实测：「固定了棋盘和调色区域，但是笔触卡片1、2都未出现」。
+    原因是识别结果只在拿到笔触面板时才带 brush_stage1/2，用 ``or`` 串联会被
+    非空字典短路，默认值整层被跳过。
+    """
+
+    def test_partial_layer_keeps_all_four(self) -> None:
+        partial = {
+            "board": calib.Region.from_pixels("board", 240, 190, 450, 450, 1294, 758),
+            "scope": calib.Region.from_pixels("scope", 260, 210, 410, 410, 1294, 758),
+        }
+        merged = calib.merge_regions(1294, 758, partial)
+        self.assertEqual(set(merged), set(calib.REGION_LABELS))
+        self.assertIn("brush_stage1", merged)
+        self.assertIn("brush_stage2", merged)
+
+    def test_later_layers_win(self) -> None:
+        current = {"board": calib.Region.from_pixels("board", 100, 100, 300, 300, 1294, 758)}
+        saved = {"board": calib.Region.from_pixels("board", 200, 150, 400, 400, 1294, 758)}
+        merged = calib.merge_regions(1294, 758, current, saved)
+        self.assertEqual(merged["board"].to_pixels(1294, 758), (200, 150, 400, 400))
+
+    def test_empty_layers_give_defaults(self) -> None:
+        merged = calib.merge_regions(1294, 758, None, {})
+        self.assertEqual(set(merged), set(calib.REGION_LABELS))
+        defaults = calib.default_regions(1294, 758)
+        for key in calib.REGION_LABELS:
+            self.assertEqual(merged[key], defaults[key])
+
+
 class DefaultAndSaveTests(unittest.TestCase):
     def test_default_regions_cover_all_keys(self) -> None:
         regions = calib.default_regions(1602, 939)

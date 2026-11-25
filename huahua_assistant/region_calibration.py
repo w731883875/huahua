@@ -189,6 +189,23 @@ def default_regions(width: int, height: int) -> dict[str, Region]:
     return {region.key: region for region in (board, scope, stage1, stage2)}
 
 
+def merge_regions(
+    width: int, height: int, *layers: dict[str, Region] | None
+) -> dict[str, Region]:
+    """按「默认 < 自动识别 < 用户固定」三层合成四块区域，**保证四块都在**。
+
+    为什么必须从默认值起步：``Region`` 是逐块覆盖的，任何一层只要「部分给出」
+    （比如识别结果里没有笔触面板，就只有 board/scope 两个键），用 ``or`` 串联
+    就会让后一层整体被跳过。用户 2026-11-25 实测到的正是这个后果——固定了棋盘
+    和调色区域后，**笔触卡片 1、2 都未出现**。
+    """
+    merged = default_regions(width, height)
+    for layer in layers:
+        if layer:
+            merged.update(layer)
+    return merged
+
+
 def load_regions() -> dict[str, Region]:
     """读已固定的标定；文件不存在或坏掉就返回空字典。"""
     if not CALIBRATION_PATH.exists():

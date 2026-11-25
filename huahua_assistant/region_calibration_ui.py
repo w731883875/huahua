@@ -80,12 +80,17 @@ class CalibrationOverlay:
         self.canvas.pack(fill=tk.BOTH, expand=True)
 
         self._place_over_window(parent)
+        # 缺哪块就补默认值：漏画一块会让人以为「这个功能没有它」，而实际上
+        # 只是没拿到初始值（用户 2026-11-25：笔触卡片 1、2 都未出现）。
+        self.regions = calib.merge_regions(self.overlay_w, self.overlay_h, self.regions)
         self._inset_scope_off_board()
         self._active_key = "board"
         self._build_toolbar(parent)
         self._bind_events()
         self.redraw()
         self._hide_parent()
+        if getattr(self, "_game_window_missing", False):
+            self._flash("没找到游戏窗口（最小化了？）已按整屏定位，先把游戏切回来")
 
     # ---- 窗口摆放 ---------------------------------------------------
     def _game_window_rect(self, parent: tk.Misc) -> tuple[int, int, int, int] | None:
@@ -114,14 +119,19 @@ class CalibrationOverlay:
             user32.EnumWindows(enum_proc, 0)
             if target is None:
                 return None
+            # 最小化的窗口不能用来定位：实测 GetWindowRect 会回
+            # (-25600, -25600, 159, 27) —— 位置在屏幕外、尺寸只剩标题栏。
+            # 照着建覆盖层就会得到 159x27 的一小块，四块区域全被最小尺寸夹成
+            # 24x24，看起来就是「绿框全没了」（2026-11-25 实测到）。
+            if user32.IsIconic(target):
+                return None
             rect = wintypes.RECT()
             user32.GetWindowRect(target, ctypes.byref(rect))
-            return (
-                rect.left,
-                rect.top,
-                rect.right - rect.left,
-                rect.bottom - rect.top,
-            )
+            width = rect.right - rect.left
+            height = rect.bottom - rect.top
+            if rect.left <= -20000 or rect.top <= -20000 or width < 320 or height < 240:
+                return None
+            return (rect.left, rect.top, width, height)
         except Exception:
             return None
 
@@ -131,9 +141,11 @@ class CalibrationOverlay:
             width = self.window.winfo_screenwidth()
             height = self.window.winfo_screenheight()
             self.window.geometry("%dx%d+0+0" % (width, height))
+            self._game_window_missing = True
         else:
             left, top, width, height = rect
             self.window.geometry("%dx%d+%d+%d" % (width, height, left, top))
+            self._game_window_missing = False
         # 尺寸直接来自刚算出的值，**不要回读 geometry()**：窗口还没映射时
         # Tk 回的是 "1x1+0+0"，会把整层算成 1x1，四块框全挤在左上角重叠
         # （2026-11-24 冒烟测试踩到过：overlay=1x1，命中测试全落到别的框上）。

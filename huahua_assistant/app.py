@@ -1252,10 +1252,12 @@ class HuahuaApp(tk.Tk):
             return regions
 
         saved = calib.load_regions()
-        initial = current_regions() or saved or calib.default_regions(overlay_w, overlay_h)
-        # 用户已固定过的区域优先：那是他亲手拖出来的，不该被自动结果覆盖。
-        for key, region in saved.items():
-            initial.setdefault(key, region)
+        # 三层优先级：用户亲手固定的 > 当前识别结果 > 内置默认，四块一个都不能少。
+        # 早先写成 ``current_regions() or saved or default_regions(...)``：识别结果
+        # 只在拿到笔触面板时才带 brush_stage1/2，字典非空就把默认值短路掉，于是
+        # 两张笔触卡片整块不画（用户 2026-11-25 实测：「固定了棋盘和调色区域，
+        # 但是笔触卡片1、2都未出现」）。
+        initial = calib.merge_regions(overlay_w, overlay_h, current_regions(), saved)
 
         def on_recalibrate() -> dict[str, calib.Region] | None:
             updated = current_regions()

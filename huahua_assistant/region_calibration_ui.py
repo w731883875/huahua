@@ -3,13 +3,18 @@
 窗口行为
 --------
 * 跟随游戏窗口（``overrideredirect`` + 置顶），坐标系为窗口物理像素；
-* **不抠色、不穿透**——拖动需要接收鼠标。所以它只在标定期间存在，
-  标定完成即销毁，不影响正常识别时那块点击穿透的提示层。
+* **半透明**：整层默认 30% 不透明，游戏画面透过来看得见。一开始这里忘了设
+  ``-alpha``，窗口是不透明纯黑，用户 2026-11-25 报「整块黑屏挡住了游戏」；
+* **可穿透**：按 ``T`` 切成点击穿透，只用来对着游戏核对位置，此时不能拖；
+* 不抠色（``-transparentcolor``）——抠掉的像素会连鼠标一起穿透，那样框内就
+  拖不动了。半透明能在「看得见游戏」和「抓得住框」之间取平衡。
 
 操作
 ----
 * 拖框内部：平移
 * 拖右下角小方块：缩放
+* ``[`` / ``]``：调暗 / 调亮（0.05 ~ 0.85）
+* ``T``：切换点击穿透（穿透时只观察，不能拖）
 * ``F5`` / 按钮：重新识别一次并把新结果画上去
 * ``Ctrl+S`` / 按钮：固定（写 ``runtime/calibration.json``）
 * ``Esc``：关闭，不保存
@@ -31,6 +36,12 @@ WHITE = "#eafff0"
 GRIP_SIZE = 10
 DRAG_THRESHOLD = 2
 
+#: 默认不透明度。太低看不见绿框，太高挡住游戏；0.30 实测两边都能用。
+DEFAULT_ALPHA = 0.30
+MIN_ALPHA = 0.05
+MAX_ALPHA = 0.85
+ALPHA_STEP = 0.07
+
 
 class CalibrationOverlay:
     """标定用覆盖层。``parent`` 是 Tk 根窗口。"""
@@ -47,11 +58,21 @@ class CalibrationOverlay:
         self.on_recalibrate = on_recalibrate
         self.on_saved = on_saved
         self._drag: dict[str, object] | None = None
+        self._alpha = DEFAULT_ALPHA
+        self._clickthrough = False
+        self._parent = parent
+        self._parent_state: str | None = None
 
         self.window = tk.Toplevel(parent)
         self.window.overrideredirect(True)
         self.window.attributes("-topmost", True)
         self.window.configure(bg=GREEN_DIM)
+        # 关键：不设 -alpha 就是一块不透明纯黑，把游戏整个盖住
+        # （用户 2026-11-25 实测反馈）。这里默认 30% 透明。
+        try:
+            self.window.attributes("-alpha", self._alpha)
+        except tk.TclError:
+            pass
 
         self.canvas = tk.Canvas(
             self.window, bg="#000000", highlightthickness=0, cursor="fleur"
@@ -64,6 +85,7 @@ class CalibrationOverlay:
         self._build_toolbar(parent)
         self._bind_events()
         self.redraw()
+        self._hide_parent()
 
     # ---- 窗口摆放 ---------------------------------------------------
     def _game_window_rect(self, parent: tk.Misc) -> tuple[int, int, int, int] | None:
@@ -157,6 +179,9 @@ class CalibrationOverlay:
             ("重新识别 (F5)", self.recalibrate),
             ("固定 (Ctrl+S)", self.save),
             ("关闭 (Esc)", self.close),
+            ("变暗 [", lambda: self.nudge_alpha(-ALPHA_STEP)),
+            ("变亮 ]", lambda: self.nudge_alpha(ALPHA_STEP)),
+            ("穿透 (T)", self.toggle_clickthrough),
         ):
             tk.Button(
                 bar,
@@ -197,6 +222,52 @@ class CalibrationOverlay:
         self._active_key = key
         self.redraw()
 
+    # ---- 透明度 / 穿透 ----------------------------------------------
+    def nudge_alpha(self, delta: float) -> None:
+        """调不透明度。太低看不见绿框，太高挡住游戏，所以给玩家自己调。"""
+        self.set_alpha(self._alpha + delta)
+
+    def set_alpha(self, value: float) -> None:
+        self._alpha = max(MIN_ALPHA, min(MAX_ALPHA, round(value, 3)))
+        try:
+            self.window.attributes("-alpha", self._alpha)
+        except tk.TclError:
+            pass
+        self._flash("不透明度 %.0f%%（[ 变暗 / ] 变亮）" % (self._alpha * 100))
+
+    def toggle_clickthrough(self) -> None:
+        """切成点击穿透：只用来对着游戏核对位置，穿透时拖不动。"""
+        self._clickthrough = not self._clickthrough
+        self._apply_clickthrough(self._clickthrough)
+        self._flash(
+            "点击穿透：开（只能看，拖不动；再按 T 关）"
+            if self._clickthrough
+            else "点击穿透：关（可以拖框了）"
+        )
+
+    def _apply_clickthrough(self, enabled: bool) -> None:
+        try:
+            import ctypes
+
+            user32 = ctypes.windll.user32
+            GWL_EXSTYLE = -20
+            WS_EX_LAYERED = 0x00080000
+            WS_EX_TRANSPARENT = 0x00000020
+            WS_EX_NOACTIVATE = 0x08000000
+            hwnd = int(self.window.winfo_id())
+            # overrideredirect 的 Toplevel，父窗口才是真正的顶层窗口
+            parent = user32.GetParent(hwnd)
+            target = parent or hwnd
+            style = user32.GetWindowLongW(target, GWL_EXSTYLE)
+            if enabled:
+                style |= WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE
+            else:
+                style &= ~WS_EX_TRANSPARENT
+                style &= ~WS_EX_NOACTIVATE
+            user32.SetWindowLongW(target, GWL_EXSTYLE, style)
+        except Exception:
+            pass
+
     # ---- 事件 -------------------------------------------------------
     def _bind_events(self) -> None:
         self.canvas.bind("<ButtonPress-1>", self._on_press)
@@ -205,6 +276,10 @@ class CalibrationOverlay:
         self.window.bind("<KeyPress-F5>", lambda _e: self.recalibrate())
         self.window.bind("<Control-s>", lambda _e: self.save())
         self.window.bind("<Escape>", lambda _e: self.close())
+        self.window.bind("<KeyPress-bracketleft>", lambda _e: self.nudge_alpha(-ALPHA_STEP))
+        self.window.bind("<KeyPress-bracketright>", lambda _e: self.nudge_alpha(ALPHA_STEP))
+        self.window.bind("<KeyPress-t>", lambda _e: self.toggle_clickthrough())
+        self.window.bind("<KeyPress-T>", lambda _e: self.toggle_clickthrough())
         self.window.focus_force()
 
     def _region_at(self, x: int, y: int) -> tuple[str, str] | None:
@@ -269,6 +344,12 @@ class CalibrationOverlay:
             active = key == self._active_key
             color = GREEN if active else GREEN_DIM
             x, y, w, h = region.to_pixels(self.overlay_w, self.overlay_h)
+            if active:
+                # 只用点阵填充标出「当前编辑」的那块，不整片涂黑，否则又挡住游戏
+                self.canvas.create_rectangle(
+                    x, y, x + w, y + h,
+                    fill=GREEN, stipple="gray12", outline="", tags=("fill", key),
+                )
             self.canvas.create_rectangle(
                 x, y, x + w, y + h,
                 outline=color, width=3 if active else 1, tags=("frame", key),
@@ -297,7 +378,10 @@ class CalibrationOverlay:
         self.canvas.create_text(
             10,
             self.overlay_h - 10,
-            text="绿框=识别区域  |  选「当前编辑」后拖框平移 · 拖右下角缩放  |  F5 重新识别 · Ctrl+S 固定 · Esc 关闭",
+            text=(
+                "绿框=识别区域 | 选「当前编辑」后拖框平移 · 拖右下角缩放 | "
+                "[ ] 调透明度 · T 点击穿透 | F5 重新识别 · Ctrl+S 固定 · Esc 关闭"
+            ),
             fill=WHITE,
             anchor="sw",
             font=("Segoe UI", 9),
@@ -347,9 +431,32 @@ class CalibrationOverlay:
         self.window.after(2600, lambda: self.canvas.delete(item))
 
     def close(self) -> None:
+        self._restore_parent()
         try:
             self.window.destroy()
         except tk.TclError:
+            pass
+
+    def _hide_parent(self) -> None:
+        """标定期间把工具窗口最小化。
+
+        工具窗口和游戏窗口几乎完全重叠（实测工具 958x642 @ (26,26)、游戏
+        1294x758 @ (121,29)），覆盖层置顶后会同时压住两者，玩家既看不全游戏
+        也点不到工具上的按钮，看起来就像「标定不了」。
+        """
+        try:
+            self._parent_state = self._parent.state()
+            if self._parent_state == "normal":
+                self._parent.iconify()
+        except Exception:
+            self._parent_state = None
+
+    def _restore_parent(self) -> None:
+        try:
+            if getattr(self, "_parent_state", None) == "normal":
+                self._parent.deiconify()
+                self._parent.lift()
+        except Exception:
             pass
 
 

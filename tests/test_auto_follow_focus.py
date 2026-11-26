@@ -17,7 +17,7 @@ from unittest.mock import patch
 
 import numpy as np
 
-from huahua_assistant import frame_pump, vision
+from huahua_assistant import capture, frame_pump, vision
 from huahua_assistant.capture import CaptureResult, WindowInfo
 from huahua_assistant.models import Rect
 
@@ -38,22 +38,26 @@ def _window(pid: int = 4242) -> WindowInfo:
 
 class AutoFollowDoesNotStealFocusTests(unittest.TestCase):
     def test_capture_never_activates_the_game_window(self) -> None:
-        """自动跟随截图必须 activate=False，否则每帧抢一次焦点。"""
+        """复用已选中的窗口，不激活窗口，也不重复搜索或重试内容抓取。"""
         with (
-            patch.object(frame_pump, "find_capture_window", return_value=_window()),
+            patch.object(frame_pump, "find_capture_window", return_value=_window()) as find,
             patch.object(frame_pump, "_foreground_allows_capture", return_value=True),
-            patch.object(frame_pump, "capture_window_content", return_value=(None, "test")),
-            patch.object(frame_pump, "capture_target") as capture_target,
+            patch.object(frame_pump, "capture_window_content", return_value=(None, "test")) as content,
+            patch.object(capture, "capture_screen", return_value=np.zeros((60, 80, 3), dtype=np.uint8)),
+            patch.object(capture, "activate_window") as activate,
+            patch.object(capture, "find_matching_windows") as rediscover,
+            patch.object(capture, "resolve_capture_backend", return_value=capture.CaptureBackendPlan(
+                "legacy", (), (capture.LegacyCaptureBackend(),))),
         ):
-            capture_target.return_value = CaptureResult(
-                image=np.zeros((4, 4, 3), dtype=np.uint8), source="test", window=_window()
-            )
-            frame_pump.default_auto_capture()
+            result = frame_pump.default_auto_capture()
 
-        self.assertTrue(capture_target.called)
-        kwargs = capture_target.call_args.kwargs
-        self.assertFalse(kwargs["activate"], "自动跟随不能激活游戏窗口")
-        self.assertEqual(0.0, kwargs["activation_delay"])
+        find.assert_called_once_with()
+        content.assert_called_once_with(_window())
+        activate.assert_not_called()
+        rediscover.assert_not_called()
+        self.assertEqual(result.window, _window())
+        self.assertEqual(result.kind, capture.CAPTURE_KIND_WINDOW_REGION)
+        self.assertEqual(set(result.timings), {"find_window", "window_content", "foreground_check", "window_region", "total"})
 
     def test_window_content_capture_skips_the_foreground_gate(self) -> None:
         """窗口内容抓得到时，前台是别的软件也照样读——遮挡/后台都不再是问题。"""
@@ -62,7 +66,7 @@ class AutoFollowDoesNotStealFocusTests(unittest.TestCase):
             patch.object(frame_pump, "find_capture_window", return_value=_window()),
             patch.object(frame_pump, "_foreground_allows_capture", return_value=False),
             patch.object(frame_pump, "capture_window_content", return_value=(frame, "wgc")),
-            patch.object(frame_pump, "capture_target") as capture_target,
+            patch.object(frame_pump, "capture_window_region") as capture_target,
         ):
             result = frame_pump.default_auto_capture()
 
@@ -76,7 +80,7 @@ class AutoFollowDoesNotStealFocusTests(unittest.TestCase):
             patch.object(frame_pump, "find_capture_window", return_value=_window()),
             patch.object(frame_pump, "_foreground_allows_capture", return_value=False),
             patch.object(frame_pump, "capture_window_content", return_value=(None, "wgc_unavailable")),
-            patch.object(frame_pump, "capture_target") as capture_target,
+            patch.object(frame_pump, "capture_window_region") as capture_target,
         ):
             result = frame_pump.default_auto_capture()
 

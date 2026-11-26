@@ -595,7 +595,9 @@ def _brush_target_proposal(
         )
         setattr(app, "_locked_brush_stage1", best.brush_type)
         index = options.index(best.brush_type)
-        point = _capture_rect_point(app, panel, 0.55, _brush_card_center(index, len(options)))
+        cards = getattr(brush_observation, "card_rects", ())
+        point = (_capture_rect_point(app, cards[index], .5, .5) if index < len(cards)
+                 else _capture_rect_point(app, panel, 0.55, _brush_card_center(index, len(options))))
         if point is None:
             return None
         return TargetProposal(
@@ -620,7 +622,9 @@ def _brush_target_proposal(
         setattr(app, "_locked_brush_stage2", best.affix)
         index = affixes.index(best.affix)
         y_ratio = _brush_card_center(index, len(affixes))
-        point = _capture_rect_point(app, panel, 0.58, y_ratio)
+        cards = getattr(brush_observation, "card_rects", ())
+        point = (_capture_rect_point(app, cards[index], .5, .5) if index < len(cards)
+                 else _capture_rect_point(app, panel, 0.58, y_ratio))
         if point is None:
             return None
         identity = best.affix.canonical_affix_id or best.affix.name

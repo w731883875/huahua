@@ -43,6 +43,75 @@ MAX_ALPHA = 0.85
 ALPHA_STEP = 0.07
 
 
+class AutomaticGeometryOverlay:
+    """Read-only, click-through preview of the current frame's actual rectangles."""
+
+    def __init__(self, parent):
+        from .capture import exclude_tool_windows_from_capture
+        self.parent = parent
+        self.window = tk.Toplevel(parent)
+        self.window.overrideredirect(True)
+        self.window.attributes("-topmost", True)
+        self.window.attributes("-transparentcolor", "#010101")
+        self.canvas = tk.Canvas(self.window, bg="#010101", highlightthickness=0)
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+        self.window.update_idletasks()
+        import ctypes
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetParent(self.window.winfo_id()) or self.window.winfo_id()
+        style = user32.GetWindowLongW(hwnd, -20)
+        user32.SetWindowLongW(hwnd, -20, style | 0x80000 | 0x20 | 0x08000000)
+        exclude_tool_windows_from_capture(parent)
+        self._timer = None
+        self._closed = False
+        self._last_geometry = None
+        self._tick()
+
+    def _tick(self):
+        from .capture import find_capture_window
+        from .models import RegionKind
+        if self._closed:
+            return
+        current = find_capture_window()
+        captured = getattr(self.parent, "last_capture_window", None)
+        scene = getattr(self.parent, "current_scene", None)
+        quality = getattr(self.parent, "last_capture_quality", None)
+        self.canvas.delete("all")
+        if current is not None:
+            if not self.window.winfo_viewable():
+                self.window.deiconify()
+            bounds = f"{current.width}x{current.height}{current.left:+d}{current.top:+d}"
+            if bounds != self._last_geometry:
+                self.window.geometry(bounds)
+                self._last_geometry = bounds
+            same = captured is not None and (captured.hwnd, captured.width, captured.height) == (current.hwnd, current.width, current.height)
+            active = self.parent.auto_follow_var.get() and not getattr(self.parent, "_capture_foreground_paused", False)
+            if same and active and scene is not None and quality is not None:
+                rects = [("棋盘", scene.board.rect)]
+                for index, kind in enumerate((RegionKind.BRUSH_CARD_1, RegionKind.BRUSH_CARD_2), 1):
+                    region = scene.region(kind)
+                    if region is not None:
+                        rects.append((f"笔触卡片 {index}", region.rect))
+                for label, rect in rects:
+                    x1, y1, x2, y2 = self.parent._window_local_rect_from_capture_rect(rect)
+                    self.canvas.create_rectangle(x1, y1, x2, y2, outline=GREEN, width=2)
+                    self.canvas.create_text(x1+5, y1+5, text=label, anchor="nw", fill=GREEN, font=("Microsoft YaHei UI", 11, "bold"))
+            else:
+                self.canvas.create_text(20, 50, text="正在自动重新定位…", anchor="nw", fill=GREEN)
+        else:
+            self.window.withdraw()
+        self._timer = self.window.after(200, self._tick)
+
+    def close(self):
+        self._closed = True
+        try:
+            if self._timer is not None:
+                self.window.after_cancel(self._timer)
+            self.window.destroy()
+        except tk.TclError:
+            pass
+
+
 class CalibrationOverlay:
     """标定用覆盖层。``parent`` 是 Tk 根窗口。"""
 

@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>画画助手 · 存档状态回放</title>
+<style>
+:root{color-scheme:light;--ink:#172e33;--muted:#617578;--paper:#f2f5f3;--line:#dce5e0;--accent:#146953;--warn:#975400}
+*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:14px/1.6 "Microsoft YaHei",system-ui,sans-serif}button,select,input{font:inherit}button,select{border:1px solid var(--line);border-radius:8px;padding:8px 12px;background:white;color:var(--ink)}button{cursor:pointer}button:hover{border-color:var(--accent)}button:disabled{opacity:.4;cursor:default}:focus-visible{outline:3px solid #43a68b;outline-offset:2px}h1,h2,h3,p{margin:0}h1{font-size:26px;letter-spacing:.02em}h2{font-size:17px}h3{font-size:14px}small,.muted{color:var(--muted)}header{background:#173d37;color:#fff;padding:24px max(24px,calc((100vw - 1400px)/2))}header p{color:#c6dad4;margin-top:5px}.eyebrow{font-size:11px;letter-spacing:.18em;color:#91bcb0;margin-bottom:6px}.shell{max-width:1450px;margin:auto;padding:22px 24px 38px}.topbar{display:flex;gap:18px;justify-content:space-between;align-items:center;margin-bottom:18px}.topbar select{min-width:310px;max-width:100%}.source-summary{font-size:12px;color:var(--muted);text-align:right}.layout{display:grid;grid-template-columns:minmax(480px,1.2fr) minmax(330px,1fr);gap:20px;align-items:start}.card{background:#fff;border:1px solid var(--line);border-radius:14px;padding:20px}.board-card{position:sticky;top:16px}.card-heading{display:flex;justify-content:space-between;gap:8px;align-items:center;margin-bottom:14px}.tag{display:inline-block;border-radius:6px;padding:2px 7px;background:#e8f1ed;color:var(--accent);font-size:12px}.stats{display:flex;gap:7px;flex-wrap:wrap;margin-top:8px}.board{display:grid;grid-template-columns:20px repeat(6,minmax(0,1fr));gap:5px;margin:10px 0 12px}.axis{text-align:center;align-self:center;color:#7a898b;font-size:11px}.cell{min-width:0;aspect-ratio:1.05;border:1px solid #dbe4df;border-radius:9px;display:flex;flex-direction:column;justify-content:center;align-items:center;position:relative;gap:1px;line-height:1.35;overflow:hidden;padding:5px 2px}.cell .name{font-size:12px;text-align:center;word-break:break-all}.cell .level{font-size:20px;font-weight:700}.cell .extra{font-size:10px;max-width:100%;text-align:center}.cell.blank{background:#f6f8f6;color:#8a9891}.cell.void{background:#dce5e2;color:#748880}.cell.blocked{background:repeating-linear-gradient(135deg,#526963,#526963 6px,#4b625c 6px,#4b625c 12px);color:white}.cell.faded{background:#eee6f2;color:#7d598a}.cell.monster{background:#fcf0e7;border-color:#efcbb1;color:#8a451b}.cell.gameplay{background:#e7f0fc;border-color:#bfd6f2;color:#2e5a87}.cell.unknown{background:#faf1d6;color:#8c6d1d}.cell.changed{outline:3px solid #238566;outline-offset:-3px}.cell.conflict:after{content:"!";position:absolute;top:2px;right:3px;border-radius:50%;background:#a34c21;color:white;width:14px;height:14px;text-align:center;font-size:10px}.cell.anchor:before{content:"初";position:absolute;left:3px;top:2px;font-size:10px;opacity:.65}.legend{display:flex;gap:12px;flex-wrap:wrap;font-size:11px;color:var(--muted);margin-bottom:14px}.dot{display:inline-block;width:9px;height:9px;margin-right:4px;border-radius:2px}.slider{width:100%;accent-color:var(--accent);margin:12px 0 6px}.time-line{display:flex;justify-content:space-between;gap:8px;font-size:12px;color:var(--muted)}.controls{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:14px 0 8px}.controls button{padding:7px 10px}.primary{background:var(--accent);border-color:var(--accent);color:white}.controls select{padding:7px 5px;max-width:140px}.play-note{font-size:11px;color:var(--muted)}.step-title{font-weight:600;font-size:16px;margin-bottom:4px}.side{display:flex;flex-direction:column;gap:14px}.section{padding:16px 18px}.section h2{margin-bottom:9px}.kv{display:grid;grid-template-columns:80px 1fr;gap:4px 10px}.kv dt{color:var(--muted)}.kv dd{margin:0;overflow-wrap:anywhere}.kv{margin:0}.rule{margin:10px 0;padding:10px 12px;border-left:3px solid #b9cfc4;background:#f3f7f4}.chips{display:flex;gap:5px;flex-wrap:wrap}.chip{display:inline-block;background:#f0f3f1;padding:3px 7px;border-radius:6px;font-size:12px}.brush-block{display:grid;gap:5px;margin-top:8px}.changes{list-style:none;padding:0;margin:0;max-height:240px;overflow:auto}.changes li{border-top:1px solid #edf0ee;padding:8px 0;font-size:12px}.changes li:first-child{border:0}.coord{display:inline-block;font-weight:700;margin-right:8px;color:var(--accent)}.arrow{color:#8b9d96;padding:0 6px}.warning{color:var(--warn);background:#fff8e9;border-color:#ead9b2}.warning h2{color:#815009}.warning ul{padding-left:20px;margin:7px 0 0;font-size:12px}.event{padding:8px 0;border-top:1px solid var(--line);font-size:12px}.event:first-child{border:0}.event small{display:block}.backpack{max-height:140px;overflow:auto}.details{margin-top:14px;font-size:12px}summary{cursor:pointer;color:var(--muted)}pre{white-space:pre-wrap;word-break:break-word;font:11px/1.5 Consolas,monospace;background:#f5f7f5;padding:10px;border-radius:7px;max-height:280px;overflow:auto}.notes{margin:16px 0 0;padding:15px 18px;border:1px solid var(--line);border-radius:12px;color:var(--muted);font-size:12px}.notes ul{padding-left:18px;margin:7px 0 0}.notes li{margin:3px 0}.audit{margin-top:18px}.audit p{margin-top:6px}.empty{font-size:12px;color:var(--muted)}a{color:var(--accent)}footer{font-size:11px;color:var(--muted);margin-top:20px}
+@media(min-width:1450px){.cell{aspect-ratio:1.2}.board-card{max-width:750px}}
+@media(max-width:950px){.layout{grid-template-columns:1fr}.board-card{position:static;max-width:670px;width:100%;margin:auto}.side{display:grid;grid-template-columns:1fr 1fr}.topbar{align-items:flex-start}.source-summary{max-width:270px}}
+@media(max-width:600px){header{padding:18px}h1{font-size:23px}.shell{padding:14px 10px}.topbar{display:block}.source-summary{text-align:left;max-width:none;margin-top:8px}.topbar select{min-width:0;width:100%}.side{display:flex}.card{padding:14px}.board{gap:4px;grid-template-columns:14px repeat(6,minmax(0,1fr))}.cell{aspect-ratio:.92}.cell .name{font-size:10px}.cell .level{font-size:17px}.cell .extra{font-size:8px}.controls button{padding:6px 8px}}
+</style>
+<style>
+.capacity-table{width:100%;border-collapse:collapse;margin:8px 0;font-size:13px}.capacity-table th,.capacity-table td{text-align:center;padding:7px 5px;border-bottom:1px solid var(--line)}.capacity-table th:first-child,.capacity-table td:first-child{text-align:left}.capacity-lines{display:flex;flex-direction:column;gap:5px;max-height:180px;overflow:auto;margin-top:9px}.capacity-lines button{text-align:left;padding:6px 9px;font-size:12px}.capacity-lines button[aria-pressed="true"]{background:#eee8fa;border-color:#8261aa;color:#62458c}.cell.line-cell{box-shadow:inset 0 0 0 4px #9673c3}.capacity-note{font-size:11px;color:var(--muted);margin-top:7px}#line-type{font-size:12px;padding:5px 8px}
+</style>
+</head>
+<body>
+<header><div class="eyebrow">HUAHUA / ARCHIVE REPLAY</div><h1>存档状态回放</h1><p>沿着已保存的局面，逐帧回看棋盘、颜料和笔触变化。</p></header>
+<main class="shell">
+  <div class="topbar"><div><label for="run-select">选择对局（首帧时间）</label><br><select id="run-select"></select></div><p class="source-summary" id="source-summary"></p></div>
+  <div class="layout">
+    <section class="card board-card" aria-label="棋盘回放">
+      <div class="card-heading"><h2>棋盘 · 6 × 6</h2><span class="tag" id="frame-number"></span></div>
+      <div class="step-title" id="step-title" aria-live="polite"></div>
+      <div class="stats" id="board-stats"></div>
+      <div class="board" id="board" role="group" aria-label="已记录的棋盘"></div>
+      <div class="legend"><span><i class="dot" style="background:#efcbb1"></i>怪物</span><span><i class="dot" style="background:#bfd6f2"></i>玩法</span><span><i class="dot" style="border:2px solid #238566"></i>本帧变化</span><span>! 明细冲突</span><span>初：记录的初始位置</span></div>
+      <div class="time-line"><span id="step-time"></span><span id="step-gap"></span></div>
+      <input id="timeline" class="slider" type="range" min="0" max="0" value="0" aria-label="快照进度">
+      <div class="controls"><button id="first" title="第一帧">首帧</button><button id="prev">上一帧</button><button id="play" class="primary">播放</button><button id="next">下一帧</button><button id="last">末帧</button><select id="speed" aria-label="每帧播放时间"><option value="1500">1.5 秒 / 帧</option><option value="800">0.8 秒 / 帧</option><option value="3000">3 秒 / 帧</option></select></div>
+      <p class="play-note">播放按固定间隔推进；快照数不等于操作次数。支持 ← → 逐帧查看。</p>
+      <div class="notes"><strong>本局记录范围</strong><ul id="run-notes"></ul></div>
+      <details class="details"><summary>查看这帧的数据来源</summary><p id="provenance"></p><pre id="raw-step"></pre></details>
+    </section>
+    <div class="side">
+      <section class="card section"><h2>横 · 竖 · 斜连线容量</h2><p class="empty">整条线的空白格＋同类已安装颜料；中间异类或空洞不切段。</p><table class="capacity-table"><thead><tr><th>类型</th><th>4 格线</th><th>5 格线</th><th>6 格线</th></tr></thead><tbody id="capacity-counts"></tbody></table><p class="capacity-note" id="capacity-quality"></p><label for="line-type">查看位置 </label><select id="line-type"><option value="monster">怪物可用线</option><option value="gameplay">玩法可用线</option></select><div id="capacity-lines" class="capacity-lines"></div><p class="capacity-note">点选直线，紫色框标出对应可用格。空白格可同时计入两类，条数不能相加；这不是待安装空位数。</p></section>
+      <section class="card section"><h2>初始颜料与笔触</h2><div id="paint-title"></div><div class="rule" id="paint-rule"></div><dl class="kv" id="resources"></dl><div id="brush" class="brush-block"></div></section>
+      <section class="card section"><h2>上一帧调色范围的等级核对</h2><p class="empty" id="scope-note"></p><div id="scope-effects"></div></section>
+      <section class="card section"><h2>相邻快照的变化</h2><p class="empty" id="action"></p><ul class="changes" id="changes"></ul></section>
+      <section class="card section warning" id="issues-card"><h2>本帧需要核对</h2><ul id="issues"></ul></section>
+      <section class="card section"><h2>这段时间的笔触与动作日志</h2><p class="empty">仅按时间关联；日志里的推断不代表实际点击。</p><div id="events"></div></section>
+      <section class="card section"><div class="card-heading"><h2>可见背包</h2><small id="backpack-total"></small></div><div id="backpack" class="chips backpack"></div></section>
+    </div>
+  </div>
+  <details class="card audit"><summary>查看存档核对结果与无法播放的单一局面</summary><div id="audit"></div><div id="excluded"></div></details>
+  <footer id="footer"></footer>
+</main>
+<script id="replay-data" type="application/json">__REPLAY_DATA__</script>
+<script>
+"use strict";
+const data = JSON.parse(document.getElementById('replay-data').textContent);
+const $ = id => document.getElementById(id);
+const el = (tag, text, cls) => {const n = document.createElement(tag);if(text !== undefined)n.textContent=text;if(cls)n.className=cls;return n;};
+const labels = {monster:'怪物',gameplay:'玩法',unknown:'未知',horizontal:'横向',vertical:'纵向',row:'横向',column:'纵向',cross:'十字',diagonal:'对角斜向',all:'全部',global:'全图',adjacent:'相邻',transform:'转锋',stack:'堆砌',spread:'扩散',upgrade:'升级',copy:'复制',none:'无',blocked_tile:'阻挡地块',blank_tile:'空白地块',void_tile:'虚空地块'};
+const name = x => x == null ? '未记录' : labels[x] || String(x);
+const itemName = p => p ? (p.s || name(p.c)+' · 家族未知')+' Lv'+(p.l ?? '?')+(p.t?' · 宝箱':'') : '未记录';
+const choices = a => (a||[]).map(x => typeof x === 'string' ? name(x) : JSON.stringify(x)).join(' / ') || '未记录';
+const fmt = n => Number(n).toFixed(1)+' 秒';
+let runIndex=0, stepIndex=0, timer=null, selectedLine=null;
+const currentRun = () => data.runs[runIndex];
+function stop(){clearInterval(timer);timer=null;$('play').textContent='播放';}
+function show(n){stepIndex=Math.max(0,Math.min(currentRun().steps.length-1,n));render();}
+function manual(n){stop();show(n);}
+function play(){if(timer){stop();return;}if(stepIndex===currentRun().steps.length-1)show(0);$('play').textContent='暂停';timer=setInterval(()=>{show(stepIndex+1);if(stepIndex===currentRun().steps.length-1)stop();},Number($('speed').value));}
+function setList(id,rows){$(id).replaceChildren(...rows.map(text=>el('li',text)));}
+function render(){
+  const r=currentRun(),s=r.steps[stepIndex],st=r.stats,b=s.board||{};
+  $('timeline').max=r.steps.length-1;$('timeline').value=stepIndex;
+  $('frame-number').textContent=`快照 ${stepIndex+1} / ${r.steps.length}`;
+  $('step-title').textContent=s.title;
+  $('step-time').textContent=`${s.clock.slice(11)} · 首帧后 ${fmt(s.offset)}`;
+  $('step-gap').textContent=stepIndex?`与上一帧相隔 ${fmt(s.gap)}`:'第一张已保存局面';
+  $('board-stats').replaceChildren(...[['颜料',b.paint],['空白',b.blank],['阻挡',b.blocked],['虚空',b.void]].map(([k,v])=>el('span',`${k} ${v ?? '?'}`,'tag')));
+  const board=$('board');board.replaceChildren(el('span',''));
+  for(let c=1;c<=6;c++)board.append(el('span',c,'axis'));
+  const changed=new Set(s.changes.map(x=>x.cell)), states=b.states||'',tiles=s.tiles||[];
+  const capacity=s.line_capacity,kind=$('line-type').value;
+  const selected=capacity.lines.find(line=>line.id===selectedLine);
+  const highlighted=new Set(selected?.capacity[kind].cells||[]);
+  for(let row=0;row<6;row++){
+    board.append(el('span',row+1,'axis'));
+    for(let col=0;col<6;col++){
+      const i=row*6+col,t=tiles[i],state=states[i]||'?';
+      const terrain={B:'空白',K:'阻挡',V:'虚空',F:'失色'};
+      const kind=state==='P'?(t?.c==='monster'?'monster':t?.c==='gameplay'?'gameplay':'unknown'):({B:'blank',K:'blocked',V:'void',F:'faded'}[state]||'unknown');
+      const conflict=(state==='P')!==Boolean(t?.c), extra=[];
+      if(t?.b)extra.push(`加成 +${t.b}`);if(t?.au)extra.push(`光环 ${t.au}`);if(t?.ra)extra.push(`保留 ${t.ral ?? '?'}级`);if(t?.t)extra.push('宝箱');
+      const cell=el('div',undefined,'cell '+kind+(changed.has(i)?' changed':'')+(conflict?' conflict':'')+(s.anchor?.[0]===row&&s.anchor?.[1]===col?' anchor':'')+(highlighted.has(i)?' line-cell':''));
+      cell.append(el('span',state==='P'?(t?.s||name(t?.c)+' · 未知'):(terrain[state]||'未知'),'name'));
+      if(state==='P')cell.append(el('span','Lv'+(t?.l??'?'),'level'));
+      if(extra.length)cell.append(el('span',extra.join(' / '),'extra'));
+      const description=`${row+1}行${col+1}列：${state==='P'?itemName(t):terrain[state]||'未知'}${extra.length?'；'+extra.join('；'):''}${conflict?'；地形与颜料明细冲突，明细为 '+itemName(t):''}`;
+      cell.title=description;cell.setAttribute('aria-label',description);board.append(cell);
+    }
+  }
+  $('capacity-counts').replaceChildren();
+  for(const category of ['monster','gameplay']){const row=el('tr');row.append(el('td',name(category)));for(const n of [4,5,6])row.append(el('td',capacity.counts[category].exact[String(n)]));$('capacity-counts').append(row);}
+  $('capacity-quality').textContent=capacity.uncertain_cells.length?`有 ${capacity.uncertain_cells.length} 格需要核对；含未知或冲突的线不计入确定条数，下方保留容量范围。`:'按恰好 4／5／6 格分组，一条 6 格线不再拆成多条短线。';
+  $('capacity-lines').replaceChildren();
+  for(const line of capacity.lines.filter(x=>x.capacity[kind].possible>=4)){
+    const c=line.capacity[kind],first=line.cells[0],last=line.cells[line.cells.length-1];
+    const label=line.direction==='horizontal'?`第 ${Math.floor(first/6)+1} 行`:line.direction==='vertical'?`第 ${first%6+1} 列`:`斜${line.direction==='diagonal_down'?'↘':'↙'} ${Math.floor(first/6)+1}行${first%6+1}列 → ${Math.floor(last/6)+1}行${last%6+1}列`;
+    const blanks=c.cells.filter(i=>states[i]==='B').length,paints=c.known-blanks;
+    const desc=c.known===c.possible?`${paints} 已装＋${blanks} 空白＝${c.known} 格`:`已确认 ${c.known}，最多 ${c.possible} 格（待核对）`;
+    const btn=el('button',`${label} · ${desc}`);btn.setAttribute('aria-pressed',String(selectedLine===line.id));btn.addEventListener('click',()=>{selectedLine=selectedLine===line.id?null:line.id;render();});$('capacity-lines').append(btn);
+  }
+  if(!$('capacity-lines').children.length)$('capacity-lines').append(el('span','当前没有 4 格以上的此类可用线。','empty'));
+  $('first').disabled=$('prev').disabled=stepIndex===0;$('last').disabled=$('next').disabled=stepIndex===r.steps.length-1;
+  const p=s.current||{};$('paint-title').textContent=itemName(p.paint);
+  const effects=p.effects?.length?p.effects:[{direction:p.direction,target:p.target,upgrade:p.upgrade},...(p.extra||[]).map(direction=>({direction,target:p.target,upgrade:p.upgrade}))];
+  $('paint-rule').replaceChildren(...effects.map((e,i)=>el('p',`调色 ${i+1}：${name(e.direction)} · ${name(e.target)} · 规则升级量 ${e.upgrade ?? '未知'}`)));
+  $('paint-rule').append(el('p','面板效果原文：'+(p.effect||'未记录')));
+  $('paint-rule').append(el('p',s.pending?'位置：尚待安装':s.anchor?`记录位置：${s.anchor[0]+1}行${s.anchor[1]+1}列`:'位置：未确认'));
+  const res=s.resources||{};$('resources').replaceChildren();
+  for(const [label,value] of [['强制次数',res.force_remaining],['背包总量',s.backpack?.total]]){$('resources').append(el('dt',label),el('dd',value??'未记录'));}
+  const brush=s.brush||{};$('brush').replaceChildren(el('p','笔触候选：'+choices(brush.stage1)),el('p','存档选择：'+(brush.chosen?name(brush.chosen)+(brush.chosen_source?'（面板识别）':'（旧档值，未验证选择）'):'未记录')),el('p','词缀候选：'+choices(brush.stage2)));
+  const selection=s.selection||{};
+  $('brush').append(el('p','具体词缀：'+(selection.selected||'未知')),el('p',selection.note||'未记录','empty'));
+  if(selection.selected){
+    const ids=selection.brush_effect_ids||[];
+    $('brush').append(el('p','笔触效果 ID：'+(selection.brush_effect_id!=null?selection.brush_effect_id:ids.length?'无法唯一确定，候选 '+ids.join(' / '):'未记录或未识别')));
+    if(ids.length)$('brush').append(el('small','由识别到的卡片文字对应官方笔触表；选择来源见下方。'));
+  }
+  if(selection.source)$('brush').append(el('small','来源：'+({captured_click:'卡片点击＋面板关闭',buffered_click:'缓冲点击与卡片文字对应',effect_inference:'按后续效果推断'}[selection.source]||selection.source)));
+  if(s.active_affix)$('brush').append(el('p','模型保留词缀：'+s.active_affix.name+'（不作为点击证据）','empty'));
+  const scope=s.scope_comparison||{};
+  $('scope-note').textContent=scope.note||'没有可比较的范围。';$('scope-effects').replaceChildren();
+  if(scope.anchor)$('scope-effects').append(el('p',`上一帧位置：${scope.anchor[0]+1}行${scope.anchor[1]+1}列`));
+  for(const e of scope.effects||[]){
+    const box=el('div',undefined,'event');
+    box.append(el('strong',`调色 ${e.ordinal}：${name(e.direction)} · ${name(e.target)} · 规则 +${e.upgrade??'?'}`));
+    if(!e.available)box.append(el('p','方向或目标信息不足，无法核对等级。','empty'));
+    else{
+      box.append(el('p',`等级读数：上升 ${e.increased} · 相同 ${e.unchanged} · 下降 ${e.decreased} · 待核对 ${e.uncertain_cells.length}`));
+      const list=el('ul',undefined,'changes');
+      for(const t of e.targets){const status={increased:'读数上升',unchanged:'读数相同',decreased:'读数下降',uncertain:'身份、等级或采集间隔待核对'}[t.status];list.append(el('li',`${Math.floor(t.cell/6)+1}行${t.cell%6+1}列 · ${t.name||name(t.category)+'家族未知'}：Lv${t.before??'?'} → Lv${t.after??'?'}（${status}）`));}
+      if(!e.targets.length)list.append(el('li','范围内没有可比较的已安装目标颜料。'));box.append(list);
+    }
+    $('scope-effects').append(box);
+  }
+  const confidence=s.inferred_action.confidence;
+  $('action').textContent='旧记录的动作推断：'+s.inferred_action.label+(confidence==null?'':`（评分 ${Number(confidence).toFixed(2)}）`)+'。';
+  $('changes').replaceChildren();
+  if(!s.changes.length)$('changes').append(el('li',stepIndex?'本帧棋盘与颜料明细没有变化。':'首帧之前的变化未记录。'));
+  for(const c of s.changes){const li=el('li');li.append(el('span',`${c.row}行${c.col}列`,'coord'),el('span',c.before),el('span','→','arrow'),el('span',c.after));if(c.detail_only)li.append(el('small',' · 仅补全家族名称'));$('changes').append(li);}
+  $('issues-card').hidden=!s.issues.length;setList('issues',s.issues);
+  $('events').replaceChildren();
+  if(!s.events.length)$('events').append(el('p','没有可关联的笔触或动作日志。','empty'));
+  for(const e of s.events){const box=el('div',`首帧后 ${fmt(e.offset)} · ${e.label}`,'event');box.append(el('small',e.evidence),el('small',`录制会话 ${e.session} · ${e.line?'auto_run_records.jsonl 第 '+e.line+' 行':'随本帧保存的事件 #'+e.sequence}`));$('events').append(box);}
+  $('backpack-total').textContent=`本帧可见 ${(s.backpack_visible||[]).length} 项`;
+  $('backpack').replaceChildren(...(s.backpack_visible||[]).map(p=>el('span',`#${Number(p.i)+1} ${itemName(p)}`,'chip')));
+  if(!(s.backpack_visible||[]).length)$('backpack').append(el('span','未记录可见背包项','empty'));
+  setList('run-notes',r.notes);
+  $('source-summary').textContent=`${r.first_clock} — ${r.last_clock.slice(11)}（北京时间）\n${st.snapshot_count} 张快照 · ${st.board_changes} 帧棋盘变化 · 最大间隔 ${fmt(st.max_gap)}`;
+  $('provenance').textContent=`轨迹：high_score_trajectories.jsonl 第 ${s.evidence.archive_line} 行，第 ${s.evidence.archive_step+1} 个快照；采集：observations.jsonl ${s.evidence.observation_lines.length?'第 '+s.evidence.observation_lines.join('、')+' 行':'未找到同局一致记录'}。`;
+  $('raw-step').textContent=JSON.stringify(s,null,2);
+  $('audit').replaceChildren(el('p',`本局 ${st.corroborated}/${st.snapshot_count} 帧与同局采集日志的棋盘和颜料明细一致；${st.missing_family} 帧缺少初始颜料家族，${st.missing_rule} 帧缺少作用规则，${st.conflict_frames} 帧存在地形与颜料明细冲突。`));
+  $('audit').append(el('p',`应用会话 ${r.session}；同期笔触卡片点击记录 ${st.click_records} 条。`));
+  for(const c of r.recorder_checks){$('audit').append(el('p','同期录制会话 '+c.session+'：'+(c.issues.length?c.issues.join('；'):'录制器内部检查未发现断链，不能据此证明没有漏采。')));}
+}
+data.runs.forEach((r,i)=>{const opt=el('option',`${r.first_clock} · ${r.stats.snapshot_count} 帧`);opt.value=i;$('run-select').append(opt);});
+$('run-select').addEventListener('change',()=>{stop();selectedLine=null;runIndex=Number($('run-select').value);show(0);});
+$('line-type').addEventListener('change',()=>{selectedLine=null;render();});
+$('timeline').addEventListener('input',()=>manual(Number($('timeline').value)));
+$('first').addEventListener('click',()=>manual(0));$('last').addEventListener('click',()=>manual(currentRun().steps.length-1));
+$('prev').addEventListener('click',()=>manual(stepIndex-1));$('next').addEventListener('click',()=>manual(stepIndex+1));$('play').addEventListener('click',play);
+$('speed').addEventListener('change',()=>{if(timer){stop();play();}});
+document.addEventListener('keydown',e=>{if(['INPUT','SELECT','TEXTAREA','BUTTON'].includes(e.target.tagName)||e.altKey||e.ctrlKey||e.metaKey)return;if(e.key==='ArrowLeft'||e.key==='ArrowRight'){e.preventDefault();manual(stepIndex+(e.key==='ArrowRight'?1:-1));}});
+document.addEventListener('visibilitychange',()=>{if(document.hidden)stop();});
+for(const x of data.excluded_single_state){$('excluded').append(el('p',`${x.session} · ${x.snapshot_count} 张快照 · ${x.reason}`));}
+$('footer').textContent=`生成于 ${data.generated_at.slice(0,19).replace('T',' ')}（北京时间） · 所有未知值保持原样；页面可离线打开。`;
+render();
+</script>
+</body>
+</html>

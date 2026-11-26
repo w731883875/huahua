@@ -33,6 +33,7 @@ from . import paint_panel
 from . import presence
 from . import s8_official_data
 from . import tile_reader
+from . import geometry
 from .models import (
     BackpackObservation,
     BackpackPaintObservation,
@@ -126,6 +127,77 @@ class VisionTracker:
         self.board_rect: Rect | None = None
         self.last_scene: SceneObservation | None = None
         self.frame_size: tuple[int, int] | None = None
+        self.layout_generation = 0
+        self._capture_key = None
+        self._grid: geometry.GridGeometry | None = None
+        self._viewport = None
+        self._pending_hint: Rect | None = None
+
+    def _invalidate_geometry(self) -> None:
+        self.board_rect = None
+        self.last_scene = None
+        self._grid = None
+        self.layout_generation += 1
+        brush_panel.reset_cache()
+        paint_panel.reset_async_state()
+
+    def set_capture_context(self, capture) -> None:
+        """A replacement HWND or capture backend invalidates all pixel caches."""
+        window = capture.window
+        key = (window.hwnd, window.process_id, capture.kind) if window is not None else (None, capture.kind)
+        viewport = geometry.capture_viewport(capture)
+        if viewport is not None and self._viewport is not None and viewport != self._viewport and self.board_rect is not None:
+            self._pending_hint = geometry.map_rect(self.board_rect, self._viewport, viewport)
+        if self._capture_key is not None and key != self._capture_key:
+            self._invalidate_geometry()
+            self._pending_hint = None
+        self._capture_key = key
+        self._viewport = viewport
+
+    def _prepare_frame(self, image: np.ndarray) -> bool:
+        changed = self._frame_size_changed(image)
+        if changed:
+            self._invalidate_geometry()
+            _RECOVER_ATTEMPTS.pop(self.frame_size, None)
+        return changed
+
+    def _analyze_geometry(self, image: np.ndarray, *, full: bool = False) -> SceneObservation | None:
+        if not _is_supported_scene_image(image):
+            return None
+        hint = self._pending_hint or (self.board_rect if self._grid is not None else None)
+        self._pending_hint = None
+        grid = geometry.refine_grid(image, hint) if hint is not None else None
+        if grid is None:
+            grid = geometry.locate_grid(image)
+        if grid is None or grid.confidence < .20 or not _board_cells_look_flat(image, grid.rect):
+            return None
+        score = _score_board_rect(image, grid.rect)
+        start_button = _find_start_drawing_button_fast(image)
+        if score < (.56 if start_button is not None else .68):
+            return None
+        if self.board_rect is not None:
+            old, new = self.board_rect, grid.rect
+            moved = max(abs(old.x-new.x), abs(old.y-new.y), abs(old.w-new.w), abs(old.h-new.h)) > 3
+            if moved:
+                self._invalidate_geometry()
+        self._grid = grid
+        if start_button is not None:
+            scene = _analyze_start_drawing_scene(image, grid.rect, start_button,
+                                                previous_scene=self.last_scene, board_score=score)
+        else:
+            scene = _analyze_scene_from_board_rect(image, grid.rect, fast=True, quick=not full,
+                                                 previous_scene=self.last_scene, board_score=score,
+                                                 icon_fallback=full)
+        if scene is None:
+            return None
+        height, width = image.shape[:2]
+        scene = replace(scene, layout={"width": width, "height": height,
+                        "matched": True, "fallback_to_default": False,
+                        "source": "image_grid", "generation": self.layout_generation,
+                        "grid_support": round(grid.confidence, 4),
+                        "rect": [grid.rect.x, grid.rect.y, grid.rect.w, grid.rect.h]})
+        self.board_rect, self.last_scene = scene.board.rect, scene
+        return scene
 
     def _frame_size_changed(self, image: np.ndarray) -> bool:
         """窗口尺寸变了吗（拖窗口 / 最大化 / 换分辨率 / 改 DPI）。
@@ -142,6 +214,12 @@ class VisionTracker:
         return changed
 
     def analyze(self, image: np.ndarray) -> SceneObservation | None:
+        self._prepare_frame(image)
+        adaptive = self._analyze_geometry(image, full=True)
+        if adaptive is not None:
+            return adaptive
+        if self._grid is not None:
+            self._invalidate_geometry()
         scene = analyze_scene(image, previous_board_rect=self.board_rect)
         if scene is not None:
             self.board_rect = scene.board.rect
@@ -149,7 +227,7 @@ class VisionTracker:
         return scene
 
     def analyze_quick(self, image: np.ndarray) -> SceneObservation | None:
-        if self._frame_size_changed(image):
+        if self._prepare_frame(image):
             # 快路径会复用上一帧的棋盘矩形。窗口一拖，那个矩形属于旧尺寸，拿它
             # 裁新画面逐格全错位，却仍返回一个「看起来成功」的 scene：自愈分支
             # 永远进不去、标定永远落不了盘（2026-11-15 23:34 实机：1536x877 →
@@ -157,6 +235,12 @@ class VisionTracker:
             # 尺寸一变必须强制重新定位一次，让自愈按新尺寸落盘标定。
             self.board_rect = None
             self.last_scene = None
+            return self.analyze_realtime(image)
+        adaptive = self._analyze_geometry(image)
+        if adaptive is not None:
+            return adaptive
+        if self._grid is not None:
+            self._invalidate_geometry()
             return self.analyze_realtime(image)
         previous_scene = self.last_scene
         scene = analyze_scene_quick(
@@ -179,6 +263,12 @@ class VisionTracker:
         return scene
 
     def analyze_realtime(self, image: np.ndarray) -> SceneObservation | None:
+        self._prepare_frame(image)
+        adaptive = self._analyze_geometry(image)
+        if adaptive is not None:
+            return adaptive
+        if self._grid is not None:
+            self._invalidate_geometry()
         scene = analyze_scene_realtime(
             image,
             previous_scene=self.last_scene,
@@ -190,9 +280,11 @@ class VisionTracker:
         return scene
 
     def reset(self) -> None:
-        self.board_rect = None
-        self.last_scene = None
+        self._invalidate_geometry()
         self.frame_size = None
+        self._capture_key = None
+        self._viewport = None
+        self._pending_hint = None
 
 
 def analyze_frame(image: np.ndarray) -> BoardObservation | None:
@@ -291,6 +383,8 @@ def _locate_board_rect(image: np.ndarray) -> tuple[Rect, float] | None:
 
     started = time.perf_counter()
     result = _locate_board_rect_impl(image)
+    # Recursive thumbnail searches must not become the public frame metadata.
+    _screen_layout(image.shape[1], image.shape[0])
     elapsed = time.perf_counter() - started
     if elapsed >= LOCATE_DIAGNOSTIC_SECONDS:
         height, width = image.shape[:2]
@@ -1096,6 +1190,7 @@ def _analyze_scene_from_board_rect(
             if brush_region is not None
             else None
         )
+        brush_options = _with_card_rects(brush_options, regions)
         return SceneObservation(
             board=board,
             regions=regions,
@@ -1109,6 +1204,7 @@ def _analyze_scene_from_board_rect(
     board = _sync_single_anchor_tile_from_current_paint(board, current_paint)
     _learn_kind_from_scene(image, board, current_paint)
     brush_options = _analyze_brush_options(image, regions)
+    brush_options = _with_card_rects(brush_options, regions)
     backpack = _analyze_backpack(image, regions)
     current_paint = _correct_current_target_from_backpack(current_paint, backpack)
     return SceneObservation(
@@ -1118,6 +1214,13 @@ def _analyze_scene_from_board_rect(
         brush_options=brush_options,
         backpack=backpack,
     )
+
+
+def _with_card_rects(observation, regions):
+    if observation is None:
+        return None
+    cards = tuple(r.rect for r in regions if r.kind in (RegionKind.BRUSH_CARD_1, RegionKind.BRUSH_CARD_2))
+    return replace(observation, card_rects=cards)
 
 
 def _correct_current_target_from_backpack(
@@ -1175,6 +1278,10 @@ def _correct_current_paint_from_board_anchor(
 ) -> CurrentPaintObservation | None:
     if current_paint is None:
         return None
+    # An exclamation mark can belong to a previously installed initial paint.
+    # The panel's title identifies the current paint, including its base level.
+    if current_paint.keyword_scores.get("panel_text:identity", 0.0) >= .5:
+        return current_paint
     marked_tiles = [tile for tile in tiles if tile.is_current_anchor]
     if len(marked_tiles) == 1:
         anchor = marked_tiles[0]
@@ -1240,6 +1347,8 @@ def _correct_current_paint_from_scope(
 ) -> CurrentPaintObservation | None:
     if current_paint is None:
         return None
+    if current_paint.keyword_scores.get("panel_text:direction", 0.0) >= .5:
+        return current_paint
     highlighted = [tile for tile in tiles if tile.is_scope_highlight]
     if len(highlighted) < 2:
         return current_paint
@@ -1448,6 +1557,8 @@ def make_debug_image(image: np.ndarray, scene: SceneObservation | BoardObservati
         RegionKind.CURRENT_PAINT: (0, 200, 255),
         RegionKind.BACKPACK: (255, 120, 0),
         RegionKind.BRUSH_OPTIONS: (255, 80, 255),
+        RegionKind.BRUSH_CARD_1: (80, 255, 120),
+        RegionKind.BRUSH_CARD_2: (80, 255, 120),
         RegionKind.CONFIRM_BUTTON: (80, 255, 120),
         RegionKind.START_DRAWING: (255, 210, 80),
         RegionKind.FINISH_DRAWING: (80, 255, 255),
@@ -1546,7 +1657,10 @@ _PANEL_TEXT_MIN_CONFIDENCE = 0.55
 
 def _panel_text_overrides(reading: paint_panel.PanelReading | None) -> dict[str, object]:
     """把「当前颜料」面板读到的字段整理成覆盖项，两条分析路径共用。"""
-    if reading is None or reading.confidence < _PANEL_TEXT_MIN_CONFIDENCE:
+    if reading is None:
+        return {}
+    valid_header = reading.category != PaintCategory.UNKNOWN and reading.subtype and reading.level is not None
+    if reading.confidence < _PANEL_TEXT_MIN_CONFIDENCE and not valid_header:
         return {}
     overrides: dict[str, object] = {}
     if reading.category != PaintCategory.UNKNOWN:
@@ -1615,6 +1729,29 @@ def _current_paint_text_crop(image: np.ndarray, panel: Rect) -> np.ndarray:
         width,
         height,
     )
+    # Locate the pale banner within the search area. The grid gives the scale;
+    # its bright background gives the actual vertical bounds. This excludes
+    # brush cards (including unchosen effects) and animated icon pixels from OCR.
+    probe_left = min(rect.right - 1, max(rect.x, round(panel.x + panel.h)))
+    probe_right = min(rect.right, max(probe_left + 1, round(panel.x + panel.h * 4)))
+    probe = image[rect.y:rect.bottom, probe_left:probe_right]
+    hsv = cv2.cvtColor(probe, cv2.COLOR_BGR2HSV)
+    pale = (hsv[:, :, 1] < 100) & (hsv[:, :, 2] > 160)
+    kernel = max(3, round(panel.h * .03) | 1)
+    profile = np.convolve(pale.mean(axis=1), np.ones(kernel) / kernel, mode="same")
+    spans = []
+    start = None
+    for index, active in enumerate(profile > .32):
+        if active and start is None:
+            start = index
+        if start is not None and (not active or index == len(profile) - 1):
+            if panel.h * .30 <= index - start <= panel.h * 1.60:
+                spans.append((start + rect.y, index + rect.y))
+            start = None
+    if spans:
+        top, bottom = min(spans, key=lambda span: abs((span[0] + span[1]) / 2 - (panel.y + panel.h / 2)))
+        margin = max(3, round(panel.h * .10))
+        return image[max(0, top-margin):min(height, bottom+margin), probe_left:rect.right]
     return image[rect.y : rect.bottom, rect.x : rect.right]
 
 
@@ -1685,6 +1822,10 @@ def _analyze_current_paint(
         match_required = overrides.get("match_required", match_required)  # type: ignore[assignment]
         # 记下「目标类别是文字读出来的」，好让背包排序那条旁证不要再翻案。
         keyword_scores["panel_text:confidence"] = float(panel_text.confidence)
+        if "category" in overrides and "level" in overrides:
+            keyword_scores["panel_text:identity"] = 1.0
+        if "direction" in overrides:
+            keyword_scores["panel_text:direction"] = 1.0
         if "target_object" in overrides:
             keyword_scores["panel_text:target"] = 1.0
 
@@ -1776,10 +1917,18 @@ def _analyze_current_paint_fast(
     keyword_scores.update(_current_paint_raster_target_scores(text_crop))
     signature = _current_panel_signature(text_crop)
     previous_signature = _current_panel_signature_from_scores(previous.keyword_scores) if previous is not None else None
+    # Read first so a new panel also invalidates the previous-frame rule below.
+    panel_text = paint_panel.read_panel_async(_current_paint_text_crop(image, panel))
+    generation = paint_panel.reading_generation()
     panel_changed = (
         previous_signature is not None
         and float(np.mean(np.abs(np.asarray(signature) - np.asarray(previous_signature)))) > 0.045
     )
+    if previous is not None:
+        panel_changed = panel_changed or previous.keyword_scores.get("panel_text:generation", generation) != generation
+        if panel_text is None and previous.keyword_scores.get("panel_text:confidence", 0.0) > 0:
+            panel_changed = True
+    keyword_scores["panel_text:generation"] = float(generation)
     _store_current_panel_signature(keyword_scores, signature)
     detected_target = _infer_target_object(keyword_scores)
     detected_direction = _infer_direction(keyword_scores)
@@ -1814,7 +1963,6 @@ def _analyze_current_paint_fast(
         upgrade_amount = default_upgrade_amount if upgrade_amount is None else upgrade_amount
 
     # 实时帧不能等 OCR：按时间节流，其余帧复用上一次成功的结果。
-    panel_text = paint_panel.read_panel_async(_current_paint_text_crop(image, panel))
     overrides = _panel_text_overrides(panel_text)
     if overrides:
         category = overrides.get("category", category)  # type: ignore[assignment]
@@ -1830,6 +1978,10 @@ def _analyze_current_paint_fast(
         match_required = overrides.get("match_required", match_required)  # type: ignore[assignment]
         # 记下「目标类别是文字读出来的」，好让背包排序那条旁证不要再翻案。
         keyword_scores["panel_text:confidence"] = float(panel_text.confidence)
+        if "category" in overrides and "level" in overrides:
+            keyword_scores["panel_text:identity"] = 1.0
+        if "direction" in overrides:
+            keyword_scores["panel_text:direction"] = 1.0
         if "target_object" in overrides:
             keyword_scores["panel_text:target"] = 1.0
 
@@ -1934,7 +2086,10 @@ def _locate_current_paint_icon(image: np.ndarray, panel: Rect) -> Rect:
         if not 0.28 <= aspect <= 2.20:
             continue
         side = max(w, h_box)
-        if side < panel.h * 0.16 or side > panel.h * 0.62:
+        # Small colored details belong to the artwork/marker, not its frame.
+        # In particular, a blue diamond's red center used to become a tiny
+        # circular crop and turn gameplay paint into monster paint.
+        if side < panel.h * 0.45 or side > panel.h * 0.90:
             continue
         left_bonus = max(0.0, 1.0 - x / max(1, search.w * 0.42))
         shape_score = 1.0 - min(1.0, abs(np.log(max(0.1, aspect))) / 1.4)
@@ -1943,7 +2098,7 @@ def _locate_current_paint_icon(image: np.ndarray, panel: Rect) -> Rect:
 
     if candidates:
         _, (x, y, w, h_box) = max(candidates, key=lambda item: item[0])
-        side = int(np.clip(max(w, h_box) * 1.45, panel.h * 0.24, panel.h * 0.56))
+        side = int(np.clip(max(w, h_box) * 1.10, panel.h * 0.60, panel.h * 0.90))
         cx = search.x + x + w / 2
         cy = search.y + y + h_box / 2
         return _bounded_rect(cx - side / 2, cy - side / 2, side, side, width, height)
@@ -1958,7 +2113,10 @@ def _classify_current_paint_category(image: np.ndarray, icon: Rect) -> tuple[Pai
         return PaintCategory.UNKNOWN, 0.0
 
     frame_category, frame_confidence = _classify_backpack_frame_shape(crop)
-    if frame_category != PaintCategory.UNKNOWN and frame_confidence >= 0.68:
+    if frame_category != PaintCategory.UNKNOWN and (
+        frame_confidence >= 0.68
+        or (frame_category == PaintCategory.GAMEPLAY and frame_confidence >= 0.64)
+    ):
         return frame_category, frame_confidence
 
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
@@ -2694,8 +2852,14 @@ def _analyze_brush_options_realtime(
 
     # 实时帧：面板文字缓存命中就立即用，没命中丢后台线程，这一帧走原来的兜底。
     panel_reading = brush_panel.read_brush_panel_async(crop)
-    if panel_reading is None and previous is not None and previous.panel_rect == panel:
-        return previous
+    # The asynchronous reader already validates text before reusing a result.
+    # Equal panel geometry alone does not mean these are still the same cards.
+    if panel_reading is None and previous is not None:
+        # Keep the live capture path fast while OCR is pending, but expose no
+        # stale names. Clicks can be buffered until these cards are read.
+        return replace(previous, panel_rect=panel, stage1_options=(), stage1_scores={},
+                       chosen_stage1=None, stage2_options=(), stage2_scores={},
+                       keyword_scores={}, confidence=0.0, card_rects=(), reading_pending=True)
     if panel_reading is not None:
         if panel_reading.stage == "direction" and panel_reading.brush_types:
             options = tuple(item.value for item in panel_reading.brush_types)
@@ -2774,6 +2938,7 @@ def _analyze_brush_options_realtime(
         stage2_scores={},
         keyword_scores={},
         confidence=float(np.clip(confidence, 0.0, 1.0)),
+        reading_pending=not stage1_options and panel_reading is None,
     )
 
 
@@ -4594,7 +4759,8 @@ def _estimate_regions(image: np.ndarray, board: BoardObservation) -> list[Region
     # 这里只给笔触面板收窄，``right`` 仍留给背包含义不变（背包要用到窗口右缘）。
     brush_right = _clamp_int(min(right, b.right + b.w * BRUSH_ROI_RIGHT_RATIO + 1), 1, width)
     brush_panel_w = max(1, brush_right - x0)
-    stage_mode = _detect_brush_options_mode(image, x0, b, brush_panel_w)
+    detected_brush = geometry.locate_brush_panel(image, b)
+    stage_mode = detected_brush is not None or _detect_brush_options_mode(image, x0, b, brush_panel_w)
 
     regions: list[RegionObservation] = [
         RegionObservation(
@@ -4696,7 +4862,7 @@ def _estimate_regions(image: np.ndarray, board: BoardObservation) -> list[Region
                 ),
             ]
         )
-    return regions
+    return _attach_card_geometry(regions, detected_brush)
 
 
 def _estimate_regions_fast(image: np.ndarray, board: BoardObservation) -> list[RegionObservation]:
@@ -4710,7 +4876,8 @@ def _estimate_regions_fast(image: np.ndarray, board: BoardObservation) -> list[R
     # 与 ``_estimate_regions`` 同款：笔触面板右边界单独算，不占用背包的 ``right``。
     brush_right = _clamp_int(min(right, b.right + b.w * BRUSH_ROI_RIGHT_RATIO + 1), 1, width)
     brush_panel_w = max(1, brush_right - x0)
-    stage_mode = _detect_brush_options_mode(image, x0, b, brush_panel_w)
+    detected_brush = geometry.locate_brush_panel(image, b)
+    stage_mode = detected_brush is not None or _detect_brush_options_mode(image, x0, b, brush_panel_w)
     regions = [
         RegionObservation(
             kind=RegionKind.CURRENT_PAINT,
@@ -4777,6 +4944,16 @@ def _estimate_regions_fast(image: np.ndarray, board: BoardObservation) -> list[R
                 ),
             ]
         )
+    return _attach_card_geometry(regions, detected_brush)
+
+
+def _attach_card_geometry(regions, detected):
+    if detected is None:
+        return regions
+    panel, cards = detected
+    regions = [replace(r, rect=panel) if r.kind == RegionKind.BRUSH_OPTIONS else r for r in regions]
+    for kind, rect in zip((RegionKind.BRUSH_CARD_1, RegionKind.BRUSH_CARD_2), cards):
+        regions.append(RegionObservation(kind=kind, rect=rect, confidence=.9, label="brush card"))
     return regions
 
 

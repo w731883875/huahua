@@ -94,7 +94,7 @@ class DefaultAutoCaptureTest(unittest.TestCase):
         self._orig = {
             'find_capture_window': fp.find_capture_window,
             'capture_window_content': fp.capture_window_content,
-            'capture_target': fp.capture_target,
+            'capture_window_region': fp.capture_window_region,
             'foreground': fp._foreground_allows_capture,
         }
         self.calls: dict[str, int] = {'target': 0, 'content': 0, 'screen': 0}
@@ -102,15 +102,15 @@ class DefaultAutoCaptureTest(unittest.TestCase):
     def tearDown(self) -> None:
         fp.find_capture_window = self._orig['find_capture_window']
         fp.capture_window_content = self._orig['capture_window_content']
-        fp.capture_target = self._orig['capture_target']
+        fp.capture_window_region = self._orig['capture_window_region']
         fp._foreground_allows_capture = self._orig['foreground']
 
-    def _fake_target(self, **kwargs):
+    def _fake_target(self, window, **kwargs):
         self.calls['target'] += 1
         return cap.CaptureResult(
             image=np.zeros((4, 4, 3), dtype=np.uint8),
-            source='screen:fallback window_capture_failed:Torchlight',
-            window=_window(),
+            source='window-screen:Torchlight method:test',
+            window=window,
         )
 
     # ---- 1. 游戏没开 / 最小化 ----------------------------------------
@@ -143,15 +143,15 @@ class DefaultAutoCaptureTest(unittest.TestCase):
         self.assertFalse(result.trusted_for_automation)
 
     # ---- 4. 窗口内容失败但游戏在前台：允许降级 -------------------------
-    def test_foreground_fallback_still_degrades_to_capture_target(self) -> None:
+    def test_foreground_fallback_captures_only_the_selected_window_region(self) -> None:
         fp.find_capture_window = lambda *a, **k: _window()
         fp.capture_window_content = lambda w: (None, 'failed')
         fp._foreground_allows_capture = lambda w: True
-        fp.capture_target = self._fake_target
+        fp.capture_window_region = self._fake_target
         result = fp.default_auto_capture()
         self.assertEqual(self.calls['target'], 1, '前台降级路径要保留')
-        self.assertEqual(result.kind, cap.CAPTURE_KIND_SCREEN)
-        self.assertFalse(result.trusted_for_automation, '降级出来的整屏图不能自动外发')
+        self.assertEqual(result.kind, cap.CAPTURE_KIND_WINDOW_REGION)
+        self.assertFalse(result.trusted_for_automation, '降级出来的合成画面不能自动外发')
 
 
 class FramePumpWriteGateTest(unittest.TestCase):

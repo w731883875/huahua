@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from huahua_assistant import learning
+from huahua_assistant import outcome_learning
 from huahua_assistant.app import _compact_recommendation
 from huahua_assistant.game_model import Paint, PlacementRecommendation, RecommendationExplanation
 from huahua_assistant.learning import _build_complete_stats
@@ -266,6 +268,67 @@ class ObservationSourceGateTests(unittest.TestCase):
 
 
 class RiskReportTests(unittest.TestCase):
+    def test_risk_summary_matches_full_normalization_for_legacy_and_current_runs(self) -> None:
+        events = [
+            _run_event("same", 8.0),
+            _run_event("same", 20.0),
+            _run_event("failed", 0.0, event="run_session_failed"),
+            _run_event("low", 2.0, event="compressed_run_summary", actual=False),
+            _run_event("skipped", 4.0, event="run_session_finish_skipped"),
+            _run_event("anonymous", 7.0),
+        ]
+        events[0]["ts"] = 20.0
+        events[1]["ts"] = 10.0  # older duplicate must not override
+        events[-1]["payload"].pop("session")
+        events[3]["payload"]["kind"] = "low_value_run"
+        trajectories = [_run_event("same", 100.0, event="high_score_trajectory")]
+        legacy = _run_event("legacy-only", 25.0, event="high_score_trajectory", actual=False)
+        legacy["payload"].update(
+            strategy_mode="稳健", policy_version="old-policy",
+            ordinary_summary={"initial_map_bucket": "legacy-map"},
+            resources={"force_used": 1, "refresh_used": 1},
+            steps=[{"resources": {"force_used": 3, "refresh_remaining": 5}},
+                   {"resources": {"force_used": 4, "refresh_remaining": 2}}],
+        )
+        legacy["payload"].pop("resource_usage", None)
+        trajectories.append(legacy)
+        normalized = normalize_run_payload(events[3]["payload"], event_type="compressed_run_summary")
+        events[3]["payload"] = normalized
+        original = deepcopy((events, trajectories))
+
+        def old_dedupe(observations, runs):
+            selected = {}
+            for event in (*observations, *runs):
+                payload, event_type = event["payload"], event["event"]
+                run = normalize_run_payload(payload, event_type=event_type)
+                key = str(run.get("session") or f"anonymous:{outcome_learning._stable_id(payload)}")
+                rank = (outcome_learning._RUN_EVENT_PRIORITY[event_type], event["ts"])
+                if key not in selected or rank >= selected[key][:2]:
+                    selected[key] = (*rank, run)
+            return [selected[key][2] for key in sorted(selected)]
+
+        with patch.object(outcome_learning, "_deduplicated_runs", side_effect=old_dedupe):
+            expected = build_outcome_risk_report(events, trajectories, min_samples=1)
+        actual = build_outcome_risk_report(events, trajectories, min_samples=1)
+        self.assertEqual(expected, actual)
+        self.assertEqual(original, (events, trajectories))
+
+    def test_risk_summary_never_copies_full_history_or_rebuilds_decisions(self) -> None:
+        class UncopyableList(list):
+            def __deepcopy__(self, memo):
+                raise AssertionError("Risk summary copied the full trajectory")
+
+        finished = _run_event("finished", 9.0)
+        duplicate = _run_event("finished", 80.0, event="high_score_trajectory")
+        standalone = _run_event("standalone", 12.0, event="high_score_trajectory")
+        for event in (duplicate, standalone):
+            event["payload"]["steps"] = UncopyableList([{"resources": {"force_used": 2}}])
+            event["payload"]["decision_records"] = UncopyableList([{"candidates": []}])
+        with patch.object(outcome_learning, "_decisions_from_run", side_effect=AssertionError("Rebuilt decisions")):
+            report = build_outcome_risk_report([finished], [duplicate, standalone], min_samples=1)
+        self.assertEqual(2, report["runs_total"])
+        self.assertEqual(10.5, report["modes"]["stable"]["metrics"]["mean"])
+
     def test_report_computes_required_distribution_and_resource_metrics(self) -> None:
         events = [_run_event(f"run-{index}", float(index), high=index > 10) for index in range(1, 21)]
 

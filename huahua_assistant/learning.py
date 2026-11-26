@@ -400,6 +400,9 @@ def _load_jsonl(path: Path) -> list[dict[str, Any]]:
 #: 推荐候选是什么、这一手改了什么）。去重是无损的，删字段是有损的。
 _DEDUPE_STEP_FIELDS = (
     "tiles",
+    "line_capacity",
+    "observed_tiles",
+    "recording_evidence",
     "candidates",
     "top",
     "backpack_cumulative",
@@ -709,10 +712,9 @@ def _append_unique_events(path: Path, incoming: list[dict[str, Any]], *, event_n
 
 #: 统计摘要的后台写盘：``_write_stats`` 只登记「最新一份快照」，由这个线程串行落盘。
 #:
-#: 为什么改后台：``_build_complete_stats`` 里 99% 的时间花在 ``build_outcome_risk_report``
-#: （实测 1.8 s，而 ``_build_stats`` 只要 0.065 s）。它是**派生摘要**——进程内没人读
-#: ``stats.json``，推荐/风险提示用的是内存里的 :func:`load_learning_stats`。所以让主线程
-#: 干等这 1.8 秒纯属白费，玩家看到的是「点完结束本局，界面卡住」。
+#: 统计是派生摘要，继续留在后台计算并发布内存缓存，界面不等它。
+#: 仅移到线程不能隔离 CPU 开销：旧风险报告深复制整段历史曾把同时运行的识别
+#: 拖到 6 秒。现在风险报告先去重、只生成统计摘要，避免重建完整轨迹决策。
 _STATS_PENDING: tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]] | None = None
 _STATS_LOCK = threading.Lock()
 _STATS_WORKER: threading.Thread | None = None

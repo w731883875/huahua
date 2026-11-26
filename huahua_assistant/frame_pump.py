@@ -5,7 +5,7 @@ import os
 import threading
 import time
 from ctypes import wintypes
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable
 
 import numpy as np
@@ -13,7 +13,7 @@ import numpy as np
 from .capture import (
     CaptureResult,
     WindowInfo,
-    capture_target,
+    capture_window_region,
     capture_window_content,
     find_capture_window,
 )
@@ -42,11 +42,20 @@ class FramePumpResult:
     #: 日志对齐、"这一帧到底多旧"都从这里算——不能用界面重绘的时刻，
     #: 否则同一帧每重绘一次就被续命一次。
     captured_at: float = 0.0
+    recording_evidence: dict | None = None
 
 
 #: 一帧跑超过这个秒数就记一条 ``slow_frame``。
 #: 自动跟随的节拍是 1.5s，正常帧 0.3~0.8s；超过 3s 才会被 tick 判成「很久没出帧」。
 SLOW_FRAME_SECONDS = 3.0
+
+
+def same_window_geometry(before: WindowInfo, current: WindowInfo | None) -> bool:
+    return current is not None and (
+        before.hwnd, before.process_id, before.left, before.top, before.right, before.bottom, before.client_bounds
+    ) == (
+        current.hwnd, current.process_id, current.left, current.top, current.right, current.bottom, current.client_bounds
+    ) and not current.minimized
 
 
 class FramePump:
@@ -63,8 +72,14 @@ class FramePump:
         record_func: Callable[[FastVisionSnapshot | None, CaptureResult], object] | None = None,
         model_state_func: Callable[[], object] | None = None,
         slow_frame_func: Callable[[dict], None] | None = None,
+        prepare_capture_func: Callable[[CaptureResult], None] | None = None,
+        geometry_probe: Callable[[], WindowInfo | None] | None = None,
     ) -> None:
         self._capture_func = capture_func
+        self._prepare_capture_func = prepare_capture_func
+        self._geometry_probe = geometry_probe
+        self._geometry_key = None
+        self._geometry_changed_at = 0.0
         self._analyze_func = analyze_func
         self._needs_full_refresh = needs_full_refresh
         self._full_analyze_func = full_analyze_func
@@ -176,6 +191,7 @@ class FramePump:
         record_elapsed = 0.0
         record_phase: str | None = None
         record_events: tuple[str, ...] = ()
+        record_evidence: dict | None = None
         #: 写盘闸门的判定结果。``None`` 表示没拦；否则是拦截原因（进 perf 便于排查）。
         write_gate: str | None = None
         try:
@@ -184,6 +200,19 @@ class FramePump:
             captured_at = time.monotonic()
             capture_elapsed = time.perf_counter() - capture_started_at
             frame = capture.image
+            if self._geometry_probe is not None and capture.window is not None and min(frame.shape[:2]) >= 100:
+                window = capture.window
+                key = (window.hwnd, window.width, window.height, frame.shape[:2], capture.kind)
+                now = time.monotonic()
+                if key != self._geometry_key:
+                    previous = self._geometry_key
+                    self._geometry_key, self._geometry_changed_at = key, now
+                    if previous is None:
+                        self._geometry_changed_at = now - .25
+                if now - self._geometry_changed_at < .20:
+                    return self._geometry_pending(capture, started_at, captured_at)
+            if self._prepare_capture_func is not None and frame.shape[0] >= 100 and frame.shape[1] >= 100:
+                self._prepare_capture_func(capture)
             # 只有窗口自己渲染的像素才允许自动落盘。整屏/桌面区域里可能是玩家的
             # 浏览器、聊天窗口、桌面文件——自动写进 runtime/ 就是把别人的画面
             # 留在磁盘上，而这一帧根本不该被当成游戏画面。
@@ -199,6 +228,11 @@ class FramePump:
                 full_started_at = time.perf_counter()
                 scene = self._full_analyze_func(frame)
                 full_refresh_elapsed = time.perf_counter() - full_started_at
+            if self._geometry_probe is not None and capture.window is not None:
+                current = self._geometry_probe()
+                before = capture.window
+                if not same_window_geometry(before, current):
+                    return self._geometry_pending(capture, started_at, captured_at)
             snapshot = snapshot_from_scene(scene, self._model_state())
             if self._record_func is not None:
                 record_started_at = time.perf_counter()
@@ -206,6 +240,7 @@ class FramePump:
                 record_elapsed = time.perf_counter() - record_started_at
                 record_phase = getattr(record_result, "phase", None)
                 record_events = tuple(getattr(record_result, "events", ()) or ())
+                record_evidence = getattr(record_result, "evidence", None)
             return FramePumpResult(
                 sequence=self._sequence,
                 capture=capture,
@@ -215,6 +250,7 @@ class FramePump:
                 elapsed=time.perf_counter() - started_at,
                 perf={
                     "capture": round(capture_elapsed, 3),
+                    "capture_stages": capture.timings or {},
                     "analysis": round(analysis_elapsed, 3),
                     "write": round(write_elapsed, 3),
                     "write_gate": write_gate,
@@ -226,6 +262,7 @@ class FramePump:
                     "pump_interval": round(self._interval, 3),
                 },
                 captured_at=captured_at,
+                recording_evidence=record_evidence,
             )
         except Exception as exc:
             return FramePumpResult(
@@ -251,6 +288,12 @@ class FramePump:
                 captured_at=time.monotonic(),
             )
 
+    def _geometry_pending(self, capture, started_at, captured_at):
+        return FramePumpResult(sequence=self._sequence, capture=capture,
+                               frame_shape=tuple(capture.image.shape), scene=None, snapshot=None,
+                               elapsed=time.perf_counter()-started_at,
+                               perf={"geometry_pending": True}, captured_at=captured_at)
+
 
 def default_auto_capture() -> CaptureResult:
     """自动跟随的截图入口。
@@ -267,37 +310,51 @@ def default_auto_capture() -> CaptureResult:
     ``screen:fallback``：游戏关掉或最小化之后，自动跟随仍然每 100ms 抓一张
     桌面图像交给识别和托管——玩家看到的是"箭头在指它自己的浏览器"。
     """
+    started = time.perf_counter()
+    stages: dict[str, float] = {}
+
+    def result_with_timings(result: CaptureResult) -> CaptureResult:
+        stages["total"] = round(time.perf_counter() - started, 4)
+        return replace(result, timings=stages)
+
+    step = time.perf_counter()
     window = find_capture_window()
+    stages["find_window"] = round(time.perf_counter() - step, 4)
     if window is None:
-        return CaptureResult(
+        return result_with_timings(CaptureResult(
             image=np.zeros((1, 1, 3), dtype=np.uint8),
             source=PAUSED_WINDOW_MISSING,
             window=None,
-        )
+        ))
 
+    step = time.perf_counter()
     content, method = capture_window_content(window)
+    stages["window_content"] = round(time.perf_counter() - step, 4)
     if content is not None:
-        return CaptureResult(
+        return result_with_timings(CaptureResult(
             image=content,
             source=(
                 f"window-content:{window.title} process:{window.process_name} "
                 f"method:{method}"
             ),
             window=window,
-        )
+        ))
 
-    if not _foreground_allows_capture(window):
-        return CaptureResult(
+    step = time.perf_counter()
+    foreground_allowed = _foreground_allows_capture(window)
+    stages["foreground_check"] = round(time.perf_counter() - step, 4)
+    if not foreground_allowed:
+        return result_with_timings(CaptureResult(
             image=np.zeros((1, 1, 3), dtype=np.uint8),
             source=PAUSED_SOURCE,
             window=window,
-        )
-    return capture_target(
-        fallback_to_screen=True,
-        fallback_if_target_uncaptureable=False,
-        activate=False,
-        activation_delay=0.0,
-    )
+        ))
+    # Selection and content capture already ran above. Re-entering capture_target
+    # would enumerate every desktop window twice and retry the same backend.
+    step = time.perf_counter()
+    result = capture_window_region(window, content_failed=method)
+    stages["window_region"] = round(time.perf_counter() - step, 4)
+    return result_with_timings(result)
 
 
 def _foreground_allows_capture(window: WindowInfo) -> bool:

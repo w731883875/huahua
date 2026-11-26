@@ -82,6 +82,8 @@ class FastBrush:
     chosen_stage1: str | None
     stage2_options: tuple[str, ...]
     confidence: float
+    card_rects: tuple[Rect, ...] = ()
+    reading_pending: bool = False
 
 
 @dataclass(frozen=True)
@@ -104,6 +106,7 @@ class FastVisionSnapshot:
     #: 背包一页只有 3 排 15 格，整包 30 枚要靠切两次排序各记一页；没有这个字段
     #: 两页的读数会互相覆盖，第二页一来就把第一页挤掉。
     backpack_page: str = ""
+    current_anchor: tuple[int, int] | None = None
 
 
 def backpack_page_of(scene: SceneObservation | None) -> str:
@@ -187,6 +190,8 @@ def snapshot_from_scene(
         reliable=not reasons,
         reasons=reasons,
         backpack_page=backpack_page or backpack_page_of(scene),
+        current_anchor=next(((t.row, t.col) for t in scene.board.tiles
+                             if t.is_current_anchor), None),
     )
 
 
@@ -306,6 +311,8 @@ def _fast_brush(brush: BrushOptionsObservation | None) -> FastBrush | None:
         chosen_stage1=brush.chosen_stage1,
         stage2_options=brush.stage2_options,
         confidence=round(float(brush.confidence), 3),
+        card_rects=brush.card_rects,
+        reading_pending=brush.reading_pending,
     )
 
 

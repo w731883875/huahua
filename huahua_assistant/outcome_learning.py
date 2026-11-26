@@ -5,6 +5,7 @@ import json
 import math
 import statistics
 from copy import deepcopy
+from itertools import chain
 from typing import Any, Mapping, Sequence
 
 
@@ -211,8 +212,12 @@ def build_outcome_risk_report(
 def _deduplicated_runs(
     events: Sequence[Mapping[str, Any]], trajectories: Sequence[Mapping[str, Any]]
 ) -> list[dict[str, Any]]:
-    selected: dict[str, tuple[int, float, dict[str, Any]]] = {}
-    for event in (*events, *trajectories):
+    # Select the authoritative outcome first. Normalizing every candidate used
+    # to deep-copy all historical trajectories and rebuild their decisions,
+    # even when a small finished observation superseded them. That CPU work
+    # delayed recognition in the same process by several seconds at each finish.
+    selected: dict[str, tuple[int, float, str, Mapping[str, Any]]] = {}
+    for event in chain(events, trajectories):
         if not isinstance(event, Mapping) or event.get("source") != "real_capture":
             continue
         event_type = str(event.get("event") or "")
@@ -221,14 +226,40 @@ def _deduplicated_runs(
         payload = event.get("payload")
         if not isinstance(payload, Mapping):
             continue
-        run = normalize_run_payload(payload, event_type=event_type)
-        session = str(run.get("session") or f"anonymous:{_stable_id(payload)}")
+        session = str(payload.get("session") or f"anonymous:{_stable_id(payload)}")
         priority = _RUN_EVENT_PRIORITY[event_type]
         timestamp = float(_finite_number(event.get("ts")) or 0.0)
         previous = selected.get(session)
         if previous is None or (priority, timestamp) >= (previous[0], previous[1]):
-            selected[session] = (priority, timestamp, run)
-    return [selected[key][2] for key in sorted(selected)]
+            selected[session] = (priority, timestamp, event_type, payload)
+    return [_risk_run_summary(selected[key][3], event_type=selected[key][2]) for key in sorted(selected)]
+
+
+def _risk_run_summary(payload: Mapping[str, Any], *, event_type: str) -> dict[str, Any]:
+    """Build only the fields read by the aggregate risk report.
+
+    Use the same conversions as the persisted contract, including legacy
+    resource counters and version/map grouping. Decision reconstruction and
+    copying board snapshots belong to trajectory export, not this summary.
+    """
+    initial = payload.get("initial_snapshot") if isinstance(payload.get("initial_snapshot"), Mapping) else {}
+    if event_type == "high_score_trajectory":
+        summary = payload.get("ordinary_summary")
+        bucket = summary.get("initial_map_bucket") if isinstance(summary, Mapping) else None
+        bucket = bucket or _initial_bucket(initial)
+    else:
+        # normalize_run_payload regenerates ordinary_summary for observations.
+        bucket = _initial_bucket(initial)
+    return {
+        "strategy_mode": _strategy_mode(payload),
+        "versions": _version_contract(payload),
+        "observed_outcome": _observed_outcome(payload, event_type=event_type),
+        "proxy_score": _proxy_score(payload),
+        "resource_usage": _resource_usage(payload),
+        "ordinary_summary": {"initial_map_bucket": bucket},
+        "high_score_gate": payload.get("high_score_gate"),
+        "kind": payload.get("kind"),
+    }
 
 
 def _mode_report(runs: list[dict[str, Any]], minimum: int) -> dict[str, Any]:

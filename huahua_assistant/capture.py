@@ -6,6 +6,7 @@ import time
 from contextlib import contextmanager
 from ctypes import wintypes
 from dataclasses import dataclass
+from os import getpid
 from os.path import basename
 from pathlib import Path
 from typing import Iterable, Protocol
@@ -85,6 +86,7 @@ class WindowInfo:
     right: int
     bottom: int
     minimized: bool
+    client_bounds: tuple[int, int, int, int] | None = None
 
     @property
     def width(self) -> int:
@@ -110,6 +112,7 @@ class CaptureResult:
     image: np.ndarray
     source: str
     window: WindowInfo | None = None
+    timings: dict[str, float] | None = None
 
     @property
     def kind(self) -> str:
@@ -251,7 +254,11 @@ class _WgcSession:
             with self._lock:
                 self._sequence += 1
                 self._frame_at = time.monotonic()
-                self._size = (int(frame.width), int(frame.height))
+                size = (int(frame.width), int(frame.height))
+                if size != self._size:
+                    self._frame = None
+                    self._copy_at = 0.0
+                self._size = size
                 if not self._want:
                     return
                 # BGRA -> BGR, contiguous copy out of the native mapping.
@@ -793,6 +800,25 @@ def capture_window_content(window: WindowInfo) -> tuple[np.ndarray | None, str]:
     return _LEGACY_BACKEND.capture_window_content(window)
 
 
+def capture_window_region(window: WindowInfo, *, content_failed: str = "") -> CaptureResult:
+    """Capture the already selected window without rediscovering or activating it."""
+    if not window.captureable:
+        raise RuntimeError("Selected game window is not captureable")
+    with physical_pixel_coordinates():
+        plan = resolve_capture_backend()
+        attempts = []
+        for backend in plan.region_backends:
+            image, method = backend.capture_window_region(window)
+            attempts.append(f"{backend.name}:{method}")
+            if image is not None:
+                return CaptureResult(
+                    image=image, window=window,
+                    source=(f"window-screen:{window.title} process:{window.process_name} "
+                            f"backend:{backend.name} method:{method} content_failed:{content_failed}"),
+                )
+    raise RuntimeError(f"Window region capture failed: {_format_capture_attempts(attempts)}")
+
+
 def close_capture_backends() -> None:
     """Release persistent capture sessions (call on shutdown)."""
 
@@ -1058,14 +1084,17 @@ def find_capture_window(window_title: str = DEFAULT_WINDOW_TITLE) -> WindowInfo 
 def find_matching_windows(targets: Iterable[str]) -> list[WindowInfo]:
     needles = [target.casefold() for target in targets if target.strip()]
     matches: list[WindowInfo] = []
-    for window in list_visible_windows():
+    # GetWindowText on our own windows sends a synchronous message to Tk.
+    # A busy UI callback would block the capture worker as well. The game is
+    # external: exclude our process before reading any title or window geometry.
+    for window in list_visible_windows(exclude_process_id=getpid()):
         haystacks = (window.title.casefold(), window.process_name.casefold())
         if any(needle in haystack for needle in needles for haystack in haystacks):
             matches.append(window)
     return matches
 
 
-def list_visible_windows() -> list[WindowInfo]:
+def list_visible_windows(*, exclude_process_id: int | None = None) -> list[WindowInfo]:
     user32 = ctypes.windll.user32
     windows: list[WindowInfo] = []
 
@@ -1073,6 +1102,11 @@ def list_visible_windows() -> list[WindowInfo]:
 
     def callback(hwnd: int, _lparam: int) -> bool:
         if not user32.IsWindowVisible(hwnd):
+            return True
+
+        process_id = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
+        if process_id.value == exclude_process_id:
             return True
 
         length = user32.GetWindowTextLengthW(hwnd)
@@ -1104,9 +1138,13 @@ def list_visible_windows() -> list[WindowInfo]:
         if width <= 0 or height <= 0:
             return True
 
-        process_id = wintypes.DWORD()
-        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
         process_name = _process_name(process_id.value)
+        client_bounds = None
+        client_rect = wintypes.RECT()
+        origin = wintypes.POINT(0, 0)
+        if user32.GetClientRect(hwnd, ctypes.byref(client_rect)) and user32.ClientToScreen(hwnd, ctypes.byref(origin)):
+            client_bounds = (int(origin.x), int(origin.y),
+                             int(origin.x + client_rect.right), int(origin.y + client_rect.bottom))
 
         windows.append(
             WindowInfo(
@@ -1119,6 +1157,7 @@ def list_visible_windows() -> list[WindowInfo]:
                 right=int(rect.right),
                 bottom=int(rect.bottom),
                 minimized=minimized,
+                client_bounds=client_bounds,
             )
         )
         return True

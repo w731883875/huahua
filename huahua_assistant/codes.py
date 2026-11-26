@@ -66,6 +66,28 @@ def canonical_affix_id(affix: AffixRule | str | None) -> str | None:
     return resolved.canonical_affix_id if resolved is not None else None
 
 
+def brush_effect_identity(affix: AffixRule | str | None,
+                          brush_type: BrushType | str | None = None) -> dict:
+    """Serialize selectable-effect identity without inventing a unique table row.
+
+    Recognition yields card text, not a protocol ID. Some identical effects have
+    several official rows; preserve all of them and leave the scalar ID null.
+    Exact catalog aliases only: no fuzzy text match in saved choice identity.
+    """
+    resolved = resolve_affix(affix, brush_type)
+    ids = sorted(set(resolved.official_ids)) if resolved is not None else []
+    if isinstance(affix, str) and affix.strip().isdigit() and int(affix.strip()) in ids:
+        ids = [int(affix.strip())]
+    return {
+        "canonical_affix_id": resolved.canonical_affix_id if resolved else None,
+        "brush_effect_id": ids[0] if len(ids) == 1 else None,
+        "brush_effect_ids": ids,
+        "brush_effect_id_status": "unique" if len(ids) == 1 else "ambiguous" if ids else "unknown",
+        "brush_effect_id_source": "catalog_mapping" if ids else None,
+        "brush_effect_table": "S8_Gameplay_SelectableEffect",
+    }
+
+
 def resolve_affix(
     affix: AffixRule | str | None,
     brush_type: BrushType | str | None = None,
@@ -241,6 +263,12 @@ def compact_rule_with_code(rule: CurrentPaintRule) -> dict:
         "upgrade": rule.upgrade_amount,
         "extra": [item.value for item in rule.extra_directions],
         "extra_code": [DIRECTION_CODES.get(item, "U") for item in rule.extra_directions],
+        # Fused paints can repeat an effect or target different paint categories.
+        "effects": [
+            {"direction": item.direction.value, "target": item.target_object.value,
+             "upgrade": item.upgrade_amount}
+            for item in rule.effects
+        ],
     }
 
 

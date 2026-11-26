@@ -78,6 +78,22 @@ def _snapshot(*, with_current: bool = True, blank: int = 20) -> FastVisionSnapsh
 
 
 class DescribeRecordStatusTests(unittest.TestCase):
+    def test_archive_is_visible_while_recorder_waits_for_confirmation(self) -> None:
+        text, level = describe_record_status(
+            _status(phase="playing"), auto_follow=True, run_archived=True,
+        )
+        self.assertIn("已存档", text)
+        self.assertIn("确认中", text)
+        self.assertNotIn("已收尾", text)
+        self.assertEqual(level, "waiting")
+
+    def test_archive_does_not_hide_a_capture_failure(self) -> None:
+        text, level = describe_record_status(
+            _status(phase="playing"), auto_follow=True, run_archived=True,
+            capture_error="failed",
+        )
+        self.assertEqual(level, "error")
+
     def test_auto_follow_off_is_explicit(self) -> None:
         """没开自动跟随就必须说「关」，不能退回「待开局」。"""
         text, level = describe_record_status(_status(phase="playing"), auto_follow=False)

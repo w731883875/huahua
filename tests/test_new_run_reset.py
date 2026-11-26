@@ -11,11 +11,14 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from huahua_assistant import app
 from huahua_assistant.game_model import PaintCategory, PaintDirection, PaintObject
+from huahua_assistant.level_smoothing import LevelStabilizer
+from huahua_assistant.models import BoardObservation, Rect, SceneObservation, TileObservation, TileState
 
 
 def _scene(direction=PaintDirection.VERTICAL, required=4, target=PaintObject.ALL):
@@ -204,6 +207,87 @@ class IntoEventDispatchTests(unittest.TestCase):
         with patch.object(app, "record_observation"):
             app.HuahuaApp._consume_game_log_events(fake)
         self.assertFalse(fake.pending_new_run)
+
+
+class NewRunPaintIdentityTests(unittest.TestCase):
+    """旧局冻结后，同位置的新怪物不能被旧玩法身份覆盖。"""
+
+    def _app(self):
+        fake = _log_consumer_app([_event("into")])
+        fake.level_stabilizer = LevelStabilizer()
+        for name in (
+            "_clear_brush_choice", "_update_perf_panel", "_update_fast_snapshot",
+            "_restore_app_window", "_set_last_capture_context", "_draw_empty_grid",
+            "_write_regions",
+        ):
+            setattr(fake, name, Mock())
+        fake.backpack_accumulator = Mock()
+        fake.tracker = Mock()
+        fake.board_var = Mock()
+        fake.last_finished_board_states = ""
+        fake.start_new_real_session = lambda **kw: app.HuahuaApp.start_new_real_session(fake, **kw)
+        fake._stabilize_scene = lambda scene: app.HuahuaApp._stabilize_scene(fake, scene)
+        return fake
+
+    def _new_board(self):
+        # 2026-11-25 实机新增的三个怪物及其位置（行列从 0 开始）。
+        tiles = tuple(
+            TileObservation(
+                row=row, col=col, rect=Rect(col * 96, row * 96, 96, 96),
+                state=TileState.PAINT, confidence=0.9, features={},
+                paint_category=PaintCategory.MONSTER, paint_category_confidence=0.9,
+                paint_subtype=subtype, paint_level=level, paint_level_confidence=0.9,
+            )
+            for row, col, subtype, level in ((2, 3, "邪影", 4), (3, 4, "黑帮", 3), (4, 5, "英灵", 3))
+        )
+        return BoardObservation(rect=Rect(0, 0, 576, 576), score=0.9, tiles=tiles)
+
+    def test_every_new_run_entry_clears_old_identity_and_unfreezes(self):
+        for entry in ("manual", "log_fast", "log_full", "board"):
+            for frozen in (False, True):
+                with self.subTest(entry=entry, frozen=frozen):
+                    fake = self._app()
+                    new_board = self._new_board()
+                    old_board = replace(new_board, tiles=tuple(
+                        replace(tile, paint_category=PaintCategory.GAMEPLAY,
+                                paint_subtype="赛季", paint_level=7, paint_is_treasure=True)
+                        for tile in new_board.tiles
+                    ))
+                    fake.level_stabilizer.observe(old_board)
+                    if frozen:
+                        fake.level_stabilizer.freeze()
+                    fake.real_session_finished = frozen
+                    fake.board_reached_full = True
+                    fake.last_real_capture_step = {"board": {"states": "P" * 36, "blank": 0, "paint": 36}}
+                    blank_scene = SceneObservation(board=replace(new_board, tiles=tuple(
+                        replace(tile, state=TileState.BLANK, paint_category=PaintCategory.UNKNOWN,
+                                paint_subtype=None, paint_level=None)
+                        for tile in new_board.tiles
+                    )), regions=())
+                    with patch.object(app, "record_observation"):
+                        if entry == "manual":
+                            fake.start_new_real_session(record_event=False)
+                        elif entry == "board":
+                            self.assertTrue(app.HuahuaApp._maybe_start_new_run_from_board(
+                                fake, blank_scene, trigger="test"))
+                        else:
+                            app.HuahuaApp._consume_game_log_events(fake)
+                            self.assertTrue(fake.pending_new_run)
+                            if entry == "log_fast":
+                                app.HuahuaApp._render_fast_scene_result(fake, None, "test", 0.01, auto=True)
+                            else:
+                                app.HuahuaApp._render_result(fake, None, None, "test", 0.01, None, None)
+                    self.assertFalse(fake.pending_new_run)
+                    self.assertFalse(fake.level_stabilizer.frozen)
+                    self.assertEqual(fake._stabilize_scene(blank_scene).board, blank_scene.board)
+                    new_scene = SceneObservation(board=new_board, regions=())
+                    self.assertEqual(fake._stabilize_scene(new_scene).board, new_board)
+                    # 新局还要继续接收升级，不能只是第一帧看起来恢复了。
+                    upgraded = replace(new_scene, board=replace(new_board, tiles=tuple(
+                        replace(tile, paint_level=tile.paint_level + 1) for tile in new_board.tiles
+                    )))
+                    fake._stabilize_scene(upgraded)
+                    self.assertEqual(fake._stabilize_scene(upgraded).board, upgraded.board)
 
 
 if __name__ == "__main__":

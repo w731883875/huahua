@@ -32,6 +32,7 @@ from .capture import (
     close_capture_backends,
     exclude_tool_windows_from_capture,
     find_window,
+    find_capture_window,
     format_capture_diagnostics,
     remote_session_reason,
     reset_wgc_state,
@@ -55,7 +56,7 @@ from .codes import (
 )
 from .fast_events import FastVisionEvent, detect_fast_events
 from .fast_vision import FastVisionSnapshot, backpack_page_of, snapshot_from_scene
-from .frame_pump import FramePump, default_auto_capture
+from .frame_pump import FramePump, default_auto_capture, same_window_geometry
 from .game_log import LOG_ALIVE_SECONDS, GameLogEvent, GameLogWatcher, find_game_log
 
 #: 日志说画面变了之后的「连拍」节拍：不额外等待，跑完一帧接着跑下一帧。
@@ -160,6 +161,7 @@ from .learning import (
 )
 from .level_reconcile import ReconcileReport, reconcile as reconcile_levels
 from .level_smoothing import LevelStabilizer
+from .line_capacity import summarize_lines
 from .models import BoardObservation, BrushOptionsObservation, PaintCategory, PaintDirection, PaintObject, Rect, RegionKind, SceneObservation, TileObservation, TileState
 from .mouse_monitor import MouseClickMonitor
 from .outcome_learning import decision_records_from_steps
@@ -332,7 +334,7 @@ class HuahuaApp(tk.Tk):
         self.refresh_available_var = tk.BooleanVar(value=False)
         self.force_used_var = tk.IntVar(value=0)
         self.refresh_used_var = tk.IntVar(value=0)
-        self.auto_follow_var = tk.BooleanVar(value=False)
+        self.auto_follow_var = tk.BooleanVar(value=True)
         self.auto_follow_interval_var = tk.IntVar(value=100)
         # 大模型托管：勾上之后，每隔 min_interval 把最新一帧交给视觉大模型，
         # 由它直接给出「点哪里」。本地链路仍然并行跑，作为超时/失败时的降级。
@@ -506,6 +508,7 @@ class HuahuaApp(tk.Tk):
         # 窗口状态的客观快照：黑屏时唯一的可靠判据。
         self.after(2000, lambda: self._dump_window_state("startup"))
         self.after(8000, lambda: self._dump_window_state("steady"))
+        self.after(500, self.toggle_auto_follow)
         # 诊断：HUAHUA_SELF_SHOT=<目录> 时在启动 12 秒后撤掉截屏免疫自拍一组图。
         # 免疫生效时进程外只能抓到纯黑，只有进程内能回答「界面到底画出来没有」。
         self_screenshot_dir = os.environ.get("HUAHUA_SELF_SHOT")
@@ -551,7 +554,7 @@ class HuahuaApp(tk.Tk):
 
         calibration_btn = tk.Button(
             primary_row,
-            text="区域标定",
+            text="定位预览",
             command=self.open_region_calibration,
             width=10,
         )
@@ -849,6 +852,7 @@ class HuahuaApp(tk.Tk):
                 frame_age=frame_age,
                 game_window=self._capture_locked_window,
                 paused=paused_reason,
+                run_archived=self.real_session_finished and not self.pending_new_run,
             )
             self.record_var.set(text)
             self.record_level = level
@@ -1165,6 +1169,9 @@ class HuahuaApp(tk.Tk):
                 self.llm_reject_reason = "option_unmatched"
                 return None
             y_ratio = 0.30 if index == 0 else 0.71
+            cards = getattr(scene.brush_options, "card_rects", ())
+            if index < len(cards):
+                return self._screen_point_for_capture_rect(cards[index])
             return self._screen_point_for_capture_rect(panel, 0.55, y_ratio)
         if advice.action == ACTION_FINISH:
             region = scene.region(RegionKind.FINISH_DRAWING)
@@ -1180,107 +1187,20 @@ class HuahuaApp(tk.Tk):
         return None
 
     def open_region_calibration(self) -> None:
-        """打开「区域标定」：把识别区域画成可拖动的绿框，拖对后固定。
+        """Preview the very same automatic geometry used by recognition."""
+        from .region_calibration_ui import AutomaticGeometryOverlay
 
-        用户 2026-11-24 要求：绿框显示棋盘、初始颜料的调色范围、两个笔触卡片，
-        能拖到正确位置再固定。
-
-        为什么要它：``layout.json`` 用窗口像素尺寸当键，而同一次运行里完整识别
-        与实时快路径拿到的尺寸并不一致（实测 1602x939 vs 800x469，正好差 2 倍），
-        总有一条匹配不上就退回内置默认比例。默认比例歪一点也能过 presence 检查，
-        于是**裁偏了还读得很自信**——用户看到的就是「第一个初始颜料的等级和范围
-        都错」。区域改用相对比例存盘后，换尺寸自动跟着走。
-        """
-
-        try:
-            from . import region_calibration as calib
-            from . import region_calibration_ui as calib_ui
-        except Exception as exc:  # 标定层出问题不能连累主流程
-            self._set_notice("区域标定打不开：%s" % exc, "error")
+        existing = getattr(self, "_calibration_overlay", None)
+        if existing is not None:
+            existing.close()
+            self._calibration_overlay = None
+            self._set_notice("自动定位预览已关闭，识别继续运行。", "info")
             return
-
-        window = self.last_capture_window
-        capture_size = self.last_capture_size
-        if window is not None and window.width > 0 and window.height > 0:
-            overlay_w, overlay_h = int(window.width), int(window.height)
-        elif capture_size is not None:
-            overlay_w, overlay_h = int(capture_size[0]), int(capture_size[1])
-        else:
-            overlay_w = int(self.winfo_screenwidth())
-            overlay_h = int(self.winfo_screenheight())
-
-        def current_regions() -> dict[str, calib.Region] | None:
-            """按最近一次识别结果给出四块绿框，转成窗口相对比例。"""
-            scene = getattr(self, "current_scene", None)
-            board_rect = None
-            if scene is not None:
-                board_rect = getattr(scene.board, "rect", None)
-            if board_rect is None:
-                return None
-            x1, y1, x2, y2 = self._window_local_rect_from_capture_rect(board_rect)
-            board = calib.Region.from_pixels(
-                "board", x1, y1, x2 - x1, y2 - y1, overlay_w, overlay_h
-            )
-            regions = {
-                "board": board,
-                # 调色范围在识别结果里没有独立矩形，先与棋盘同框，由用户拖到实际范围。
-                "scope": calib.Region(
-                    key="scope",
-                    x_ratio=board.x_ratio,
-                    y_ratio=board.y_ratio,
-                    w_ratio=board.w_ratio,
-                    h_ratio=board.h_ratio,
-                ),
-            }
-            # 笔触卡片：识别结果只有「面板」矩形（panel_rect），卡片矩形没有
-            # 独立落盘。两张卡默认左右各占面板下半，先给个可拖的占位。
-            brush = getattr(self, "_last_brush_observation", None)
-            panel = getattr(brush, "panel_rect", None) if brush is not None else None
-            if panel is not None:
-                px1, py1, px2, py2 = self._window_local_rect_from_capture_rect(panel)
-                pw, ph = px2 - px1, py2 - py1
-                half = max(calib.MIN_SIDE_PX, int(pw / 2) - 6)
-                height = max(calib.MIN_SIDE_PX, int(ph * 0.42))
-                regions["brush_stage1"] = calib.Region.from_pixels(
-                    "brush_stage1", px1 + 6, py1 + ph - height - 6, half, height,
-                    overlay_w, overlay_h,
-                )
-                regions["brush_stage2"] = calib.Region.from_pixels(
-                    "brush_stage2", px2 - 6 - half, py1 + ph - height - 6, half, height,
-                    overlay_w, overlay_h,
-                )
-            return regions
-
-        saved = calib.load_regions()
-        # 三层优先级：用户亲手固定的 > 当前识别结果 > 内置默认，四块一个都不能少。
-        # 早先写成 ``current_regions() or saved or default_regions(...)``：识别结果
-        # 只在拿到笔触面板时才带 brush_stage1/2，字典非空就把默认值短路掉，于是
-        # 两张笔触卡片整块不画（用户 2026-11-25 实测：「固定了棋盘和调色区域，
-        # 但是笔触卡片1、2都未出现」）。
-        initial = calib.merge_regions(overlay_w, overlay_h, current_regions(), saved)
-
-        def on_recalibrate() -> dict[str, calib.Region] | None:
-            updated = current_regions()
-            if updated is None:
-                self._set_notice("还没识别过棋盘，先点「完整识别」再标定。", "warn")
-                return None
-            return updated
-
-        def on_saved(regions: dict[str, calib.Region]) -> None:
-            self.calibrated_regions = dict(regions)
-            self._set_notice(
-                "区域标定已固定：%d 块区域（棋盘/调色范围/2 个笔触卡片）。"
-                % len(regions),
-                "success",
-            )
-
-        self._calibration_overlay = calib_ui.CalibrationOverlay(
-            self,
-            initial,
-            on_recalibrate=on_recalibrate,
-            on_saved=on_saved,
-        )
-        self._set_notice("区域标定已打开：拖动绿框到正确位置，Ctrl+S 固定。", "info")
+        if not self.auto_follow_var.get():
+            self.auto_follow_var.set(True)
+            self.toggle_auto_follow()
+        self._calibration_overlay = AutomaticGeometryOverlay(self)
+        self._set_notice("自动定位预览已打开：棋盘和笔触卡片随游戏窗口自动更新。", "info")
 
     def toggle_overlay(self) -> None:
         self._destroy_overlay_window()
@@ -1614,6 +1534,8 @@ class HuahuaApp(tk.Tk):
         if self.auto_follow_pump is None:
             self.auto_follow_pump = FramePump(
                 capture_func=default_auto_capture,
+                prepare_capture_func=self.tracker.set_capture_context,
+                geometry_probe=find_capture_window,
                 analyze_func=self.tracker.analyze_quick,
                 needs_full_refresh=lambda: False,
                 full_analyze_func=self.tracker.analyze_realtime,
@@ -1645,6 +1567,13 @@ class HuahuaApp(tk.Tk):
         clicks = self.mouse_click_monitor.drain()
         local_clicks: list[tuple[float, float, float]] = []
         window = capture.window
+        geometry = (window.hwnd, window.left, window.top, window.width, window.height,
+                    capture.image.shape[:2]) if window is not None else None
+        previous_geometry = getattr(self, "_recorder_click_geometry", geometry)
+        self._recorder_click_geometry = geometry
+        if geometry != previous_geometry:
+            # Drained clicks may belong to coordinates before the resize/move.
+            clicks = ()
         if window is not None and snapshot is not None and window.width > 0 and window.height > 0:
             capture_height, capture_width = capture.image.shape[:2]
             for click in clicks:
@@ -2058,6 +1987,12 @@ class HuahuaApp(tk.Tk):
         # 换了游戏窗口（重开游戏、窗口重建）：把「WGC 不可用」的判定清掉重试一次。
         # 那条判定只是为了别每帧白抛异常，不该变成永久结论。
         captured_window = result.capture.window
+        # The UI may consume a queued result after another resize or move.
+        if result.scene is not None and captured_window is not None and not same_window_geometry(
+            captured_window, find_capture_window()
+        ):
+            result = replace(result, scene=None, snapshot=None,
+                             perf={**result.perf, "geometry_pending": True})
         captured_hwnd = int(getattr(captured_window, "hwnd", 0) or 0)
         if captured_hwnd and captured_hwnd != self._capture_window_hwnd:
             previous_hwnd, self._capture_window_hwnd = self._capture_window_hwnd, captured_hwnd
@@ -2084,7 +2019,7 @@ class HuahuaApp(tk.Tk):
         # 一律不入队，并且立刻清掉待发帧——否则"窗口消失前一瞬"留下的那张图
         # 会在下一次 _llm_tick 被悄悄发出去。
         if self.llm_var.get():
-            if _llm_may_receive_frame(result.capture):
+            if _llm_may_receive_frame(result.capture) and not result.perf.get("geometry_pending"):
                 self._llm_pending_frame = result.capture.image
                 self._llm_pending_captured_at = float(result.captured_at or 0.0)
                 self._llm_block_reason = None
@@ -2111,6 +2046,7 @@ class HuahuaApp(tk.Tk):
             capture_size,
             generation,
             result.perf,
+            recording_evidence=result.recording_evidence,
         )
 
     def _auto_follow_error(self, exc: Exception, generation: int) -> None:
@@ -2144,6 +2080,7 @@ class HuahuaApp(tk.Tk):
                 activation_delay=0.02,
             )
             frame = capture.image
+            self.tracker.set_capture_context(capture)
             write_image("runtime/capture.png", frame)
             scene, debug_path = analyze_and_save_debug(
                 frame,
@@ -2189,6 +2126,7 @@ class HuahuaApp(tk.Tk):
             )
             capture_elapsed = time.perf_counter() - capture_started_at
             frame = capture.image
+            self.tracker.set_capture_context(capture)
             write_elapsed = 0.0
             if bool(config_value("debug.save_fast_captures", False)):
                 write_started_at = time.perf_counter()
@@ -2566,6 +2504,7 @@ class HuahuaApp(tk.Tk):
         capture_size: tuple[int, int] | None,
         generation: int,
         capture_perf: dict | None = None,
+        recording_evidence: dict | None = None,
     ) -> None:
         if generation != self.auto_follow_generation or not self.auto_follow_var.get():
             self.auto_follow_busy = False
@@ -2576,7 +2515,8 @@ class HuahuaApp(tk.Tk):
                 # 不弹「未识别」，保持上一帧的提示，等回来再说。
                 return
             self._set_last_capture_context(capture_window, capture_size)
-            self._render_fast_scene_result(scene, capture_source, elapsed, auto=True, capture_perf=capture_perf)
+            self._render_fast_scene_result(scene, capture_source, elapsed, auto=True,
+                                           capture_perf=capture_perf, recording_evidence=recording_evidence)
         finally:
             self.auto_follow_busy = False
             self._schedule_auto_follow()
@@ -2589,6 +2529,7 @@ class HuahuaApp(tk.Tk):
         *,
         auto: bool,
         capture_perf: dict | None = None,
+        recording_evidence: dict | None = None,
     ) -> None:
         # 日志说「入画」了：先无条件把旧局清干净，再谈识别。
         # 放在「没找到棋盘」的提前返回之前是故意的——选画纸、集雪这些界面本来就
@@ -2603,6 +2544,9 @@ class HuahuaApp(tk.Tk):
             self.last_capture_quality = None
             self._update_fast_snapshot(None)
             self._update_perf_panel(mode=prefix, elapsed=elapsed, capture_source=capture_source, capture_perf=capture_perf)
+            if capture_perf and capture_perf.get("geometry_pending"):
+                self.status_var.set("窗口正在变化，稳定后自动重新定位棋盘和笔触卡片。")
+                return
             if self.real_session_finished or self.board_reached_full:
                 # 结算/奖励/选画纸这类界面本来就看不到棋盘。本局已经收尾，
                 # 这里就是「待开局」状态——不要报成「未找到棋盘」，那看起来像识别坏了。
@@ -2689,6 +2633,7 @@ class HuahuaApp(tk.Tk):
             elapsed,
             capture_perf=capture_perf,
             capture_source=capture_source,
+            recording_evidence=recording_evidence,
         )
         high_value_notice = self._record_high_value_seen(
             scene,
@@ -2920,9 +2865,6 @@ class HuahuaApp(tk.Tk):
                 return False
         if finished_before and _looks_like_new_run(scene, self.last_real_capture_step):
             self.start_new_real_session(record_event=True)
-            # 新一局：等级稳定器清空历史并解除冻结，否则上一局的「已确认等级」
-            # 会被当成这一局的基准，新画纸上的读数全被按旧值顶回去。
-            self.level_stabilizer.reset()
             record_observation(
                 "new_run_detected",
                 {"trigger": trigger, "board": board},
@@ -3005,6 +2947,9 @@ class HuahuaApp(tk.Tk):
         self.board_reached_full = False
         self.board_full_autosave_attempted = False
         self.pending_new_run = False
+        # 所有新局入口（日志、手动、棋盘判定）都要清空格子身份并解除结算冻结。
+        # 只在棋盘判定分支重置，会让日志开局后的怪物被旧局同位置的玩法覆盖。
+        self.level_stabilizer.reset()
         self.current_scene = None
         self.current_state = None
         self.previous_fast_snapshot = None
@@ -3288,6 +3233,8 @@ class HuahuaApp(tk.Tk):
         # 用户 2026-11-22 要求「本局完成后颜料等级和种类不再变化」——结算后还让
         # 抖动读数改写终局盘面，会把已经入库的成绩和轨迹一起改坏。
         self.level_stabilizer.freeze()
+        # 存档完成后立刻取下一张确认帧，不再等空闲采集间隔。
+        self._wake_auto_follow_pump()
         return saved, score
 
     def _intern_board(self, step: dict) -> str:
@@ -3395,6 +3342,7 @@ class HuahuaApp(tk.Tk):
         *,
         capture_perf: dict | None = None,
         capture_source: str | None = None,
+        recording_evidence: dict | None = None,
     ) -> bool:
         quality = _quick_capture_quality(scene, elapsed, capture_perf, capture_source=capture_source)
         step = _compact_real_capture_step(
@@ -3409,6 +3357,7 @@ class HuahuaApp(tk.Tk):
             quality=quality,
         )
         step["type"] = "quick_capture"
+        step["recording_evidence"] = recording_evidence
         step["mode"] = "quick_capture"
         step["ocr"] = False
         step["board_id"] = self._intern_board(step)
@@ -3436,7 +3385,8 @@ class HuahuaApp(tk.Tk):
             if tentative_saved:
                 self.quick_capture_record_count += 1
             return tentative_saved
-        if _is_noop_capture_update(step["inferred_action"]):
+        if (_is_noop_capture_update(step["inferred_action"])
+                and not _recording_metadata_changed(self.last_real_capture_step, step)):
             return False
 
         step_key = _stable_payload_key(
@@ -3450,6 +3400,8 @@ class HuahuaApp(tk.Tk):
                 "resources": step.get("resources"),
                 "tiles": step.get("tiles"),
                 "action": step.get("inferred_action"),
+                "recording_evidence": step.get("recording_evidence"),
+                "observed_tiles": step.get("observed_tiles"),
             }
         )
         if step_key == self.last_quick_step_key:
@@ -4852,8 +4804,8 @@ class HuahuaApp(tk.Tk):
             self._write_current_terrain_bucket_hint()
         except Exception:  # noqa: BLE001 - 刷数字不能影响主流程
             pass
-        # 推荐排序本身就吃 learning_stats，有局面就按新统计重排一次。
-        if self.current_state is not None:
+        # 统计回调也要遵守记录模式；已结束的对局无需再搜索推荐。
+        if self.current_state is not None and not self.real_session_finished and not recording_mode_enabled():
             try:
                 self._refresh_after_correction()
             except Exception:  # noqa: BLE001
@@ -4869,11 +4821,15 @@ class HuahuaApp(tk.Tk):
                 if self.last_capture_quality["ok"]
                 else []
             )
-        self.recommendations = recommend_placements(
-            self.current_state,
-            learning_stats=self._learning_stats_cache if self.current_scene is not None else None,
-        )
-        self.install_plan = recommend_install_plan(self.current_state)
+        if recording_mode_enabled() or self.real_session_finished:
+            self.recommendations = []
+            self.install_plan = None
+        else:
+            self.recommendations = recommend_placements(
+                self.current_state,
+                learning_stats=self._learning_stats_cache if self.current_scene is not None else None,
+            )
+            self.install_plan = recommend_install_plan(self.current_state)
         self.selected_backpack_index = None
         self.canvas.delete("all")
         self._draw_grid(self.current_scene.board if self.current_scene else None, self.current_state)
@@ -5752,6 +5708,8 @@ class HuahuaApp(tk.Tk):
             RegionKind.CURRENT_PAINT: "当前初始颜料",
             RegionKind.BACKPACK: "背包",
             RegionKind.BRUSH_OPTIONS: "笔触选项",
+            RegionKind.BRUSH_CARD_1: "笔触卡片 1",
+            RegionKind.BRUSH_CARD_2: "笔触卡片 2",
             RegionKind.CONFIRM_BUTTON: "确认按钮",
             RegionKind.START_DRAWING: "开始绘制",
             RegionKind.FINISH_DRAWING: "完成绘制",
@@ -5770,7 +5728,7 @@ class HuahuaApp(tk.Tk):
         )
         self._write_coordinate_debug(scene)
         for region in scene.regions:
-            name = region_names[region.kind]
+            name = region_names.get(region.kind, region.kind.value)
             text = (
                 f"{name}\n"
                 f"x={region.rect.x} y={region.rect.y} "
@@ -6971,33 +6929,33 @@ def _compact_real_capture_step(
 ) -> dict:
     rule = state.current_rule
     brush = scene.brush_options
-    if brush_scenario:
-        stage1 = [item.value for item in brush_scenario.stage1_options]
-        chosen = brush_scenario.chosen_stage1.value
-        stage2 = [affix.name for affix in brush_scenario.stage2_options]
-    else:
-        stage1 = list(brush.stage1_options) if brush else []
-        chosen = brush.chosen_stage1 if brush else None
-        stage2 = list(brush.stage2_options) if brush else []
+    # A UI scenario may default to the first candidate. It is not a selection.
+    stage1 = list(brush.stage1_options) if brush else []
+    chosen = brush.chosen_stage1 if brush else None
+    stage2 = list(brush.stage2_options) if brush else []
     brush_payload = {
         "stage1": stage1,
         "chosen": chosen,
         "stage2": stage2,
+        "chosen_source": "panel_recognition" if chosen else None,
     }
     brush_payload.update(brush_payload_codes(stage1, chosen, stage2))
     candidate_payloads = [
         _compact_recommendation(rec, rank=rank)
         for rank, rec in enumerate(recommendations[:36], start=1)
     ]
-    # 「调色效果」原文 = 这枚颜料自带的笔触。面板 OCR 读到就带出来，
-    # 复盘时不用再拿 stats.json 的累计计数去猜某一手吃了哪条效果。
+    # 面板「调色效果」与选卡得到的笔触词缀分开保存，不互相替代。
     hint = getattr(getattr(scene, "current_paint", None), "raw_text_hint", None) or ""
-    effect_text = hint.split("effect=", 1)[1].strip() if "effect=" in hint else None
+    effect_text = getattr(scene.current_paint, "effect_text", None)
+    if not effect_text and "effect=" in hint:
+        effect_text = hint.split("effect=", 1)[1].strip()
     current_payload = dict(_compact_rule(rule) or {})
     current_payload["effect"] = effect_text
+    board_payload = _compact_board_summary(scene)
+    tile_payloads = _compact_tile_paints(state)
     return {
         "type": "capture",
-        "board": _compact_board_summary(scene),
+        "board": board_payload,
         "current": current_payload,
         "anchor": list(state.current_anchor) if state.current_anchor is not None else None,
         "pending": current_rule_is_pending(state),
@@ -7015,7 +6973,16 @@ def _compact_real_capture_step(
             "refresh_available": resources.refresh_available,
             "refresh_remaining": resources.refresh_remaining,
         },
-        "tiles": _compact_tile_paints(state),
+        "tiles": tile_payloads,
+        # Keep displayed levels separate from model base levels and buffs.
+        "observed_tiles": [
+            {"state": _tile_state_code(t.state), "c": t.paint_category.value,
+             "s": t.paint_subtype, "l": t.paint_level, "t": int(t.paint_is_treasure),
+             "confidence": round(t.confidence, 3),
+             "level_confidence": round(t.paint_level_confidence, 3)}
+            for t in getattr(getattr(scene, "board", None), "tiles", ())
+        ],
+        "line_capacity": summarize_lines(board_payload.get("states", ""), tile_payloads),
         "quality": quality or {},
         "top": candidate_payloads[:3],
         "candidates": candidate_payloads,
@@ -7033,10 +7000,15 @@ def _initial_snapshot_from_step(step: dict) -> dict:
         "t": step.get("t"),
         "board": _learning_board_snapshot(step),
         "tiles": tiles,
+        "line_capacity": summarize_lines(board.get("states", ""), tiles),
         "board_known": _paint_collection_summary_from_compact(tiles),
         "current": current,
         "anchor": step.get("anchor"),
         "pending": bool(step.get("pending")),
+        "brush": step.get("brush"),
+        "active_affix": step.get("active_affix"),
+        "recording_evidence": step.get("recording_evidence"),
+        "observed_tiles": step.get("observed_tiles"),
         "backpack": step.get("backpack") or {},
         "resources": step.get("resources") or {},
         "quality": quality,
@@ -7513,6 +7485,12 @@ def _state_count_delta(previous_board: dict, current_board: dict) -> dict:
         key: int(current_board.get(key, 0)) - int(previous_board.get(key, 0))
         for key in keys
     }
+
+
+def _recording_metadata_changed(previous: dict | None, current: dict) -> bool:
+    previous = previous or {}
+    return any(previous.get(key) != current.get(key) for key in
+               ("current", "brush", "active_affix", "recording_evidence"))
 
 
 def _is_noop_capture_update(inferred_action: dict) -> bool:
@@ -8291,7 +8269,7 @@ def _quick_capture_quality(
         # 今天全错但自评分没掉」就是缺这一项才查不出来：棋盘定位是按窗口
         # 尺寸分别标定的，没有匹配尺寸时会**静默**回落到内置默认比例，
         # 整盘偏移可每格依然读得「很自信」（unknown_tiles 仍是 0）。
-        "layout": layout.last_layout_match(),
+        "layout": getattr(scene, "layout", None) or layout.last_layout_match(),
     }
     global _FAMILY_STATUS_TICK
     _FAMILY_STATUS_TICK += 1

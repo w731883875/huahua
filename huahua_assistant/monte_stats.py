@@ -5,7 +5,7 @@
 用户要求的记录项：
 
 * 当局的**空白地块 / 阻挡 / 虚空**数量；
-* **4 格、5 格、6 格空白连线**数量；
+* **4 格、5 格、6 格普通可用地块连线**数量（整条直线，不要求连续空白）；
 * **怪物 / 玩法 / 宝箱**初始颜料几率；
 * **调色效果**几率、**笔触效果**几率。
 
@@ -33,6 +33,7 @@ from typing import Any
 from . import game_model as gm
 from . import practice as pr
 from . import strategy_lv7 as st
+from .line_capacity import SCHEMA as LINE_CAPACITY_SCHEMA
 
 # 一次运行内累计的计数器键（聚合时按这些键合并）
 _COUNTER_KEYS = (
@@ -87,7 +88,7 @@ def observe_run(
         key: collections.Counter() for key in _COUNTER_KEYS
     }
 
-    # 开局棋盘构成 + 空白连线段长度（用户要的 4/5/6 格连线）
+    # 开局棋盘构成 + 整条横/竖/斜线上普通可用地块数；不按空洞切段。
     for tile in session.state.tiles:
         counters['board_' + tile.state.value][0] += 1
     for length in st.line_runs(session.state):
@@ -208,6 +209,7 @@ def _merge(observations: list[RunObservation]) -> dict[str, Any]:
 
     return {
         'runs': len(observations),
+        'line_capacity_schema': LINE_CAPACITY_SCHEMA,
         'score': {
             'mean': round(statistics.mean(scores), 2) if scores else 0.0,
             'median': round(statistics.median(scores), 2) if scores else 0.0,
@@ -251,7 +253,7 @@ def _board_summary(aggregated: dict[str, Any]) -> str:
     return (
         f'开局地块(每局均值): 空白 {blank:.2f} / 阻挡 {blocked:.2f} / '
         f'虚空 {void:.2f} / 失色 {faded:.2f}\n'
-        f'开局空白连线(每局均值): 4 格 {len4:.2f} 条 / 5 格 {len5:.2f} 条 / '
+        f'开局可用地块连线(每局均值): 4 格 {len4:.2f} 条 / 5 格 {len5:.2f} 条 / '
         f'6 格 {len6:.2f} 条'
     )
 
@@ -317,6 +319,7 @@ def run(
 
     config = {
         'runs': runs,
+        'line_capacity_schema': LINE_CAPACITY_SCHEMA,
         'workers': workers,
         'started_at': stamp,
         'grade_thresholds': list(pr.GRADE_THRESHOLDS),

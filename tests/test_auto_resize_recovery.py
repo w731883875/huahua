@@ -74,8 +74,8 @@ class AutoResizeRecoveryTests(unittest.TestCase):
         self.assertEqual((1536, 877), tracker.frame_size)
         quick.assert_called_once()
 
-    def test_full_recovery_writes_a_new_calibration(self) -> None:
-        """没有新尺寸标定 → 自愈 → 按 1765x965 落盘 → 认全 5 枚颜料。"""
+    def test_image_geometry_recovers_without_saving_calibration(self) -> None:
+        """New sizes are measured from pixels without needing a saved preset."""
         image = _image()
         saved: list[tuple[int, int, Rect]] = []
         with patch.object(vision, "load_layout", return_value=ScreenLayout()), patch.object(
@@ -92,10 +92,9 @@ class AutoResizeRecoveryTests(unittest.TestCase):
         self.assertLessEqual(abs(scene.board.rect.x - TRUE_RECT.x), 12)
         self.assertLessEqual(abs(scene.board.rect.y - TRUE_RECT.y), 12)
         self.assertEqual(5, sum(1 for t in scene.board.tiles if t.state == TileState.PAINT))
-        self.assertTrue(
-            any(w == WIDTH and h == HEIGHT for w, h, _ in saved),
-            f"没有按新尺寸落盘标定：{saved}",
-        )
+        self.assertEqual([], saved)
+        self.assertEqual("image_grid", scene.layout["source"])
+        self.assertEqual((WIDTH, HEIGHT), (scene.layout["width"], scene.layout["height"]))
 
     def test_large_frame_uses_coarse_locate(self) -> None:
         """大窗口必须先在 800 宽缩略图上定位，不能吃满全图搜索。

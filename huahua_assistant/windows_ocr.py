@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import subprocess
 import tempfile
@@ -27,6 +28,8 @@ _ocr_process: subprocess.Popen[str] | None = None
 _warm_thread: threading.Thread | None = None
 _AVAILABLE: bool | None = None
 _probe_lock = threading.Lock()
+_last_error: str | None = None
+_logger = logging.getLogger(__name__)
 
 _POWERSHELL_OCR = r"""
 $ErrorActionPreference = 'Stop'
@@ -34,7 +37,8 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Runtime.WindowsRuntime
 [Windows.Media.Ocr.OcrEngine, Windows.Foundation, ContentType=WindowsRuntime] | Out-Null
 [Windows.Graphics.Imaging.BitmapDecoder, Windows.Foundation, ContentType=WindowsRuntime] | Out-Null
-[Windows.Storage.StorageFile, Windows.Storage, ContentType=WindowsRuntime] | Out-Null
+[Windows.Storage.Streams.InMemoryRandomAccessStream, Windows.Storage.Streams, ContentType=WindowsRuntime] | Out-Null
+[Windows.Storage.Streams.DataWriter, Windows.Storage.Streams, ContentType=WindowsRuntime] | Out-Null
 function Await($Operation, $ResultType) {
     $Method = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
         $_.Name -eq 'AsTask' -and $_.IsGenericMethod -and $_.GetParameters().Count -eq 1
@@ -51,20 +55,70 @@ $ProgressPreference = 'SilentlyContinue'
 while ($true) {
     $ImagePath = [Console]::In.ReadLine()
     if ($null -eq $ImagePath -or $ImagePath -eq '__EXIT__') { break }
+    $Stream = $null
+    $Writer = $null
+    $Bitmap = $null
     try {
-        $File = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($ImagePath)) ([Windows.Storage.StorageFile])
-        $Stream = Await ($File.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])
+        # StorageFile applies WinRT app-location restrictions even when this
+        # desktop process can read the file. Decode ordinary file bytes in memory.
+        $Stream = [Windows.Storage.Streams.InMemoryRandomAccessStream]::new()
+        $Writer = [Windows.Storage.Streams.DataWriter]::new($Stream)
+        $Writer.WriteBytes([System.IO.File]::ReadAllBytes($ImagePath))
+        Await ($Writer.StoreAsync()) ([UInt32]) | Out-Null
+        $Writer.DetachStream() | Out-Null
+        $Writer.Dispose()
+        $Writer = $null
+        $Stream.Seek(0)
         $Decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($Stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
         $Bitmap = Await ($Decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
         $Result = Await ($Engine.RecognizeAsync($Bitmap)) ([Windows.Media.Ocr.OcrResult])
         $Lines = @($Result.Lines | ForEach-Object { $_.Text })
         [Console]::Out.WriteLine('__RESULT__' + ($Lines | ConvertTo-Json -Compress))
     } catch {
-        [Console]::Out.WriteLine('__ERROR__')
+        [Console]::Out.WriteLine('__ERROR__' + ($_.Exception.GetBaseException().Message | ConvertTo-Json -Compress))
+    } finally {
+        if ($null -ne $Bitmap) { $Bitmap.Dispose() }
+        if ($null -ne $Writer) { $Writer.Dispose() }
+        if ($null -ne $Stream) { $Stream.Dispose() }
     }
     [Console]::Out.Flush()
 }
 """
+
+
+def last_error() -> str | None:
+    """Most recent OCR failure; empty text and a failed request are different."""
+    return _last_error
+
+
+def _set_error(message: str | None) -> None:
+    global _last_error
+    if message and message != _last_error:
+        _logger.warning("Windows OCR: %s", message)
+    _last_error = message
+
+
+def text_signature(crop: np.ndarray, *, light_on_dark: bool = False) -> np.ndarray:
+    """Letter detail with aspect preserved, independent of overall brightness."""
+    size = (320, max(16, round(crop.shape[0] * 320 / crop.shape[1])))
+    gray = cv2.cvtColor(cv2.resize(crop, size, interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)
+    operation = cv2.MORPH_TOPHAT if light_on_dark else cv2.MORPH_BLACKHAT
+    return cv2.morphologyEx(gray, operation, np.ones((7, 7), np.uint8))
+
+
+def same_text(left: np.ndarray, right: np.ndarray) -> bool:
+    """Reject changed text while tolerating crop-edge jitter and animation."""
+    if abs(left.shape[0] - right.shape[0]) > 12:
+        return False
+    if max(float(left.std()), float(right.std())) < 1:
+        return True
+    if min(float(left.std()), float(right.std())) < 1:
+        return False
+    if left.shape[0] < right.shape[0]:
+        left, right = right, left
+    padded = cv2.copyMakeBorder(left, 6, 6, 4, 4, cv2.BORDER_CONSTANT, value=0)
+    similarity = cv2.minMaxLoc(cv2.matchTemplate(padded, right, cv2.TM_CCOEFF_NORMED))[1]
+    return similarity >= .85
 
 
 def warm_windows_ocr_async() -> None:
@@ -146,6 +200,8 @@ def recognize_chinese_lines(image: np.ndarray, timeout: float = 2.5) -> tuple[st
             process = _ensure_ocr_process_locked()
             if process is None or process.stdin is None or process.stdout is None:
                 lines = ()
+                cacheable = False
+                _set_error("worker unavailable")
             else:
                 process.stdin.write(os.path.abspath(path) + "\n")
                 process.stdin.flush()
@@ -156,12 +212,21 @@ def recognize_chinese_lines(image: np.ndarray, timeout: float = 2.5) -> tuple[st
                     _abort_ocr_process_locked()
                     lines = ()
                     cacheable = False
+                    _set_error("request timed out")
                     response = ""
                 payload_text = response.strip().removeprefix("__RESULT__")
-                if not response.strip().startswith("__RESULT__") or not payload_text:
+                if not response.strip().startswith("__RESULT__"):
+                    lines = ()
+                    cacheable = False
+                    if response:
+                        _set_error(response.strip())
+                    elif _last_error != "request timed out":
+                        _set_error("worker returned no response")
+                elif not payload_text:
                     # 一帧里没有任何文字时，PowerShell 的 ConvertTo-Json 会输出空串。
                     # 以前这里直接 json.loads("") 抛异常，把整帧识别带崩。
                     lines = ()
+                    _set_error(None)
                 else:
                     import json
 
@@ -169,11 +234,21 @@ def recognize_chinese_lines(image: np.ndarray, timeout: float = 2.5) -> tuple[st
                         decoded = json.loads(payload_text)
                     except ValueError:
                         decoded = ()
+                        cacheable = False
+                        _set_error("invalid OCR response")
                     if isinstance(decoded, str):
                         decoded = [decoded]
+                    if not isinstance(decoded, (list, tuple)):
+                        decoded = ()
+                        cacheable = False
+                        _set_error("invalid OCR response type")
                     lines = tuple(str(line).strip() for line in decoded if str(line).strip())
-    except (OSError, subprocess.SubprocessError):
+                    if cacheable:
+                        _set_error(None)
+    except (OSError, subprocess.SubprocessError) as exc:
         lines = ()
+        cacheable = False
+        _set_error(str(exc))
     finally:
         if path:
             try:

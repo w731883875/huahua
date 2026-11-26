@@ -37,20 +37,21 @@ def _state(tiles: list[gm.Tile], **kwargs) -> gm.PuzzleState:
 
 
 class LineRunsTest(unittest.TestCase):
-    """「4 连、5 连」的度量：只数空白格，虚空/阻挡会截断。"""
+    """整条直线的可用地块数，空洞不切段，已有同类颜料不扣除。"""
 
     def test_empty_board_has_full_length_runs(self) -> None:
         runs = st.line_runs(_state(_blank_board()))
         self.assertIn(BOARD, runs, '空棋盘应当有整行/整列的 6 连')
 
-    def test_void_cells_break_runs(self) -> None:
+    def test_void_cells_reduce_capacity_without_splitting(self) -> None:
         empty_runs = st.line_runs(_state(_blank_board()))
         full_six = sum(1 for length in empty_runs if length >= BOARD)
         tiles = _blank_board()
         for row in range(BOARD):
             tiles[row * BOARD + 2] = gm.Tile(gm.TileState.VOID)
-        broken_six = sum(1 for length in st.line_runs(_state(tiles)) if length >= BOARD)
-        self.assertLess(broken_six, full_six, '整列被虚空截断后，6 连应当变少')
+        runs = st.line_runs(_state(tiles))
+        self.assertLess(sum(length >= BOARD for length in runs), full_six)
+        self.assertGreaterEqual(runs.count(5), BOARD, '每行中间一个虚空，应保留整条 5 格线')
 
     def test_long_line_count_only_counts_long_ones(self) -> None:
         self.assertGreaterEqual(

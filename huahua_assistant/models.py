@@ -18,6 +18,8 @@ class RegionKind(str, Enum):
     CURRENT_PAINT = "current_paint"
     BACKPACK = "backpack"
     BRUSH_OPTIONS = "brush_options"
+    BRUSH_CARD_1 = "brush_card_1"
+    BRUSH_CARD_2 = "brush_card_2"
     CONFIRM_BUTTON = "confirm_button"
     START_DRAWING = "start_drawing"
     FINISH_DRAWING = "finish_drawing"
@@ -171,6 +173,8 @@ class BrushOptionsObservation:
     stage2_scores: dict[str, float]
     keyword_scores: dict[str, float]
     confidence: float
+    card_rects: tuple[Rect, ...] = ()
+    reading_pending: bool = False
 
 
 @dataclass(frozen=True)
@@ -201,6 +205,7 @@ class SceneObservation:
     current_paint: CurrentPaintObservation | None = None
     brush_options: BrushOptionsObservation | None = None
     backpack: BackpackObservation | None = None
+    layout: dict | None = None
 
     def region(self, kind: RegionKind) -> RegionObservation | None:
         for region in self.regions:

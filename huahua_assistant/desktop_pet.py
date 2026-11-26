@@ -1391,14 +1391,18 @@ def _fit_marker_caption(text: str) -> str:
 
 
 def _stage1_point(app, panel: Rect, index: int, count: int) -> tuple[int, int] | None:
-    if count <= 1:
-        x_ratio = 0.50
-    else:
-        x_ratio = (index + 0.5) / count
-    return app._screen_point_for_capture_rect(panel, x_ratio, 0.34)
+    brush = getattr(getattr(app, "current_scene", None), "brush_options", None)
+    cards = getattr(brush, "card_rects", ())
+    if index < len(cards):
+        return app._screen_point_for_capture_rect(cards[index], .5, .5)
+    return app._screen_point_for_capture_rect(panel, .55, .30 if index == 0 else .71)
 
 
 def _stage2_point(app, panel: Rect, index: int, count: int) -> tuple[int, int] | None:
+    brush = getattr(getattr(app, "current_scene", None), "brush_options", None)
+    cards = getattr(brush, "card_rects", ())
+    if index < len(cards):
+        return app._screen_point_for_capture_rect(cards[index], .5, .5)
     if count <= 1:
         y_ratio = 0.45
     else:

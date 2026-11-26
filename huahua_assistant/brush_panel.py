@@ -375,6 +375,7 @@ _ASYNC_STATE: dict[str, object] = {
     "inflight_generation": None,
     #: 上一次成功读取时的 32x12 灰度缩略图，用来判断「面板换了没有」。
     "reading_vector": None,
+    "input_text": None,
 }
 
 
@@ -430,6 +431,7 @@ def reset_cache() -> None:
                 "inflight_generation": None,
                 "generation": int(_ASYNC_STATE["generation"]) + 1,
                 "reading_vector": None,
+                "input_text": None,
             }
         )
 
@@ -511,15 +513,24 @@ def read_brush_panel_async(crop: np.ndarray) -> BrushPanelReading | None:
         return None
     key = panel_signature(crop)
     vector = panel_signature_vector(crop)
+    # Card backgrounds barely change when their text changes. Comparing only
+    # 32x12 average brightness allowed the previous card's OCR to win.
+    text_crop = crop[:, int(crop.shape[1] * .24):max(1, int(crop.shape[1] * .95))]
+    text = windows_ocr.text_signature(text_crop, light_on_dark=True)
     cached = _cache_get(_SIGNATURE_CACHE, key)
-    if cached is not None:
-        with _ASYNC_LOCK:
-            _remember_async(key, cached)
-            _ASYNC_STATE["reading_vector"] = vector
-        return cached
-
     now = time.monotonic()
     with _ASYNC_LOCK:
+        old_text = _ASYNC_STATE.get("input_text")
+        if old_text is not None and not windows_ocr.same_text(old_text, text):
+            _ASYNC_STATE.update(reading=None, reading_vector=None, key=None,
+                                pending=False, inflight_generation=None, requested_at=0.,
+                                generation=int(_ASYNC_STATE["generation"])+1, input_text=text)
+        elif old_text is None:
+            _ASYNC_STATE["input_text"] = text
+        if cached is not None:
+            _remember_async(key, cached)
+            _ASYNC_STATE["reading_vector"] = vector
+            return cached
         if (
             _ASYNC_STATE["reading"] is not None
             and now - float(_ASYNC_STATE["reading_at"]) > PANEL_READ_STALE
@@ -552,6 +563,7 @@ def read_brush_panel_async(crop: np.ndarray) -> BrushPanelReading | None:
         ):
             _ASYNC_STATE["pending"] = False
             _ASYNC_STATE["inflight_generation"] = None
+            _ASYNC_STATE["generation"] = int(_ASYNC_STATE["generation"])+1
         should_request = not _ASYNC_STATE["pending"] and (
             now - float(_ASYNC_STATE["requested_at"]) >= PANEL_READ_INTERVAL
         )
@@ -560,10 +572,11 @@ def read_brush_panel_async(crop: np.ndarray) -> BrushPanelReading | None:
             _ASYNC_STATE["requested_at"] = now
             _ASYNC_STATE["key"] = key
             _ASYNC_STATE["inflight_generation"] = int(_ASYNC_STATE["generation"])
+        generation = int(_ASYNC_STATE["generation"])
     if should_request:
         thread = threading.Thread(
             target=_async_read_worker,
-            args=(key, crop.copy(), int(_ASYNC_STATE["generation"])),
+            args=(key, crop.copy(), generation),
             name="huahua-brush-panel-ocr",
             daemon=True,
         )

@@ -52,11 +52,15 @@ OCR_SCALE = 3.0
 # 实时帧读面板的最小间隔。面板有动画，像素哈希必然每帧都变，
 # 只能按时间节流：0.35 秒一次，其余帧复用上次结果。
 PANEL_READ_INTERVAL = 0.35
+PANEL_RESULT_MAX_AGE = 1.5
 
 _reading_lock = threading.Lock()
 _last_reading: "PanelReading | None" = None
 _last_reading_at = 0.0
 _read_inflight = False
+_reading_generation = 0
+_input_signature: np.ndarray | None = None
+_last_completed_at = 0.0
 
 # 方向词按长度降序，避免「对角斜向」被「横向」截胡。
 _DIRECTION_KEYWORDS: tuple[tuple[str, PaintDirection], ...] = (
@@ -76,7 +80,9 @@ _OBJECT_KEYWORDS: tuple[tuple[str, PaintObject], ...] = (
     ("玩法", PaintObject.GAMEPLAY),
 )
 
-_HEADER_RE = re.compile(r"(怪物|玩法)颜料[-·・](.+?)LV(\d)")
+# Windows OCR renders the game's separator as '-', '·', '．' or '.'.
+# Category + official subtype + LV are the header anchor, not that punctuation.
+_HEADER_RE = re.compile(r"(怪物|玩法)颜料[-·・.．:：]?(.*?)LV([1-7])(?!\d)", re.IGNORECASE)
 _PROGRESS_RE = re.compile(r"\((\d+)/(\d+)\)")
 _UPGRADE_RE = re.compile(r"提升(\d)级")
 
@@ -336,34 +342,63 @@ def read_panel_async(text_crop: np.ndarray) -> PanelReading | None:
     线程堆积、结果永远拿不到，上层只能一直沿用「方向未知」的旧值。
     （实测：实时帧里方向/目标从来没被文字覆盖过。）
 
-    改成「最多每 ``PANEL_READ_INTERVAL`` 秒跑一次 OCR，其余帧直接返回上次结果」。
-    面板真变了最多晚 0.35 秒跟上，对提示来说完全够。
+    每 ``PANEL_READ_INTERVAL`` 秒最多提交一次 OCR。文字区域明显变化时，旧结果
+    和旧请求立即失效；细微进度变化在下一次读取后更新。连续读取失败时，结果
+    最多保留 ``PANEL_RESULT_MAX_AGE`` 秒，避免一直显示上一个颜料。
     """
-    global _last_reading, _last_reading_at, _read_inflight
+    global _last_reading, _last_reading_at, _read_inflight, _reading_generation, _input_signature
 
     if text_crop is None or text_crop.size == 0:
         return None
     now = time.monotonic()
+    signature = _panel_signature(text_crop)
     with _reading_lock:
+        if _input_signature is not None and not _same_panel(_input_signature, signature):
+            # A reroll/new paint can keep the same window and panel rectangle.
+            # Discard both cached text and the outstanding result from the old UI.
+            _reading_generation += 1
+            _last_reading = None
+            _last_reading_at = 0.0
+            _read_inflight = False
+            _input_signature = signature
+        elif _input_signature is None:
+            _input_signature = signature
+        cached = _last_reading if now - _last_completed_at <= PANEL_RESULT_MAX_AGE else None
         if _read_inflight:
-            return _last_reading
+            return cached
         if now - _last_reading_at < PANEL_READ_INTERVAL:
-            return _last_reading
+            return cached
         _read_inflight = True
+        generation = _reading_generation
         # 提交时就记时间：万一这一轮 OCR 失败，也别每帧重试把线程打爆。
         _last_reading_at = now
     payload = prepare_for_ocr(text_crop).copy()
     threading.Thread(
         target=_refresh_reading,
-        args=(payload,),
+        args=(payload, generation),
         name="huahua-panel-ocr",
         daemon=True,
     ).start()
-    return _last_reading
+    return cached
 
 
-def _refresh_reading(payload: np.ndarray) -> None:
-    global _last_reading, _read_inflight
+def _panel_signature(crop: np.ndarray) -> np.ndarray:
+    """Dark lettering, with aspect preserved so crop-edge jitter can be aligned."""
+    return windows_ocr.text_signature(crop)
+
+
+def _same_panel(left: np.ndarray, right: np.ndarray) -> bool:
+    # Small progress/word edits are refreshed by the regular 350 ms OCR. This
+    # gate rejects a different panel without repeatedly cancelling animated UI.
+    return windows_ocr.same_text(left, right)
+
+
+def reading_generation() -> int:
+    return _reading_generation
+
+
+def _refresh_reading(payload: np.ndarray, generation: int) -> None:
+    global _last_reading, _read_inflight, _last_completed_at
     try:
         lines = windows_ocr.recognize_chinese_lines(payload)
         if not lines:
@@ -372,12 +407,15 @@ def _refresh_reading(payload: np.ndarray) -> None:
         if reading.is_empty:
             return
         with _reading_lock:
-            _last_reading = reading
+            if generation == _reading_generation:
+                _last_reading = reading
+                _last_completed_at = time.monotonic()
     except Exception:
         return
     finally:
         with _reading_lock:
-            _read_inflight = False
+            if generation == _reading_generation:
+                _read_inflight = False
 
 
 def last_reading() -> PanelReading | None:
@@ -386,8 +424,11 @@ def last_reading() -> PanelReading | None:
 
 
 def reset_async_state() -> None:
-    global _last_reading, _last_reading_at, _read_inflight
+    global _last_reading, _last_reading_at, _read_inflight, _reading_generation, _input_signature, _last_completed_at
     with _reading_lock:
+        _reading_generation += 1
         _last_reading = None
         _last_reading_at = 0.0
         _read_inflight = False
+        _input_signature = None
+        _last_completed_at = 0.0

@@ -233,6 +233,7 @@ class NewRunTriggerTests(unittest.TestCase):
             real_session_finished = finished
             board_reached_full = full
             last_real_capture_step = previous
+            last_finished_board_states = ""
 
             def start_new_real_session(self, record_event: bool = True) -> None:
                 started.append(record_event)

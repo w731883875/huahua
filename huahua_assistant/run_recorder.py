@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import copy
 import json
 import queue
 import threading
@@ -11,10 +12,10 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from .codes import BRUSH_NAMES, affix_code, brush_code, resolve_affix
-from .fast_vision import FastCurrentPaint, FastTile, FastVisionSnapshot
+from .codes import BRUSH_NAMES, affix_code, brush_code, brush_effect_identity, resolve_affix
+from .fast_vision import FastBrush, FastCurrentPaint, FastTile, FastVisionSnapshot
 from .game_model import AffixEffect, AffixRule, BrushType
-from .models import RegionKind, TileState
+from .models import Rect, RegionKind, TileState
 
 
 def _brush_name(brush: str | None) -> str | None:
@@ -143,6 +144,7 @@ class RecorderFrameResult:
     phase: str
     session_id: str | None
     events: tuple[str, ...]
+    evidence: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -420,6 +422,11 @@ class AutomaticRunRecorder:
         self._stage1_reported: tuple[str, ...] | None = None
         self._pending_force_clicked_at: float | None = None
         self._events: list[dict[str, Any]] = []
+        self._brush_snapshot: FastVisionSnapshot | None = None
+        self._observation_snapshot: FastVisionSnapshot | None = None
+        self._clicked_affix_source = "captured_click"
+        self._clicked_affix_confidence = 0.99
+        self._clicked_affix_options: tuple[str, ...] = ()
         self._installed_paints: Counter[tuple] = Counter()
         self._initial_paints: Counter[tuple] = Counter()
         self._force_count = 0
@@ -473,6 +480,7 @@ class AutomaticRunRecorder:
                     events=(),
                 )
             self._missing_frames = 0
+            self._observation_snapshot = snapshot
             self._frames += 1
             start_visible = RegionKind.START_DRAWING.value in snapshot.regions
             finish_visible = RegionKind.FINISH_DRAWING.value in snapshot.regions
@@ -529,6 +537,19 @@ class AutomaticRunRecorder:
                 self.phase = "playing"
 
             if self.phase in {"opening", "playing"}:
+                # Card panels can disappear before the board becomes stable.
+                # Record their observations independently of board acceptance.
+                previous_brush = self._brush_snapshot or replace(snapshot, brush=None)
+                if (snapshot.brush is not None and self._last_panel_rect is not None
+                        and snapshot.brush.panel_rect != self._last_panel_rect):
+                    self._buffered_panel_clicks = []
+                emitted.extend(self._record_control_clicks(snapshot, clicks))
+                unknown_panel = snapshot.brush is not None and snapshot.brush.reading_pending
+                if not unknown_panel:
+                    emitted.extend(self._record_brush_transition(previous_brush, snapshot, now))
+                    self._brush_snapshot = snapshot
+                if snapshot.brush is not None:
+                    self._last_panel_rect = snapshot.brush.panel_rect
                 # 地形先结算：把「阻挡 ↔ 虚空」这种官方规则里不存在的逐格抖动压在旧值上，
                 # 否则 `_accept_stable_snapshot` 会把它当成"这一帧瞎了"整帧否决，
                 # 而**基准又不推进**，于是一次开局误读就把整局冻住（2026-11-20 实测：
@@ -537,7 +558,6 @@ class AutomaticRunRecorder:
                 emitted.extend(terrain_events)
                 snapshot, level_events = self._settle_levels(snapshot, now)
                 emitted.extend(level_events)
-                emitted.extend(self._record_control_clicks(snapshot, clicks))
                 emitted.extend(self._refresh_initial_inventory(snapshot, now))
                 emitted.extend(self._accept_stable_snapshot(snapshot, now))
                 no_blank = int(snapshot.terrain_counts.get(TileState.BLANK.value, 0) or 0) == 0
@@ -566,12 +586,24 @@ class AutomaticRunRecorder:
                     )
                     emitted.extend(self._finish_run(final_snapshot, now, reason=reason))
 
+            # Cumulative evidence survives FramePump coalescing. Bind it here,
+            # under the lock, so a later UI frame cannot read future events.
+            evidence = self._evidence_snapshot()
         return RecorderFrameResult(
             elapsed=time.perf_counter() - started,
             phase=self.phase,
             session_id=self.session_id,
             events=tuple(emitted),
+            evidence=evidence,
         )
+
+    def _evidence_snapshot(self) -> dict:
+        records = [event for event in self._events
+                   if event['event'].startswith(('brush_', 'affix_'))
+                   or event['event'] == 'current_paint_changed']
+        return {"session": self.session_id,
+                "events": copy.deepcopy(records[-256:]),
+                "truncated": len(records) > 256}
 
     def status(self, *, now: float | None = None) -> RecorderStatus:
         """锁内取一份只读快照，界面线程只认这个。"""
@@ -644,6 +676,7 @@ class AutomaticRunRecorder:
         self.initial_board = _board_payload(snapshot)
         self.initial_inventory = _backpack_payload(snapshot)
         self._last_snapshot = snapshot
+        self._brush_snapshot = None
         self._candidate_snapshot = None
         self._candidate_key = None
         self._candidate_frames = 0
@@ -1100,8 +1133,6 @@ class AutomaticRunRecorder:
     ) -> list[str]:
         emitted: list[str] = []
         changes = _tile_changes(previous, current)
-        brush_events = self._record_brush_transition(previous, current, now)
-        emitted.extend(brush_events)
 
         if changes:
             emitted.append(
@@ -1324,6 +1355,12 @@ class AutomaticRunRecorder:
                 self._clicked_stage1 = None
 
         if after_stage2 and after_stage2 != before_stage2:
+            if self._clicked_affix_options != after_stage2:
+                self._clicked_affix = None
+            if not before_stage2:
+                emitted.append(self._emit("affix_options_observed", {
+                    "options": list(after_stage2), "brush": chosen_after,
+                    "source": "panel_recognition"}, now))
             # 卡片刚读出来：看看之前有没有「面板还没读出来时就点下去」的一下。
             # 有就按 Y 分带回填成具体的词缀选择——这比事后靠等级变化反推可靠得多。
             self._resolve_buffered_panel_click(after, after_stage2, emitted, now)
@@ -1401,8 +1438,8 @@ class AutomaticRunRecorder:
                             "effect": selected.effect.value if selected is not None else None,
                             "options": list(before_stage2),
                             "stage1_options": list(before_stage1),
-                            "confidence": 0.99,
-                            "source": "captured_click",
+                            "confidence": self._clicked_affix_confidence,
+                            "source": self._clicked_affix_source,
                             "clicked_at": round(clicked[1], 3),
                         },
                         now,
@@ -1429,8 +1466,8 @@ class AutomaticRunRecorder:
         ``stage2_options`` 还是空的时候点下的那一下以前直接丢掉，整局就 0 条
         ``affix_card_clicked``，只能退化成 ``effect_inference`` 猜。
 
-        回填后写进 ``self._clicked_affix``，交给面板关闭时那段现成的逻辑收尾——
-        那边会标 ``source="captured_click"``、置信度 0.99，比反推硬气得多。
+        回填后写进 ``self._clicked_affix``，面板关闭时保留 ``buffered_click``
+        来源及其置信度，不把延迟对应的卡片提升为当帧直接命中。
         """
 
         if self._clicked_affix is not None:
@@ -1441,19 +1478,21 @@ class AutomaticRunRecorder:
         self._buffered_panel_clicks = fresh
         if not fresh:
             return
-        # 取**最后一次**落在面板里的点击。卡片点击之后紧跟着的是「确认」，两下都
-        # 落在卡片区域内，所以「最后一下」和「第一下」只要序号相同就是同一次操作。
+        # 取最后一次落在卡片内的点击，排除卡片间隙和下方确认按钮。
         chosen: tuple[float, float, float] | None = None
         for entry in fresh:
-            if _point_in_rect(entry[0], entry[1], brush.panel_rect):
+            if _card_index(brush, entry[0], entry[1], len(stage2_options)) is not None:
                 chosen = entry
         if chosen is None:
             return
         x, y, clicked_at = chosen
         relative_y = (y - brush.panel_rect.y) / max(1, brush.panel_rect.h)
-        index = min(len(stage2_options) - 1, max(0, int(relative_y * len(stage2_options))))
+        index = _card_index(brush, x, y, len(stage2_options))
         name = stage2_options[index]
         self._clicked_affix = (name, clicked_at)
+        self._clicked_affix_source = "buffered_click"
+        self._clicked_affix_confidence = 0.90
+        self._clicked_affix_options = stage2_options
         self._buffered_panel_clicks = []
         emitted.append(
             self._emit(
@@ -1481,7 +1520,7 @@ class AutomaticRunRecorder:
         if not clicks:
             return []
         emitted: list[str] = []
-        brush = snapshot.brush or (self._last_snapshot.brush if self._last_snapshot is not None else None)
+        brush = snapshot.brush or (self._brush_snapshot.brush if self._brush_snapshot is not None else None)
         if brush is not None:
             self._last_panel_rect = brush.panel_rect
         for clicked_at, x, y in clicks:
@@ -1490,8 +1529,8 @@ class AutomaticRunRecorder:
                 if relative_y > CARD_CONFIRM_ZONE_TOP:
                     # 落在两张卡（底边 0.900）之下的确认按钮上：这不是选卡。
                     continue
-                index = 0 if relative_y < 0.52 else 1
-                if 0 <= index < len(brush.stage2_options):
+                index = _card_index(brush, x, y, len(brush.stage2_options))
+                if index is not None:
                     name = brush.stage2_options[index]
                     # 同一条卡连点两下 = 「点卡片 + 点确认」，只算一次选择。
                     #
@@ -1508,6 +1547,9 @@ class AutomaticRunRecorder:
                     ):
                         continue
                     self._clicked_affix = (name, clicked_at)
+                    self._clicked_affix_source = "captured_click"
+                    self._clicked_affix_confidence = 0.99 if brush.card_rects else 0.90
+                    self._clicked_affix_options = brush.stage2_options
                     emitted.append(
                         self._emit(
                             "affix_card_clicked",
@@ -1517,7 +1559,9 @@ class AutomaticRunRecorder:
                                 "options": list(brush.stage2_options),
                                 "brush": brush.chosen_stage1,
                                 "brush_name": _brush_name(brush.chosen_stage1),
-                                "confidence": 0.99,
+                                "confidence": self._clicked_affix_confidence,
+                                "source": "captured_click",
+                                "hit_test": "card_rect" if brush.card_rects else "panel_band",
                                 "click_y": round(y, 1),
                                 "relative_y": round(relative_y, 4),
                                 "panel_height": round(brush.panel_rect.h, 1),
@@ -1551,7 +1595,9 @@ class AutomaticRunRecorder:
                     # 落在两张卡（底边 0.900）之下的确认按钮上：这不是选卡。
                     continue
                 count = len(brush.stage1_options)
-                index = min(count - 1, max(0, int(relative_y * count)))
+                index = _card_index(brush, x, y, count)
+                if index is None:
+                    continue
                 name = brush.stage1_options[index]
                 # 同上面阶段二：点卡片后紧跟着的「确认」会落在同一张卡上，
                 # 同序号且时间相邻就不重复记，只保留第一次。
@@ -1573,6 +1619,8 @@ class AutomaticRunRecorder:
                             "options": list(brush.stage1_options),
                             "names": [_brush_name(option) for option in brush.stage1_options],
                             "confidence": 0.99,
+                            "source": "captured_click",
+                            "hit_test": "card_rect" if brush.card_rects else "panel_band",
                             # 原始坐标留档：阶段一「窄化成一张」是服务端真值，
                             # 配上这里的 relative_y 就能离线校准分带阈值。
                             "click_y": round(y, 1),
@@ -1636,6 +1684,21 @@ class AutomaticRunRecorder:
         *,
         include_in_session: bool = True,
     ) -> str:
+        if kind.startswith("affix_"):
+            payload = dict(payload)
+            if "selected" in payload:
+                payload.update(brush_effect_identity(payload["selected"], payload.get("brush")))
+            # Preserve option order, even when one card cannot be mapped.
+            options = payload.get("options", payload.get("after"))
+            if isinstance(options, (list, tuple)):
+                payload["option_effects"] = [
+                    {"name": name, **brush_effect_identity(name, payload.get("brush"))}
+                    for name in options
+                ]
+        if kind.startswith(("brush_", "affix_")) and self._observation_snapshot is not None:
+            snapshot = self._observation_snapshot
+            payload = {**payload, "observed_current": _current_payload(snapshot.current),
+                       "observed_anchor": list(snapshot.current_anchor) if snapshot.current_anchor else None}
         event = {
             # v1 只增字段、不删字段。⚠️ 2026-11-19 起 `current_paint_changed.payload.after`
             # 里的 `effect_id` 改了含义：现在是**调色效果表**(S8_Gameplay_ItemEffect)的 ID，
@@ -1656,6 +1719,18 @@ class AutomaticRunRecorder:
         if self._writer is not None:
             self._writer.submit(event)
         return kind
+
+
+def _card_index(brush, x: float, y: float, count: int) -> int | None:
+    if count <= 0 or not _point_in_rect(x, y, brush.panel_rect):
+        return None
+    if len(brush.card_rects) == count:
+        hits = [i for i, rect in enumerate(brush.card_rects) if _point_in_rect(x, y, rect)]
+        return hits[0] if len(hits) == 1 else None
+    relative_y = (y - brush.panel_rect.y) / max(1, brush.panel_rect.h)
+    if relative_y > CARD_CONFIRM_ZONE_TOP:
+        return None
+    return min(count - 1, max(0, int(relative_y * count)))
 
 
 def _semantic_snapshot_key(snapshot: FastVisionSnapshot) -> tuple:
@@ -2176,6 +2251,7 @@ def describe_record_status(
     game_window: bool | None = None,
     paused: str | None = None,
     stall_after: float = 8.0,
+    run_archived: bool = False,
 ) -> tuple[str, str]:
     """把录制器状态翻成界面上那盏灯的文字 + 配色等级。
 
@@ -2204,6 +2280,8 @@ def describe_record_status(
     if frame_age is not None and frame_age > stall_after:
         return f"记录 无画面 {frame_age:.0f}s", "error"
     if status.phase == "playing":
+        if run_archived:
+            return _with_writer_warning("记录 本局已存档 · 录制收尾确认中", status), "waiting"
         text = f"记录 录制中 {status.event_count} 事件 {_format_duration(status.duration)}"
         return _with_writer_warning(text, status), "recording"
     if status.phase == "opening":

@@ -27,6 +27,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from . import game_model as gm
+from .line_capacity import analyze_lines
 
 # 用户口径里的硬指标，集中放这里便于对照实机再调。
 LONG_LINE_MIN = 4          # 算作「长连线」的最小长度（4 连、5 连）
@@ -55,43 +56,26 @@ def _is_blank(tile: gm.Tile) -> bool:
     return tile.state is gm.TileState.BLANK
 
 
-def line_runs(state: gm.PuzzleState) -> tuple[int, ...]:
-    """棋盘上所有**可落笔空白格**构成的极大直线段长度（横/竖/两条斜线）。
+def line_runs(state: gm.PuzzleState, category: gm.PaintCategory | None = None) -> tuple[int, ...]:
+    """整条横/竖/斜线上的可用格数，保留旧函数名以兼容统计调用。
 
-    「4 连、5 连」就是这里长度 >= 4 的段。只数空白格，因为只有空白格能落笔；
-    虚空/阻挡/失色/已有颜料都不算——它们会截断连线，这正是用户说的
-    「棋盘图形不好」的意思。
+    不按中间格子切段。指定类别时计空白 + 同类已安装颜料；不指定时
+    只看地块结构，计空白 + 所有已安装颜料。家族和等级不影响类别。
+    虚空/阻挡/失色不计入普通可用格，但不会阻断两侧格子的联系。
     """
-    size = gm.BOARD_SIZE
-    runs: list[int] = []
-
-    def scan(cells: list[tuple[int, int]]) -> None:
-        current = 0
-        for row, col in cells:
-            if 0 <= row < size and 0 <= col < size and _is_blank(state.tile(row, col)):
-                current += 1
-            else:
-                if current >= 2:
-                    runs.append(current)
-                current = 0
-        if current >= 2:
-            runs.append(current)
-
-    for row in range(size):
-        scan([(row, col) for col in range(size)])
-    for col in range(size):
-        scan([(row, col) for row in range(size)])
-    # 主对角线方向（左上→右下）与其平行线
-    for offset in range(-(size - 1), size):
-        scan([(row, row - offset) for row in range(size)])
-    # 副对角线方向（右上→左下）
-    for offset in range(0, 2 * size - 1):
-        scan([(row, offset - row) for row in range(size)])
-    return tuple(runs)
+    codes = {gm.TileState.BLANK: "B", gm.TileState.PAINT: "P", gm.TileState.VOID: "V",
+             gm.TileState.BLOCKED: "K", gm.TileState.FADED: "F"}
+    states = "".join(codes.get(tile.state, "?") for tile in state.tiles)
+    paints = [{"c": tile.paint.category.value} if tile.paint else None for tile in state.tiles]
+    kind = category.value if category is not None else "geometry"
+    if kind not in ("geometry", "monster", "gameplay"):
+        return ()
+    return tuple(line["capacity"][kind]["known"] for line in analyze_lines(states, paints)["lines"]
+                 if line["capacity"][kind]["known"] >= 2)
 
 
 def long_line_count(state: gm.PuzzleState, minimum: int = LONG_LINE_MIN) -> int:
-    """长度 >= ``minimum`` 的直线段条数（用户口径里的「4 连、5 连」）。"""
+    """普通可用地块数 >= minimum 的整条直线数；不是连续空白段。"""
     return sum(1 for length in line_runs(state) if length >= minimum)
 
 

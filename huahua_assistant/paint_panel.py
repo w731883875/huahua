@@ -144,30 +144,45 @@ class PanelReading:
 
     @property
     def effect_text(self) -> str | None:
-        """「调色效果」那一行的正文——也就是这枚颜料的**笔触**。
+        """调色效果正文；与用户选中的笔触效果是两个独立字段。"""
+        return _section_text(self.lines, "tint")
 
-        面板三行固定是：标题 / 调色目标 / 调色效果。前两行早就结构化进
-        ``direction`` / ``target_object`` / 进度，第三行过去**整行被丢掉**，
-        所以复盘时「这笔吃的是哪条笔触」永远查不到（``stats.json`` 里只有
-        全库累计的 code 计数，对不上具体某一手）。
+    @property
+    def brush_effect_text(self) -> str | None:
+        """笔触效果正文，保留换行内容，不从调色效果猜测。"""
+        return _section_text(self.lines, "brush")
 
-        OCR 会把「效果」读成「效里」「效杲」，所以按 `效` + 果/里 匹配，
-        而且**只认带这个标记的行**——没有标记就返回 ``None``，绝不把
-        调色目标行当效果返回。
-        """
 
-        for line in self.lines:
-            if "效果" in line or "效里" in line or "效杲" in line:
-                _, separator, tail = line.partition(":")
-                text = (tail if separator else line).strip()
-                # OCR 有时把冒号也吃掉，整行原样回来。把「调色效果/笔触效果」这层
-                # 标签剥掉，剩下的才是能拿去官方表反查的条目原文。
-                for prefix in ("调色效果", "笔触效果", "调色效里", "笔触效里", "调色效杲", "笔触效杲", "效果"):
-                    if text.startswith(prefix):
-                        text = text[len(prefix) :].lstrip(":：").strip()
-                        break
-                return text or None
-        return None
+_SECTION_RE = re.compile(r"(调?色效[果里杲采]|[笔笋]触效[果里杲采]|颜料内容|调色目标(?!的))")
+
+
+def _section(line: str) -> tuple[str | None, str]:
+    match = _SECTION_RE.search(line)
+    if match is None:
+        return None, line
+    label = match.group(1)
+    kind = ("brush" if "触" in label else "tint" if "效" in label
+            else "target" if "目标" in label else "content")
+    return kind, line[match.end():].lstrip(":：")
+
+
+def _section_text(lines, wanted):
+    active = None
+    parts = []
+    for raw in lines:
+        line = normalize_line(raw)
+        kind, tail = _section(line)
+        if kind is not None:
+            if active == wanted:
+                break
+            active = kind
+            if active == wanted and tail:
+                parts.append(tail)
+        elif active == wanted:
+            if _HEADER_RE.search(line):
+                break
+            parts.append(line)
+    return "".join(parts) or None
 
 
 def _pick_subtype(raw: str) -> str | None:
@@ -221,6 +236,14 @@ def parse_lines(lines: tuple[str, ...] | list[str]) -> PanelReading:
     """把 OCR 出来的若干行解析成 :class:`PanelReading`（纯函数，无 IO）。"""
     normalized = [normalize_line(line) for line in lines]
     normalized = [line for line in normalized if line]
+    # Tooltips render the paint title and level on separate rows.
+    for index in range(len(normalized)-1):
+        if (re.fullmatch(r"(怪物|玩法)颜料[-·・.．:：]?.+", normalized[index])
+                and "LV" not in normalized[index].upper()
+                and re.fullmatch(r"LV[1-7]", normalized[index+1], re.IGNORECASE)):
+            normalized[index] += normalized[index+1]
+            normalized[index+1] = ""
+    normalized = [line for line in normalized if line]
 
     # 标题行（「怪物颜料·黑帮LV3」）是面板里唯一的锚点。
     # 搜索区为了兼容窗口化布局会向上多留一截，可能顺带读到上方的其它 UI；
@@ -241,23 +264,24 @@ def parse_lines(lines: tuple[str, ...] | list[str]) -> PanelReading:
     match_current: int | None = None
     match_required: int | None = None
 
+    active_section = None
     for line in body:
         header = _HEADER_RE.search(line)
         if header is not None:
             category = PaintCategory.MONSTER if header.group(1) == "怪物" else PaintCategory.GAMEPLAY
             subtype = _pick_subtype(header.group(2))
             level = int(header.group(3))
+            active_section = None
             continue
 
-        # 逐项按**内容**取，不再按「这一行是不是目标行/效果行」分流。
-        #
-        # 2026-11-15 实机：面板文案是「在纵向地块上放置玩法颜料(0/3)」，
-        # 整行没有一个「目标」字；而「调色效果」被 OCR 读成「调色效里」、
-        # 「笔触效果」读成「笋触效果」。按关键字分流的结果是方向、目标、
-        # 提升级数三项全丢，`confidence` 卡在 0.52（阈值 0.55），
-        # 整份文字证据被丢弃 —— 界面上就表现成「这份规则没识别出来」。
-        #
-        # 这些字段在面板里各自唯一，谁先读到就算谁的，重复的行不会覆盖。
+        section, _ = _section(line)
+        if section is not None:
+            active_section = section
+        if active_section in {"brush", "content"}:
+            continue
+
+        # Missing headings still allow rule recovery from text. A recognized
+        # brush/content section, however, must never contaminate the tint rule.
         if direction == PaintDirection.UNKNOWN:
             direction = _match_direction(line)
         if target_object == PaintObject.UNKNOWN:

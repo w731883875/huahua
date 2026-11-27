@@ -442,14 +442,8 @@ class AutomaticRunRecorderTests(unittest.TestCase):
         started = next(event for event in recorder._events if event["event"] == "run_started")
         self.assertTrue(started["payload"]["attached_mid_run"])
 
-    def test_current_effect_text_is_recorded_with_the_change(self) -> None:
-        """面板第三行「调色效果」必须进 current_paint_changed。
-
-        2026-11-18 实机复盘：同一类别/等级/方向、只差一条笔触的两枚颜料，
-        旧记录里完全区分不出来，``effect`` 一项都没有 → 用户核对时对不上
-        「第 5 个是转锋·进度-2」这类条目。现在 effect 既是身份的一部分
-        （进 `_current_key`），也写进事件载荷。
-        """
+    def test_current_brush_text_is_recorded_with_the_change(self) -> None:
+        """只有笔触正文变化也应记录，且不混入调色效果字段。"""
         recorder = AutomaticRunRecorder(path=None, stable_frames=1)
         tiles = [_blank_tile(index) for index in range(36)]
         first = _current()
@@ -467,7 +461,7 @@ class AutomaticRunRecorderTests(unittest.TestCase):
             match_current=first.match_current,
             match_required=first.match_required,
             confidence=first.confidence,
-            effect_text="调色目标的进度要求减少2",
+            brush_effect_text="调色目标的进度要求减少2",
         )
         recorder.process(_snapshot(tiles, current=first), observed_at=5000.0)
         recorder.process(_snapshot(tiles, current=second), observed_at=5000.2)
@@ -475,7 +469,8 @@ class AutomaticRunRecorderTests(unittest.TestCase):
         changes = [event for event in recorder._events if event["event"] == "current_paint_changed"]
         self.assertEqual(1, len(changes))
         self.assertIsNone(changes[0]["payload"]["before"]["effect"])
-        self.assertEqual("调色目标的进度要求减少2", changes[0]["payload"]["after"]["effect"])
+        self.assertIsNone(changes[0]["payload"]["after"]["effect"])
+        self.assertEqual("调色目标的进度要求减少2", changes[0]["payload"]["after"]["brush_effect"])
         self.assertEqual([], changes[0]["payload"]["after"]["effect_id"])
         self.assertEqual([1011], changes[0]["payload"]["after"]["brush_effect_id"])
 

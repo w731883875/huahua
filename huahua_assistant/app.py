@@ -43,6 +43,7 @@ from .capture import (
     write_image,
 )
 from .config import config_value
+from .brush_recording import BrushEvidenceService, EvidenceStore
 from .codebook import Codebook, board_signature, paint_id
 from .codes import (
     affix_code,
@@ -375,9 +376,13 @@ class HuahuaApp(tk.Tk):
         self.last_fast_events: tuple[FastVisionEvent, ...] = ()
         self.last_pet_state: PetBrainState | None = None
         self.tracker = VisionTracker()
-        self.run_recorder = AutomaticRunRecorder()
+        self.run_recorder = AutomaticRunRecorder(external_brush_choices=True)
         self.mouse_click_monitor = MouseClickMonitor()
         self.mouse_click_monitor.start()
+        self.brush_evidence = BrushEvidenceService(self.mouse_click_monitor, store=EvidenceStore(
+            max_bytes=int(config_value("brush_recording.max_image_mb", 128)) * 1024 * 1024,
+            mode=str(config_value("brush_recording.mode", "validation")),
+        ))
         self.backpack_accumulator = BackpackAccumulator()
         self.backpack_session_key: str | None = None
         #: 最近一帧是否真的在画面里看到了背包面板。None = 还没有任何一帧。
@@ -733,6 +738,7 @@ class HuahuaApp(tk.Tk):
             font=("Microsoft YaHei UI", 9, "bold"),
         )
         self.record_label.pack(side=tk.RIGHT, padx=(12, 0))
+        tk.Button(footer, text="笔触核对", command=self._open_brush_review, width=8).pack(side=tk.RIGHT)
 
         status = tk.Label(
             footer,
@@ -746,6 +752,15 @@ class HuahuaApp(tk.Tk):
         body.pack(fill=tk.BOTH, expand=True, padx=14, pady=8)
 
         self._draw_empty_grid()
+
+    def _open_brush_review(self) -> None:
+        from .brush_review import write_report
+        try:
+            path = self.brush_evidence.store.root / "review.html"
+            write_report(self.brush_evidence.store, path)
+            os.startfile(str(path.resolve()))
+        except OSError as exc:
+            self._set_notice(f"笔触核对页打开失败：{exc}", "warning")
 
     def _set_notice(self, message: str, level: str = "info") -> None:
         bg, fg = NOTICE_STYLES.get(level, NOTICE_STYLES["info"])
@@ -854,6 +869,11 @@ class HuahuaApp(tk.Tk):
                 paused=paused_reason,
                 run_archived=self.real_session_finished and not self.pending_new_run,
             )
+            service = getattr(self, "brush_evidence", None)
+            error = (service.last_error or service.store.last_error) if service is not None else None
+            if error:
+                text += " · " + {"image_budget_exhausted": "笔触图片已达上限",
+                                  "id_only_requires_verified_accuracy": "笔触待准确率核验"}.get(error, "笔触记录需检查")
             self.record_var.set(text)
             self.record_level = level
             if self.record_label is not None:
@@ -1548,9 +1568,13 @@ class HuahuaApp(tk.Tk):
             )
         interval_ms = max(100, int(self.auto_follow_interval_var.get() or 100))
         self.auto_follow_pump.start(interval=interval_ms / 1000.0)
+        self.brush_evidence.start()
         self.auto_follow_last_frame_at = time.monotonic()
 
     def _stop_auto_follow_pump(self, *, wait: bool = False) -> None:
+        evidence = getattr(self, "brush_evidence", None)
+        if evidence is not None:
+            evidence.stop()
         if self.auto_follow_pump is not None:
             self.auto_follow_pump.stop(wait=wait)
         self.auto_follow_pump = None
@@ -1582,9 +1606,16 @@ class HuahuaApp(tk.Tk):
                 local_clicks.append((click.ts, x, y))
         # 换局信号「用掉就清」：日志事件是一次性的，不能每帧都拿它去切局。
         boundary, self._recorder_run_boundary = self._recorder_run_boundary, None
-        return self.run_recorder.process(
+        result = self.run_recorder.process(
             snapshot, clicks=tuple(local_clicks), run_boundary=boundary
         )
+        service = getattr(self, "brush_evidence", None)
+        if service is not None:
+            service.context(result.session_id if result.phase in {"opening", "playing"} else None, snapshot)
+            evidence = dict(result.evidence or {})
+            evidence["brush_choices"] = service.evidence(result.session_id)
+            result = replace(result, evidence=evidence)
+        return result
 
     # --- 游戏日志驱动 -------------------------------------------------------
 
@@ -1723,8 +1754,14 @@ class HuahuaApp(tk.Tk):
             # 日志是服务端驱动的，没有这个歧义。
             if any(event.kind == "into" for event in events):
                 self._recorder_run_boundary = "new_run"
+                service = getattr(self, "brush_evidence", None)
+                if service is not None:
+                    service.context(None, None)
             elif any(event.kind == "finish" for event in events):
                 self._recorder_run_boundary = "finished"
+                service = getattr(self, "brush_evidence", None)
+                if service is not None:
+                    service.context(None, None)
             self._sync_game_log_status(watcher)
 
         # 先定「静默与否」。它只看 watcher 的时间戳，跟这一批事件无关，
@@ -6370,6 +6407,7 @@ class HuahuaApp(tk.Tk):
         # 窗口内容抓取的会话持有 Direct3D 设备，不释放会在下次启动前一直占着显存。
         close_capture_backends()
         self.mouse_click_monitor.close()
+        self.brush_evidence.close()
         self.run_recorder.close()
         self.destroy()
 
@@ -6951,6 +6989,7 @@ def _compact_real_capture_step(
         effect_text = hint.split("effect=", 1)[1].strip()
     current_payload = dict(_compact_rule(rule) or {})
     current_payload["effect"] = effect_text
+    current_payload["brush_effect"] = getattr(scene.current_paint, "brush_effect_text", None)
     board_payload = _compact_board_summary(scene)
     tile_payloads = _compact_tile_paints(state)
     return {

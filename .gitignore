@@ -22,3 +22,4 @@ _repak/
 
 # 一次性截帧/探针产物
 huahua_ocr_*.bmp
+runtime/brush_evidence/

@@ -17,6 +17,30 @@ def rule_effects(rule: dict) -> list[dict]:
 def selection_evidence(step: dict) -> dict:
     """Expose a choice with provenance; never treat temporal proximity as proof."""
     bundle = step.get("recording_evidence") or {}
+    modern = bundle.get("brush_choices")
+    if isinstance(modern, dict) and modern.get("schema") == "brush-evidence-v1":
+        choices = modern.get("choices") or []
+        record = choices[-1] if choices else None
+        if record is None or record.get("stage") != "effect" or record.get("status") != "confirmed":
+            return {"status": "unknown", "selected": None, "source": "retained_card_ocr",
+                    "choice_id": (record or {}).get("choice_id"),
+                    "note": "卡片记录尚未取得选卡、确认和文字的完整证据；不采用旧版倒推结论。"}
+        result = dict(record)
+        if not result.get("selected"):
+            from .codes import resolve_affix
+            rule = resolve_affix(result.get("canonical_affix_id"))
+            result["selected"] = rule.display_name if rule is not None else None
+        result["status"] = "unlinked"
+        result["note"] = "已记录卡片点击和确认；对应颜料及落点仍需独立证据。"
+        paint = (step.get("current") or {}).get("paint") or {}
+        observed = record.get("paint_observation") or {}
+        placement = record.get("placement") or {}
+        if (placement.get("status") == "associated" and step.get("anchor") == [placement.get("row"), placement.get("col")]
+                and observed.get("agreement") is True and observed.get("subtype") == paint.get("s")
+                and observed.get("category") == paint.get("c")):
+            result["status"] = "associated"
+            result["note"] = "选卡、确认、笔触正文及落点读数一致；视觉关联，不等于协议确认。"
+        return result
     events = bundle.get("events") or []
     selected = None
     for event in events:

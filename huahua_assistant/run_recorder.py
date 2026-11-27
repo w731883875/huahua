@@ -345,8 +345,10 @@ class _AsyncJsonlWriter:
 class AutomaticRunRecorder:
     """Convert stable fast-vision snapshots into a complete automatic run log."""
 
-    def __init__(self, path: Path | None = AUTO_RUN_LOG, *, stable_frames: int = 2) -> None:
+    def __init__(self, path: Path | None = AUTO_RUN_LOG, *, stable_frames: int = 2,
+                 external_brush_choices: bool = False) -> None:
         self._lock = threading.RLock()
+        self._external_brush_choices = external_brush_choices
         self._writer = _AsyncJsonlWriter(path) if path is not None else None
         self._stable_frames = max(1, int(stable_frames))
         self.phase = "waiting"
@@ -1684,6 +1686,13 @@ class AutomaticRunRecorder:
         *,
         include_in_session: bool = True,
     ) -> str:
+        if kind == "affix_choice_resolved" and self._external_brush_choices:
+            # The dedicated card recorder owns confirmed choices. Keep legacy
+            # board inference as a candidate for diagnostics, never as a choice.
+            payload = dict(payload)
+            payload["candidate"] = payload.pop("selected", None)
+            payload["status"] = "unconfirmed_legacy_candidate"
+            kind = "affix_choice_legacy_candidate"
         if kind.startswith("affix_"):
             payload = dict(payload)
             if "selected" in payload:
@@ -2040,6 +2049,7 @@ def _current_key(current: FastCurrentPaint | None) -> tuple | None:
         # 面板「调色效果」原文也是这枚颜料的身份：类别/等级/方向全同、只差一条效果
         # 的两枚颜料必须算两次变化，否则复盘看不到「这一手换了笔触」。
         current.effect_text,
+        current.brush_effect_text,
     )
 
 
@@ -2056,15 +2066,17 @@ def _current_payload(current: FastCurrentPaint | None) -> dict[str, Any] | None:
         "upgrade": current.upgrade_amount,
         "match_current": current.match_current,
         "match_required": current.match_required,
-        # 笔触条目原文（面板第三行）。None = 那一帧没读到，不代表没有效果。
+        # 两段文字分别记录；None 仅表示未读到。
         "effect": current.effect_text,
+        "brush_effect": current.brush_effect_text,
         # 这句话在**地块调色效果表**（S8_Gameplay_ItemEffect，27 条）里的记录 ID。
         # 上线实测：面板第三行多数时候显示的是「使纵向的玩法颜料提升2级」这类调色效果，
         # 早先拿笔触表反查，结果 9 段全空。
         "effect_id": _plot_effect_ids(current.effect_text),
-        # 同一句话在**笔触表**（S8_Gameplay_SelectableEffect，59 条）里的记录 ID。
+        # 笔触效果正文在**笔触表**（S8_Gameplay_SelectableEffect）里的候选 ID。
         # 两张表 ID 撞号但语义不同（1101 在两张表里完全是两回事），所以分开记。
-        "brush_effect_id": _brush_effect_ids(current.effect_text),
+        "brush_effect_id": _brush_effect_ids(current.brush_effect_text),
+        "brush_effect_source": "brush_section" if current.brush_effect_text else None,
     }
 
 

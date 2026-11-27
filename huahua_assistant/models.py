@@ -156,11 +156,9 @@ class CurrentPaintObservation:
     upgrade_amount: int | None
     keyword_scores: dict[str, float]
     raw_text_hint: str
-    #: 面板第三行「调色效果」的正文 = 这枚颜料自带的**笔触条目**原文，
-    #: 例如「使自身等级提升1级」「对全图中与自身内容相同的颜料额外提升1级」。
-    #: 过去这一行解析完就扔，复盘只能看到大类（堆砌/扩散/转锋），
-    #: 对不上游戏里那一条（官方 52 条 selectableeffect）。
+    #: 调色规则与附加笔触分别记录，不能互相当作选择证据。
     effect_text: str | None = None
+    brush_effect_text: str | None = None
 
 
 @dataclass(frozen=True)

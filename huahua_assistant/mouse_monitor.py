@@ -19,6 +19,7 @@ class MouseClick:
     ts: float
     x: int
     y: int
+    window_geometry: tuple[int, int, int, int, int] | None = None
 
 
 class _Point(ctypes.Structure):
@@ -35,12 +36,28 @@ class _MouseHookData(ctypes.Structure):
     )
 
 
+def _click_window_geometry(user32):
+    from .capture import physical_pixel_coordinates, _visible_bounds
+    hwnd = int(user32.GetForegroundWindow() or 0)
+    if not hwnd:
+        return None
+    rect = wintypes.RECT()
+    with physical_pixel_coordinates():
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return None
+        # Capture uses DWM visible bounds; GetWindowRect alone includes the
+        # invisible resize grip and would reject every click in windowed mode.
+        rect = _visible_bounds(hwnd, rect)
+        return (hwnd, rect.left, rect.top, rect.right-rect.left, rect.bottom-rect.top)
+
+
 class MouseClickMonitor:
     """Capture click coordinates; consumers discard clicks outside game controls."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._clicks: deque[MouseClick] = deque(maxlen=128)
+        self._history: deque[MouseClick] = deque(maxlen=256)
         self._thread: threading.Thread | None = None
         self._thread_id = 0
         self._hook = None
@@ -74,6 +91,11 @@ class MouseClickMonitor:
         if self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout=0.5)
 
+    def since(self, timestamp: float) -> tuple[MouseClick, ...]:
+        """Independent read cursor for card recording; never drains board clicks."""
+        with self._lock:
+            return tuple(click for click in self._history if click.ts > timestamp)
+
     def _run(self) -> None:
         user32 = ctypes.windll.user32
         kernel32 = ctypes.windll.kernel32
@@ -84,8 +106,11 @@ class MouseClickMonitor:
         def hook_callback(code, message, data):
             if code >= 0 and int(message) == WM_LBUTTONDOWN:
                 payload = ctypes.cast(data, ctypes.POINTER(_MouseHookData)).contents
+                geometry = _click_window_geometry(user32)
+                click = MouseClick(time.time(), int(payload.pt.x), int(payload.pt.y), geometry)
                 with self._lock:
-                    self._clicks.append(MouseClick(time.time(), int(payload.pt.x), int(payload.pt.y)))
+                    self._clicks.append(click)
+                    self._history.append(click)
             return user32.CallNextHookEx(self._hook, code, message, data)
 
         self._callback = callback_type(hook_callback)
@@ -93,6 +118,8 @@ class MouseClickMonitor:
         kernel32.GetModuleHandleW.restype = wintypes.HMODULE
         user32.SetWindowsHookExW.argtypes = (ctypes.c_int, callback_type, wintypes.HMODULE, wintypes.DWORD)
         user32.SetWindowsHookExW.restype = ctypes.c_void_p
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        user32.GetWindowRect.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.RECT))
         # 不声明 argtypes 的话 ctypes 按 32 位 int 传参，64 位下 lParam 一超范围就抛
         # OverflowError，钩子链里每个鼠标事件都刷一条异常。
         user32.CallNextHookEx.argtypes = (

@@ -1338,6 +1338,7 @@ def _correct_current_paint_from_board_anchor(
         keyword_scores=current_paint.keyword_scores,
         raw_text_hint=current_paint.raw_text_hint,
         effect_text=current_paint.effect_text,
+        brush_effect_text=current_paint.brush_effect_text,
     )
 
 
@@ -1858,6 +1859,7 @@ def _analyze_current_paint(
         keyword_scores=keyword_scores,
         raw_text_hint=raw_text_hint,
         effect_text=getattr(panel_text, "effect_text", None),
+        brush_effect_text=getattr(panel_text, "brush_effect_text", None),
     )
 
 
@@ -2016,6 +2018,7 @@ def _analyze_current_paint_fast(
         keyword_scores=keyword_scores,
         raw_text_hint=raw_text_hint,
         effect_text=getattr(panel_text, "effect_text", None),
+        brush_effect_text=getattr(panel_text, "brush_effect_text", None),
     )
 
 

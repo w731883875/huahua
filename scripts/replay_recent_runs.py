@@ -175,7 +175,7 @@ def compact_event(record, first_ts):
             'sequence': record.get('sequence'), 'payload': payload}
 
 
-def make_run(payload, archive_line, observations, recorder_records):
+def make_run(payload, archive_line, observations, recorder_records, brush_records=None):
     steps = copy.deepcopy(payload['steps'])
     start = float(payload.get('started_at') or 0)
     first_ts = start+float(steps[0].get('t') or 0)
@@ -191,6 +191,18 @@ def make_run(payload, archive_line, observations, recorder_records):
     output_steps = []
     for index, step in enumerate(steps):
         ts = start+float(step.get('t') or 0)
+        bundle = step.get('recording_evidence') or {}
+        modern = bundle.get('brush_choices')
+        if isinstance(modern, dict) and brush_records:
+            # Exact recorder session + choice identity only. Late OCR is evidence
+            # about captured pixels, not a new action at the time replay is built.
+            session_id = bundle.get('session')
+            merged = {r['choice_id']: r for r in modern.get('choices') or []}
+            from huahua_assistant.brush_recording import choice_at_time
+            for key, record in brush_records.items():
+                if record.get('session') == session_id and float(record.get('observed_at') or 0) <= ts:
+                    merged[key] = choice_at_time(record, ts)
+            modern['choices'] = sorted(merged.values(), key=lambda r:r.get('observed_at', 0))
         changes = diff_steps(previous, step) if previous is not None else []
         gaps = ts-(start+float(previous.get('t') or 0)) if previous else 0
         issues = snapshot_issues(step)
@@ -299,6 +311,8 @@ def make_run(payload, archive_line, observations, recorder_records):
 
 
 def build_report(runtime, count=5):
+    from huahua_assistant.brush_recording import EvidenceStore
+    brush_records = EvidenceStore(runtime/'brush_evidence').records()
     archives = runtime/'high_score_trajectories.jsonl'
     selected, ignored, bad = select_archives(archives, count)
     if not selected:
@@ -317,7 +331,7 @@ def build_report(runtime, count=5):
             observations[session].append({**record, '_line': line})
     recorder = [{**r, '_line': line} for line,r in read_rows(runtime/'auto_run_records.jsonl') if r is not None]
     report = {'schema': 'huahua-archive-replay-v1', 'generated_at': datetime.now(LOCAL).isoformat(),
-              'runs': [make_run(p, line, observations, recorder) for _,p,line in selected],
+              'runs': [make_run(p, line, observations, recorder, brush_records) for _,p,line in selected],
               'excluded_single_state': sorted(ignored, key=lambda x: x.get('finished_at') or 0, reverse=True),
               'invalid_archive_lines': bad, 'invalid_observation_lines': bad_obs,
               'sources': [{'name': name, 'bytes': (runtime/name).stat().st_size}

@@ -9,6 +9,10 @@ from typing import Any
 CONFIG_PATH = Path("runtime/strategy_config.json")
 
 DEFAULT_STRATEGY_CONFIG: dict[str, Any] = {
+    "brush_recording": {
+        "mode": "validation",
+        "max_image_mb": 128,
+    },
     "quality": {
         "min_overall": 0.58,
         "min_board": 0.48,

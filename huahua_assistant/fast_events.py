@@ -239,6 +239,8 @@ def _current_key(current: FastCurrentPaint | None) -> tuple | None:
         current.upgrade_amount,
         current.match_current,
         current.match_required,
+        current.effect_text,
+        current.brush_effect_text,
     )
 
 

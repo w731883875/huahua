@@ -111,8 +111,8 @@ class ParseLinesTest(unittest.TestCase):
         self.assertEqual(reading.target_object, PaintObject.GAMEPLAY)
         self.assertEqual(reading.direction, PaintDirection.ADJACENT)
 
-    def test_effect_text_is_the_brush_of_this_paint(self) -> None:
-        """「调色效果」整行必须能取回来——它就是这枚颜料的笔触。"""
+    def test_effect_text_is_the_tint_rule_of_this_paint(self) -> None:
+        """调色效果独立保留，不等于选中的笔触效果。"""
 
         reading = paint_panel.parse_lines(OCR_SAMPLES["怪谈"])
         self.assertEqual(reading.effect_text, "使相邻的所有颜料提升2级")
@@ -143,7 +143,7 @@ class ParseLinesTest(unittest.TestCase):
         self.assertEqual(reading.effect_text, "调色目标的进度要求减少2")
 
     def test_effect_text_is_none_when_panel_has_no_effect_line(self) -> None:
-        # 没有效果行时绝不能把「调色目标」当成笔触返回。
+        # 没有效果行时绝不能把「调色目标」当成效果返回。
         reading = paint_panel.parse_lines(
             ["怪物颜料·鼠人LV1", "调色目标:在相邻地块上放置所有颜料(0/3)"]
         )

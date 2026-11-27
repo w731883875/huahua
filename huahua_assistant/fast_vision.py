@@ -71,8 +71,9 @@ class FastCurrentPaint:
     match_current: int | None
     match_required: int | None
     confidence: float
-    #: 面板「调色效果」正文（笔触条目原文）。None = 没读到这一行。
+    #: 面板「调色效果」正文。None = 没读到这一行。
     effect_text: str | None = None
+    brush_effect_text: str | None = None
 
 
 @dataclass(frozen=True)
@@ -297,8 +298,9 @@ def _fast_current(current: CurrentPaintObservation | None) -> FastCurrentPaint |
         match_current=current.match_current,
         match_required=current.match_required,
         confidence=round(sum(confidence_parts) / len(confidence_parts), 3),
-        # 面板第三行「调色效果」，即这笔吃的是哪一条官方笔触。
+        # 调色规则与附加笔触正文分别传入录制快照。
         effect_text=getattr(current, "effect_text", None),
+        brush_effect_text=getattr(current, "brush_effect_text", None),
     )
 
 

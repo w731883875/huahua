@@ -874,6 +874,11 @@ class HuahuaApp(tk.Tk):
             if error:
                 text += " · " + {"image_budget_exhausted": "笔触图片已达上限",
                                   "id_only_requires_verified_accuracy": "笔触待准确率核验"}.get(error, "笔触记录需检查")
+            monitor = getattr(self, "mouse_click_monitor", None)
+            if monitor is not None and monitor.warning:
+                text += " · " + {"input_low_integrity": "笔触点击受限，请双击启动.bat重开工具",
+                                  "input_hook_failed": "鼠标钩子失败，正用备用点击检测"}[monitor.warning]
+                level = "error" if monitor.warning == "input_low_integrity" else "waiting"
             self.record_var.set(text)
             self.record_level = level
             if self.record_label is not None:
@@ -1614,6 +1619,7 @@ class HuahuaApp(tk.Tk):
             service.context(result.session_id if result.phase in {"opening", "playing"} else None, snapshot)
             evidence = dict(result.evidence or {})
             evidence["brush_choices"] = service.evidence(result.session_id)
+            self.run_recorder.record_brush_choices(evidence["brush_choices"]["choices"])
             result = replace(result, evidence=evidence)
         return result
 

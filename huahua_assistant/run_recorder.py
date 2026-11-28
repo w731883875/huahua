@@ -349,6 +349,7 @@ class AutomaticRunRecorder:
                  external_brush_choices: bool = False) -> None:
         self._lock = threading.RLock()
         self._external_brush_choices = external_brush_choices
+        self._external_choice_states: dict[str, tuple] = {}
         self._writer = _AsyncJsonlWriter(path) if path is not None else None
         self._stable_frames = max(1, int(stable_frames))
         self.phase = "waiting"
@@ -1678,6 +1679,25 @@ class AutomaticRunRecorder:
                 )
         return emitted
 
+    def record_brush_choices(self, choices: list[dict]) -> None:
+        """Write durable outcomes from the dedicated recorder, once per change."""
+        with self._lock:
+            for choice in choices:
+                if choice.get("session") != self.session_id or not choice.get("choice_id"):
+                    continue
+                key = choice["choice_id"]
+                state = (choice.get("status"), choice.get("selected_index"),
+                         choice.get("selected"), choice.get("canonical_affix_id"))
+                previous = self._external_choice_states.get(key)
+                if state == previous or (state[0] != "confirmed" and previous is None):
+                    continue
+                self._external_choice_states[key] = state
+                if len(self._external_choice_states) > 256:
+                    del self._external_choice_states[next(iter(self._external_choice_states))]
+                payload = {k: v for k, v in choice.items() if k not in {"cards", "session"}}
+                self._emit("brush_choice_confirmed" if state[0] == "confirmed" else "brush_choice_retracted",
+                           payload, time.time())
+
     def _emit(
         self,
         kind: str,
@@ -1693,6 +1713,13 @@ class AutomaticRunRecorder:
             payload["candidate"] = payload.pop("selected", None)
             payload["status"] = "unconfirmed_legacy_candidate"
             kind = "affix_choice_legacy_candidate"
+        elif kind == "brush_stage1_selected" and self._external_brush_choices:
+            payload = dict(payload)
+            payload["candidate"] = payload.pop("selected", None)
+            payload["candidate_name"] = payload.pop("selected_name", None)
+            payload["candidate_code"] = payload.pop("code", None)
+            payload["status"] = "unconfirmed_legacy_candidate"
+            kind = "brush_stage1_legacy_candidate"
         if kind.startswith("affix_"):
             payload = dict(payload)
             if "selected" in payload:

@@ -13,7 +13,7 @@ from huahua_assistant.paint_panel import parse_lines
 from huahua_assistant.models import PaintDirection, PaintObject, Rect
 from huahua_assistant.brush_recording import (
     EvidenceStore, ChoiceTracker, match_card, audit_report,
-    detect_cards,
+    detect_cards, selected_card, _same_card_text,
     BrushEvidenceService, recognizer_revision, choice_at_time,
 )
 from huahua_assistant.replay_effects import selection_evidence
@@ -53,6 +53,16 @@ class SeparateEffectsTest(unittest.TestCase):
 
 
 class MatchTest(unittest.TestCase):
+    def test_card_crop_height_jitter_keeps_text_but_not_a_second_line(self):
+        rng = np.random.default_rng(42)
+        text = rng.integers(0, 200, (22, 320), dtype=np.uint8)
+        small = np.pad(text, ((5, 5), (0, 0)))
+        tall = np.pad(small, ((10, 10), (0, 0)))
+        self.assertTrue(_same_card_text(small, tall))
+        extra = tall.copy()
+        extra[:10] = rng.integers(0, 255, (10, 320), dtype=np.uint8)
+        self.assertFalse(_same_card_text(small, extra))
+
     def test_unknown_and_duplicate_slots(self):
         self.assertIsNone(match_card([])['name'])
         result = match_card(['当前颜料可放置在阻挡地块'])
@@ -113,6 +123,161 @@ class RecordingTest(unittest.TestCase):
     def show(self, ts=10, session='s1', geometry=(1, 0, 0, 200, 200)):
         return self.tracker.observe(self.cards, self.rects, self.confirm,
                                     geometry=geometry, session=session, ts=ts)
+
+    def highlighted(self, index):
+        cards = [card.copy() for card in self.cards]
+        cv2.rectangle(cards[index], (0, 0), (159, 39), (250, 240, 210), 2)
+        return tuple(cards)
+
+    def show_selected(self, index=1, ts=10, geometry=(1, 0, 0, 200, 200)):
+        cards = self.highlighted(index)
+        key, _ = self.tracker.observe(cards, self.rects, self.confirm,
+                                      geometry=geometry, session='s1', ts=ts)
+        self.tracker.observe(cards, self.rects, self.confirm,
+                             geometry=geometry, session='s1', ts=ts+.15)
+        self.tracker.reading(key, [match_card(['作用方向改为横向']), match_card(['调色目标的进度要求减少3'])])
+        return key
+
+    def test_real_frame_border_requires_three_edges_and_unique_slot(self):
+        self.assertIsNone(selected_card(self.cards))
+        self.assertEqual(selected_card(self.highlighted(1)), 1)
+        art = [c.copy() for c in self.cards]
+        art[0][10:30, 10:140] = 255  # Bright artwork/text is not a border.
+        self.assertIsNone(selected_card(art))
+        self.assertIsNone(selected_card([self.highlighted(0)[0], self.highlighted(1)[1]]))
+
+    def test_highlight_is_provisional_until_confirmed(self):
+        key = self.show_selected()
+        record = self.store.records()[key]
+        self.assertEqual(record['selected_index'], 1)
+        self.assertIsNone(record['clicked_at'])
+        self.assertIsNone(record['selected'])
+        self.assertIsNone(record['brush_effect_id'])
+        self.tracker.absent(10.5)
+        self.tracker.absent(11)
+        self.assertEqual(self.store.records()[key]['status'], 'unconfirmed')
+
+    def test_highlight_survives_focus_loss_and_confirm_saves_selected_id(self):
+        key = self.show_selected()
+        self.tracker.absent(11, reason='foreground_lost')
+        self.tracker.absent(100, reason='foreground_lost')
+        self.assertEqual(self.tracker.active, key)
+        resumed = self.show_selected(ts=101)
+        self.assertEqual(resumed, key)
+        self.tracker.click(101.3, 130, 140, (1, 0, 0, 200, 200))
+        self.tracker.absent(101.4)
+        self.tracker.absent(102)
+        record = self.store.records()[key]
+        self.assertEqual(record['status'], 'confirmed')
+        self.assertEqual(record['brush_effect_id'], 1012)
+        self.assertEqual(record['canonical_affix_id'], 'transform.match_required.minus_3')
+        self.assertEqual(record['source'], 'selection_frame_and_confirm')
+        self.assertEqual(record['cards'][0]['brush_effect_ids'], [1002, 4001])
+        service = BrushEvidenceService(MouseClickMonitor(), store=self.store)
+        service.tracker = self.tracker
+        self.assertEqual(service.evidence('s1')['choices'][0]['brush_effect_id'], 1012)
+
+    def test_confirm_on_focus_return_before_first_new_sample(self):
+        key = self.show_selected()
+        self.tracker.suspend(11)
+        service = BrushEvidenceService(MouseClickMonitor(), store=self.store)
+        service.tracker, service.session = self.tracker, 's1'
+        frame = np.zeros((200, 200, 3), np.uint8)
+        for rect, card in zip(self.rects, self.highlighted(1)):
+            frame[rect.y:rect.bottom, rect.x:rect.right] = card
+        service._accept_sample(frame, (Rect(0, 0, 5, 5), self.rects, self.confirm),
+                               (1, 0, 0, 200, 200), 100, 's1',
+                               [MouseClick(99.9, 130, 140, (1, 0, 0, 200, 200))])
+        self.tracker.absent(100.2)
+        self.tracker.absent(100.6)
+        self.assertEqual(self.store.records()[key]['brush_effect_id'], 1012)
+
+    def test_confirm_after_normal_capture_delay_is_not_dropped(self):
+        key = self.show_selected()
+        self.assertEqual(self.tracker.click(11, 130, 140, (1, 0, 0, 200, 200)), 'confirm')
+        self.tracker.absent(11.1)
+        self.tracker.absent(11.6)
+        self.assertEqual(self.store.records()[key]['brush_effect_id'], 1012)
+
+    def test_highlight_and_confirm_after_resize(self):
+        key = self.show_selected()
+        self.show_selected(ts=12, geometry=(1, 50, 60, 200, 200))
+        self.tracker.click(12.2, 130, 140, (1, 0, 0, 200, 200))
+        self.assertIsNone(self.store.records()[key]['confirmed_at'])
+        self.tracker.click(12.3, 130, 140, (1, 50, 60, 200, 200))
+        self.tracker.absent(12.4)
+        self.tracker.absent(13)
+        self.assertEqual(self.store.records()[key]['brush_effect_id'], 1012)
+
+    def test_stage1_is_confirmed_by_actual_stage2_even_with_late_ocr(self):
+        key, _ = self.show()
+        changed = tuple(np.random.default_rng(i).integers(0, 255, (40, 160, 3), dtype=np.uint8) for i in range(2))
+        effect, _ = self.tracker.observe(changed, self.rects, self.confirm,
+                                         geometry=(1, 0, 0, 200, 200), session='s1', ts=12)
+        self.assertNotEqual(key, effect)
+        self.tracker.reading(effect, [match_card(['作用方向改为横向']), match_card(['调色目标的进度要求减少3'])])
+        self.tracker.reading(key, [match_card(['附加额外的调色效果']), match_card(['转变调色目标和效果'])])
+        record = self.store.records()[key]
+        self.assertEqual(record['selected_index'], 1)
+        self.assertEqual(record['selected'], 'transform')
+        self.assertEqual(record['brush_code'], '1')
+        self.assertEqual(record['source'], 'stage2_cards')
+        self.assertEqual(record['status'], 'confirmed')
+        self.assertEqual(record['next_choice_id'], effect)
+        self.assertIsNone(self.store.records()[effect]['selected'])
+        # Conflicting later OCR must revoke the fallback, not keep a guessed type.
+        self.tracker.reading(effect, [match_card(['当前颜料可放置在阻挡地块'])]*2)
+        self.assertEqual(self.store.records()[key]['status'], 'unconfirmed')
+
+    def test_focus_loss_or_shutdown_cannot_confirm(self):
+        key = self.show_selected()
+        self.tracker.suspend(11)
+        self.tracker.boundary(12, 'capture_stopped')
+        self.assertEqual(self.store.records()[key]['status'], 'unconfirmed')
+        self.assertIsNone(self.store.records()[key]['brush_effect_id'])
+
+    def test_visual_selection_replay_masks_future_choice(self):
+        key = self.show_selected()
+        self.tracker.click(11, 130, 140, (1, 0, 0, 200, 200))
+        self.tracker.absent(11.2)
+        self.tracker.absent(11.6)
+        record = self.store.records()[key]
+        self.assertIsNone(choice_at_time(record, 10)['selected_index'])
+        self.assertEqual(choice_at_time(record, 10.5)['selected_index'], 1)
+        self.assertIsNone(choice_at_time(record, 10.5)['brush_effect_id'])
+        self.assertEqual(choice_at_time(record, 12)['brush_effect_id'], 1012)
+
+    def test_hook_and_poll_deduplicate_without_losing_double_clicks(self):
+        monitor = MouseClickMonitor()
+        geometry = (1, 0, 0, 200, 200)
+        for ts, source in ((10, 'hook'), (10.008, 'poll'), (10.03, 'hook'), (10.038, 'poll')):
+            monitor._record(MouseClick(ts, 20, 30, geometry, source))
+        self.assertEqual(len(monitor.since(0)), 2)
+        self.assertEqual(monitor.diagnostics()['duplicate'], 2)
+
+    def test_low_integrity_is_visible_even_if_hook_install_succeeds(self):
+        monitor = MouseClickMonitor()
+        monitor.integrity = {'rid': 0x1000, 'name': 'LOW'}
+        monitor._hook = 123
+        self.assertEqual(monitor.diagnostics()['warning'], 'input_low_integrity')
+        monitor.integrity = {'rid': 0x2000, 'name': 'MEDIUM'}
+        self.assertIsNone(monitor.warning)
+        monitor.last_error = 5
+        self.assertEqual(monitor.warning, 'input_hook_failed')
+
+    def test_only_id_mode_still_records_selected_slot_and_id(self):
+        with patch.object(EvidenceStore, 'audit', return_value={'eligible': True}):
+            store = EvidenceStore(Path(self.temp.name)/'ids', mode='id_only')
+        self.store, self.tracker = store, ChoiceTracker(store)
+        key = self.show_selected()
+        self.tracker.click(10.3, 130, 140, (1, 0, 0, 200, 200))
+        self.tracker.absent(10.4)
+        self.tracker.absent(11)
+        record = store.records()[key]
+        self.assertEqual(record['brush_effect_id'], 1012)
+        self.assertEqual(record['selected_index'], 1)
+        self.assertNotIn('selected', record)
+        self.assertEqual(record['samples'], [])
 
     def test_late_ocr_keeps_slots_and_original_session(self):
         choice, _ = self.show()
@@ -305,6 +470,29 @@ class RecordingTest(unittest.TestCase):
         self.assertEqual(event['event'], 'affix_choice_legacy_candidate')
         self.assertNotIn('selected', event['payload'])
         self.assertNotIn('brush_effect_id', event['payload'])
+        recorder._emit('brush_stage1_selected', {'selected': 'stack', 'source': 'card_highlight'}, 11)
+        self.assertEqual(recorder._events[-1]['event'], 'brush_stage1_legacy_candidate')
+        self.assertNotIn('selected', recorder._events[-1]['payload'])
+
+    def test_confirmed_choices_are_in_main_log_once_and_retractions_are_saved(self):
+        from huahua_assistant.run_recorder import AutomaticRunRecorder
+        recorder = AutomaticRunRecorder(path=None, external_brush_choices=True)
+        self.addCleanup(recorder.close)
+        recorder.session_id = 's1'
+        key = self.show_selected()
+        recorder.record_brush_choices(self.tracker.for_session('s1'))
+        self.assertFalse(recorder._events)
+        self.tracker.click(10.3, 130, 140, (1, 0, 0, 200, 200))
+        self.tracker.absent(10.4)
+        self.tracker.absent(11)
+        for _ in range(2):
+            recorder.record_brush_choices(self.tracker.for_session('s1'))
+        self.assertEqual(len(recorder._events), 1)
+        self.assertEqual(recorder._events[-1]['event'], 'brush_choice_confirmed')
+        self.assertEqual(recorder._events[-1]['payload']['brush_effect_id'], 1012)
+        self.tracker.reading(key, [match_card(['当前颜料可放置在阻挡地块'])]*2)
+        recorder.record_brush_choices(self.tracker.for_session('s1'))
+        self.assertEqual(recorder._events[-1]['event'], 'brush_choice_retracted')
 
     def test_audit_requires_coverage_and_does_not_double_count_labels(self):
         revision = recognizer_revision()

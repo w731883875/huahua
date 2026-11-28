@@ -23,7 +23,7 @@ import numpy as np
 
 from . import windows_ocr
 from .brush_panel import BRUSH_DESCRIPTIONS, _affix_catalog_index, dice_similarity, lcs_ratio
-from .codes import brush_effect_identity
+from .codes import brush_effect_identity, brush_code, resolve_affix
 from .models import Rect
 
 ROOT = Path("runtime/brush_evidence")
@@ -144,12 +144,18 @@ def audit_report(records, reviews):
 def choice_at_time(record, timestamp):
     """Late OCR may fill the observed cards, but future actions cannot fill old frames."""
     result = json.loads(json.dumps(record))
+    if (result.get("selection_at", result.get("clicked_at")) or float("inf")) > timestamp:
+        result.update(selected_index=None, selection_at=None, selection_source=None)
     if (result.get("clicked_at") or float("inf")) > timestamp:
-        result.update(clicked_at=None, selected_index=None)
+        result["clicked_at"] = None
     if (result.get("confirmed_at") or float("inf")) > timestamp:
         result["confirmed_at"] = None
     if (result.get("closed_at") or float("inf")) > timestamp:
         result.update(status="observed", selected=None, closed_at=None)
+        result.update(brush_effect_identity(None))
+        result.update(brush_type=None, brush_code=None)
+    if (result.get("resolved_at") or result.get("closed_at") or float("inf")) > timestamp:
+        result.update(status="observed", selected=None, brush_type=None, brush_code=None)
         result.update(brush_effect_identity(None))
     for key in ("placement", "placement_click", "paint_observation"):
         value = result.get(key)
@@ -238,8 +244,47 @@ def _rect(rect):
 
 def _signatures(cards):
     # Ignore the icon and selection border; only text distinguishes the episodes.
-    return tuple(windows_ocr.text_signature(c[:, round(c.shape[1]*.17):round(c.shape[1]*.94)],
+    return tuple(windows_ocr.text_signature(c[round(c.shape[0]*.23):round(c.shape[0]*.77),
+                                            round(c.shape[1]*.22):round(c.shape[1]*.94)],
                                           light_on_dark=True) for c in cards)
+
+
+def selected_card(cards):
+    """Recognize the continuous bright selection frame, not the blue artwork.
+
+    Require three separated edges; text, ice decoration and a bright icon alone
+    cannot select a card. Ratios are measured in each freshly located rectangle.
+    """
+    hits = []
+    for index, card in enumerate(cards):
+        h, w = card.shape[:2]
+        if h < 20 or w < 60:
+            continue
+        b, g, r = cv2.split(card)
+        bright = (b > 205) & (g > 205) & (r > 145)
+        top = bright[:round(h*.16), round(w*.2):round(w*.95)].any(axis=0).mean()
+        bottom = bright[round(h*.8):, round(w*.2):round(w*.95)].any(axis=0).mean()
+        right = bright[round(h*.15):round(h*.8), round(w*.97):].any(axis=1).mean()
+        if top >= .72 and bottom >= .35 and right >= .4:
+            hits.append(index)
+    return hits[0] if len(hits) == 1 else None
+
+
+def _same_card_text(left, right):
+    if windows_ocr.same_text(left, right):
+        return True
+    # Selected cards grow vertically to include the glowing frame. A changed
+    # crop height alone must not split the offer. Allow the extra blank rows,
+    # but reject an unmatched second text line (a genuinely different card).
+    if left.shape[0] < right.shape[0]:
+        left, right = right, left
+    if left.shape[0] - right.shape[0] > 30 or min(left.std(), right.std()) < 1:
+        return False
+    padded = cv2.copyMakeBorder(left, 6, 6, 4, 4, cv2.BORDER_CONSTANT, value=0)
+    _, score, _, (x, y) = cv2.minMaxLoc(cv2.matchTemplate(padded, right, cv2.TM_CCOEFF_NORMED))
+    energy = padded.astype(np.float32) ** 2
+    covered = energy[y:y+right.shape[0], x:x+right.shape[1]].sum()
+    return score >= .93 and covered >= .8 * energy.sum()
 
 
 class ChoiceTracker:
@@ -256,6 +301,10 @@ class ChoiceTracker:
         self.confirm = None
         self.last_seen = 0.0
         self.geometry_since = 0.0
+        self.suspended = False
+        self.visual_candidate = None
+        self.visual_count = 0
+        self.click_diagnostics = {}
 
     def observe(self, cards, rects, confirm, *, geometry, session, ts):
         """Return (choice_id, should_retain_sample). Called before any OCR."""
@@ -263,7 +312,8 @@ class ChoiceTracker:
         with self.lock:
             previous = self.records.get(self.active)
             same = (previous is not None and previous["session"] == session and self.signature is not None
-                    and all(windows_ocr.same_text(a, b) for a, b in zip(signature, self.signature)))
+                    and len(signature) == len(self.signature)
+                    and all(_same_card_text(a, b) for a, b in zip(signature, self.signature)))
             if previous is not None and not same:
                 self._finish(ts, "cards_changed")
             if not same:
@@ -275,10 +325,13 @@ class ChoiceTracker:
                     "frame_size": list(geometry[-2:]), "card_rects": [_rect(r) for r in rects],
                     "stage": "unknown", "status": "observed", "selected_index": None,
                     "clicked_at": None, "confirmed_at": None, "closed_at": None,
+                    "selection_at": None, "selection_source": None,
+                    "previous_choice_id": previous["choice_id"] if previous and previous["session"] == session else None,
                     "source": "retained_card_ocr", "samples": [], "cards": [None, None],
                     "placement": None, "paint_observation": None, "samples_queued": 0,
                 }
                 self.signature = signature
+                self.visual_candidate, self.visual_count = None, 0
                 # Old worker results remain durable on disk; only retain a small active set.
                 if len(self.records) > 128:
                     oldest = next(iter(self.records))
@@ -287,9 +340,11 @@ class ChoiceTracker:
                 self.geometry_since = ts
             self.geometry, self.rects, self.confirm = geometry, rects, confirm
             self.last_seen, self.missing_at = ts, None
+            self.suspended = False
             record = self.records[self.active]
             record["card_rects"] = [_rect(r) for r in rects]
             record["frame_size"] = list(geometry[-2:])
+            self._visual_selection(record, cards, ts)
             retain = record["samples_queued"] == 0 or (
                 record["samples_queued"] < 2 and ts - record["observed_at"] >= .4)
             if retain:
@@ -297,27 +352,58 @@ class ChoiceTracker:
                 self._write(record)
             return self.active, retain
 
+    def _visual_selection(self, record, cards, ts):
+        index = selected_card(cards)
+        self.visual_count = self.visual_count + 1 if index is not None and index == self.visual_candidate else 1
+        self.visual_candidate = index
+        if index is None or self.visual_count < 2 or record.get("confirmed_at") is not None:
+            return
+        record["visual_selection"] = {"index": index, "ts": ts, "source": "three_edge_selection_frame"}
+        if index != record["selected_index"]:
+            record.update(selected_index=index, selection_at=ts, selection_source="selection_frame",
+                          clicked_at=None)
+            self._write(record)
+
+    def suspend(self, ts):
+        # Losing foreground is not a cancellation or panel transition. Preserve
+        # the provisional slot; verify the same cards when sampling resumes.
+        with self.lock:
+            self.suspended = True
+            self.missing_at = None
+            self.visual_candidate, self.visual_count = None, 0
+
+    def _click_result(self, reason):
+        self.click_diagnostics[reason] = self.click_diagnostics.get(reason, 0) + 1
+        return reason
+
     def click(self, ts, x, y, geometry):
         with self.lock:
             if (self.active is None or geometry != self.geometry or ts < self.geometry_since
                     or ts < self.records[self.active]["observed_at"]):
-                return
-            if ts - self.last_seen > .6:
-                return
+                return self._click_result("wrong_episode_or_geometry")
+            if not self.suspended and ts - self.last_seen > 3:
+                return self._click_result("stale_frame")
             record = self.records[self.active]
             hits = [i for i, rect in enumerate(self.rects) if _inside(rect, x, y)]
             if len(hits) == 1:
                 if record["confirmed_at"] is not None:
                     return
-                record.update(selected_index=hits[0], clicked_at=ts, confirmed_at=None)
+                record.update(selected_index=hits[0], clicked_at=ts, confirmed_at=None,
+                              selection_at=ts, selection_source="card_click")
+                outcome = "card"
             elif _inside(self.confirm, x, y) and record["selected_index"] is not None:
-                record["confirmed_at"] = ts
+                record.update(confirmed_at=ts, confirmation_source="confirm_click")
+                outcome = "confirm"
             else:
-                return
+                return self._click_result("outside_controls_or_no_selection")
             self._write(record)
+            return self._click_result(outcome)
 
     def absent(self, ts, *, reason="panel_closed"):
         with self.lock:
+            if reason == "foreground_lost":
+                self.suspend(ts)
+                return
             if self.active is None:
                 return
             if self.missing_at is None:
@@ -363,10 +449,48 @@ class ChoiceTracker:
                 record["samples"].append(sample)
             self._resolve(record)
             self._write(record)
+            self._resolve_previous(record)
+            for child in self.records.values():
+                if child.get("previous_choice_id") == key:
+                    self._resolve_previous(child)
+
+    def _resolve_previous(self, next_record):
+        """A recognized effect page proves the preceding category was accepted.
+
+        Both effect slots must belong to the same brush type. This also works
+        when the click hook missed the category click; generic disappearance
+        and focus changes can never satisfy it.
+        """
+        previous = self.records.get(next_record.get("previous_choice_id"))
+        if previous and previous.get("confirmation_source") == "stage2_cards":
+            previous.update(confirmed_at=None, confirmation_source=None)
+            self._resolve(previous)
+            self._write(previous)
+        if (not previous or previous.get("stage") != "direction"
+                or next_record.get("stage") != "effect" or next_record.get("ocr_conflict")
+                or previous.get("close_reason") != "cards_changed"):
+            return
+        rules = [resolve_affix(c.get("name")) if c else None for c in next_record["cards"]]
+        if len(rules) != 2 or any(r is None for r in rules):
+            return
+        kinds = {r.brush_type.value for r in rules}
+        indices = [i for i, c in enumerate(previous["cards"]) if c and c.get("name") in kinds]
+        if len(kinds) != 1 or len(indices) != 1:
+            return
+        index = indices[0]
+        if previous.get("selected_index") != index:
+            previous.update(selection_at=previous["closed_at"], selection_source="stage2_cards", clicked_at=None)
+        previous.update(selected_index=index, confirmed_at=previous["closed_at"],
+                        confirmation_source="stage2_cards", next_choice_id=next_record["choice_id"])
+        if previous.get("selection_at") is None:
+            previous.update(selection_at=previous["closed_at"], selection_source="stage2_cards")
+        self._resolve(previous)
+        self._write(previous)
 
     def _resolve(self, record):
         record.update(brush_effect_identity(None))
         record["selected"] = None
+        record.update(brush_type=None, brush_code=None)
         if record["closed_at"] is None:
             return
         record["status"] = "unconfirmed"
@@ -380,9 +504,15 @@ class ChoiceTracker:
         if not card or not card.get("name"):
             record["status"] = "unread"
             return
-        record.update(status="confirmed", selected=card["name"], source="card_click_and_confirm")
+        source = record.get("confirmation_source") or "confirm_click"
+        record.update(status="confirmed", selected=card["name"],
+                      source=("card_click_and_confirm" if source == "confirm_click" and record.get("clicked_at")
+                              else "selection_frame_and_confirm" if source == "confirm_click" else source),
+                      resolved_at=record.get("resolved_at") or record["closed_at"])
         if card["stage"] == "effect":
             record.update(brush_effect_identity(card["name"]))
+        elif card["stage"] == "direction":
+            record.update(brush_type=card["name"], brush_code=brush_code(card["name"]))
 
     def _write(self, record):
         record["storage_mode"] = self.store.mode
@@ -593,6 +723,8 @@ class BrushEvidenceService:
         fields = ("choice_id", "session", "stage", "status", "source", "observed_at", "closed_at",
                   "selected_index", "selected", "canonical_affix_id", "brush_effect_id", "brush_effect_ids",
                   "clicked_at", "confirmed_at",
+                  "selection_at", "selection_source", "confirmation_source", "resolved_at",
+                  "brush_type", "brush_code", "cards", "next_choice_id",
                   "brush_effect_id_status", "brush_effect_id_source", "brush_effect_table",
                   "paint_observation", "placement", "placement_click")
         choices = [{k:v for k,v in r.items() if k in fields}
@@ -604,6 +736,8 @@ class BrushEvidenceService:
                 "sidecar": str(self.store.root / "choices"),
                 "mode": self.store.mode, "requested_mode": self.store.requested_mode,
                 "image_bytes": self.store.image_bytes, "max_image_bytes": self.store.max_bytes,
+                "input": self.monitor.diagnostics(),
+                "click_handling": dict(self.tracker.click_diagnostics),
                 "error": self.last_error or self.store.last_error}
 
     def _sample(self):
@@ -621,7 +755,7 @@ class BrushEvidenceService:
                 session = self.session
                 window = find_capture_window()
                 if window is None or not window.captureable or not _foreground_matches(window):
-                    self.tracker.absent(time.time(), reason="foreground_lost")
+                    self.tracker.suspend(time.time())
                     self.stop_event.wait(.2)
                     continue
                 geometry = (window.hwnd, window.left, window.top, window.width, window.height)
@@ -661,9 +795,18 @@ class BrushEvidenceService:
                 self._board, self._board_geometry = None, None
             if not found and self.tracker.active is not None and self.tracker.missing_at is None:
                 self.tracker.absent(ts)
+            # Re-establish the card identity after returning to the game before
+            # accepting a click that happened between focus gain and this frame.
+            preobserved = None
+            cards = None
+            if found and self.tracker.suspended:
+                _, rects, confirm = found
+                cards = tuple(frame[r.y:r.bottom, r.x:r.right].copy() for r in rects)
+                preobserved = self.tracker.observe(cards, rects, confirm, geometry=geometry, session=session, ts=ts)
             for click in clicks:
                 self.last_click = max(self.last_click, click.ts)
                 if click.window_geometry != geometry:
+                    self.tracker._click_result("capture_geometry_mismatch")
                     continue
                 x, y = click.x-geometry[1], click.y-geometry[2]
                 # click() also compares against the geometry of the last seen
@@ -675,8 +818,9 @@ class BrushEvidenceService:
                 self.tracker.absent(ts)
                 return
             _, rects, confirm = found
-            cards = tuple(frame[r.y:r.bottom, r.x:r.right].copy() for r in rects)
-            key, retain = self.tracker.observe(cards, rects, confirm, geometry=geometry, session=session, ts=ts)
+            if cards is None:
+                cards = tuple(frame[r.y:r.bottom, r.x:r.right].copy() for r in rects)
+            key, retain = preobserved or self.tracker.observe(cards, rects, confirm, geometry=geometry, session=session, ts=ts)
             if retain:
                 images = [self.store.save_crop(card) for card in cards]
                 self.tracker.reading(key, [], {"captured_at": ts, "images": images, "ocr_pending": True})
